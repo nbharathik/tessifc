@@ -55,7 +55,15 @@ WASM_OPT_FLAGS = [
     "--enable-nontrapping-float-to-int",
     "--enable-mutable-globals",
     "--enable-sign-ext",
+    "--enable-reference-types",
+    "--enable-multivalue",
 ]
+
+# Older binaryen releases rewrite the module's exported externref table to
+# point at the function table, and the glue then fails at start-up with
+# "WebAssembly.Table.grow(): failed to grow table by 4". Distribution packages
+# are often that old, so the version is checked and the output is verified.
+MIN_WASM_OPT_VERSION = 116
 
 OUT_DIRS = {
     "web": REPO / "bindings" / "wasm" / "pkg",
@@ -247,6 +255,93 @@ def run_bindgen(tool: str, flavour: str, artefact: Path) -> Path:
     return produced
 
 
+def wasm_opt_version(tool: str) -> int | None:
+    """The release number from `wasm-opt --version`, or None if it cannot be read."""
+    code, output = capture([tool, "--version"])
+    if code != 0:
+        return None
+    for word in output.split():
+        if word.isdigit():
+            return int(word)
+    return None
+
+
+def read_leb(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data):
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            break
+    return value, offset
+
+
+def table_exports(data: bytes) -> dict[str, tuple[int, int | None]]:
+    """Map each exported table name to its (element type, maximum) pair.
+
+    Enough of the binary format to see whether an optimiser has re-pointed an
+    export at a different table, which is what breaks wasm-bindgen's start-up.
+    """
+    tables: list[tuple[int, int | None]] = []
+    exports: dict[str, int] = {}
+    offset = 8
+    while offset < len(data):
+        section = data[offset]
+        size, offset = read_leb(data, offset + 1)
+        body = data[offset : offset + size]
+        offset += size
+        if section == 2:
+            count, at = read_leb(body, 0)
+            for _ in range(count):
+                length, at = read_leb(body, at)
+                at += length
+                length, at = read_leb(body, at)
+                at += length
+                kind = body[at]
+                at += 1
+                if kind == 0:
+                    _, at = read_leb(body, at)
+                elif kind == 1:
+                    element = body[at]
+                    flags = body[at + 1]
+                    minimum, at = read_leb(body, at + 2)
+                    maximum = None
+                    if flags & 1:
+                        maximum, at = read_leb(body, at)
+                    tables.append((element, maximum))
+                elif kind == 2:
+                    flags = body[at]
+                    _, at = read_leb(body, at + 1)
+                    if flags & 1:
+                        _, at = read_leb(body, at)
+                else:
+                    at += 2
+        elif section == 4:
+            count, at = read_leb(body, 0)
+            for _ in range(count):
+                element = body[at]
+                flags = body[at + 1]
+                _, at = read_leb(body, at + 2)
+                maximum = None
+                if flags & 1:
+                    maximum, at = read_leb(body, at)
+                tables.append((element, maximum))
+        elif section == 7:
+            count, at = read_leb(body, 0)
+            for _ in range(count):
+                length, at = read_leb(body, at)
+                name = body[at : at + length].decode("utf-8", errors="replace")
+                at += length
+                kind = body[at]
+                index, at = read_leb(body, at + 1)
+                if kind == 1:
+                    exports[name] = index
+    return {name: tables[index] for name, index in exports.items() if index < len(tables)}
+
+
 def run_wasm_opt(wasm: Path) -> bool:
     """Optimise in place. Returns False when it was skipped, which is not an error."""
     tool = find_tool("wasm-opt")
@@ -257,6 +352,15 @@ def run_wasm_opt(wasm: Path) -> bool:
         say("             or, on Windows, `winget install WebAssembly.binaryen`.")
         return False
 
+    version = wasm_opt_version(tool)
+    if version is not None and version < MIN_WASM_OPT_VERSION:
+        say(f"    WARNING: wasm-opt {version} is too old, skipping the -O3 pass.")
+        say(f"             Releases before {MIN_WASM_OPT_VERSION} mis-link the externref table")
+        say("             and the module then fails to start. Install a current binaryen")
+        say("             from https://github.com/WebAssembly/binaryen/releases.")
+        return False
+    say(f"    wasm-opt {version if version is not None else '(version unknown)'}  ({tool})")
+
     before = wasm.stat().st_size
     temporary = wasm.with_suffix(".opt.wasm")
     command = [tool, *WASM_OPT_FLAGS, str(wasm), "-o", str(temporary)]
@@ -265,6 +369,18 @@ def run_wasm_opt(wasm: Path) -> bool:
         say("    WARNING: wasm-opt failed, keeping the unoptimised module.")
         say("             This is usually an old binaryen that cannot parse a newer")
         say("             wasm feature. The size check below still applies.")
+        return False
+
+    # The optimised module must export the same tables as the original. An
+    # export that now names a table with a different type or limit would fail
+    # in every browser at start-up, so the unoptimised module is kept instead.
+    expected = table_exports(wasm.read_bytes())
+    produced = table_exports(temporary.read_bytes())
+    if produced != expected:
+        temporary.unlink(missing_ok=True)
+        say("    WARNING: wasm-opt changed the module's table exports, keeping the")
+        say("             unoptimised module. This binaryen release is not usable here;")
+        say("             install a current one from https://github.com/WebAssembly/binaryen/releases.")
         return False
 
     after = temporary.stat().st_size

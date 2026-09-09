@@ -687,7 +687,11 @@ function workerFailed(data) {
   finishLoading();
   setStatus("Kernel failed to start", "err");
   $("model-name").textContent = "Kernel unavailable";
-  shell.toast(`${data.message} Build the browser WASM package, then reload.`, "error", 0);
+  shell.toast(
+    `The geometry kernel failed to start: ${data.message} Reload the page. From a checkout, build the browser WASM package first.`,
+    "error",
+    0,
+  );
 }
 
 // ------------------------------------------------------------ model load

@@ -1,0 +1,29 @@
+/target
+**/target
+Cargo.lock.bak
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+bindings/wasm/pkg/
+bindings/wasm/pkg-node/
+pkg/
+data/
+dev/
+bench/
+.claude/
+# Local only.
+CLAUDE.md
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+
+# No IFC file is ever committed: not scratch models, not fixtures, not samples.
+*.ifc
+*.ifczip
+*.igp

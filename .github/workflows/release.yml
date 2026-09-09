@@ -1,0 +1,212 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Release: on a version tag, build the CLI for three platforms and the WASM
+# package, attach them to a GitHub release with checksums, and publish to npm
+# and crates.io when the tokens exist. The website is deployed by pages.yml.
+# Without tokens the publish jobs say so and skip; the artefacts still ship.
+#
+# Cut a release by setting one version everywhere and pushing an annotated
+# tag `vX.Y.Z` to main. Release notes are written on the Releases page.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # First, before anything can resolve and rewrite the lock: a stale lock
+      # would otherwise pass here and fail in the crates job, long after the
+      # binaries are built.
+      - name: the lock is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      # The tag must match every published manifest, or the artefacts would lie
+      # and the npm publish would fail after everything has already been built.
+      - name: tag matches every published manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          test "$tag" = "$version" || { echo "tag $tag != Cargo.toml $version"; exit 1; }
+          for manifest in bindings/wasm adapters/three; do
+            found=$(grep -m1 '"version"' "$manifest/package.json" | sed 's/.*"version": *"\([^"]*\)".*/\1/')
+            test "$found" = "$tag" || { echo "$manifest/package.json is $found, tag is $tag"; exit 1; }
+          done
+
+  cli:
+    name: cli (${{ matrix.target }})
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  archive: tar.gz }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    archive: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release -p tessifc-cli --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          set -eu
+          name="tessifc-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/tessifc.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/tessifc" "dist/$name/"
+          fi
+          cp LICENSE NOTICE README.md "dist/$name/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+
+  wasm:
+    name: wasm package
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install wasm-bindgen-cli at the locked version
+        run: |
+          version=$(python - <<'EOF'
+          import re, pathlib
+          lock = pathlib.Path("Cargo.lock").read_text(encoding="utf-8")
+          match = re.search(r'name = "wasm-bindgen"\nversion = "([^"]+)"', lock)
+          print(match.group(1))
+          EOF
+          )
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - name: install binaryen for wasm-opt
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - run: python scripts/build-wasm.py --target both
+      - run: node bindings/wasm/test/smoke.mjs
+      - run: node viewer/test/igp.test.mjs
+      - run: node adapters/three/test/build.test.mjs
+      - name: browser and website checks
+        run: |
+          npm ci --prefix viewer
+          (cd viewer && npx playwright install --with-deps chromium)
+          npm --prefix viewer test
+          python -m unittest discover -s scripts -p 'test_*.py'
+          python scripts/build-site.py
+      - name: package the npm tarballs
+        run: |
+          mkdir -p dist
+          (cd bindings/wasm && npm pack --pack-destination ../../dist)
+          (cd adapters/three && npm pack --pack-destination ../../dist)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/*.tgz
+      - name: publish to npm
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not set; skipping npm publish. The tarballs are attached to the release."
+            exit 0
+          fi
+          (cd bindings/wasm && npm publish --access public --provenance --tag preview)
+          (cd adapters/three && npm publish --access public --provenance --tag preview)
+
+  crates:
+    name: crates.io
+    needs: [verify, cli, wasm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish."
+            exit 0
+          fi
+          # Dependency order, not directory order: tessifc-step needs
+          # tessifc-schema, so schema goes first.
+          # A rerun after a partial publish must not die on the crates that
+          # already went out.
+          for crate in schema mesh pack step model geom engine cli; do
+            if output=$(cargo publish -p "tessifc-$crate" --locked 2>&1); then
+              echo "$output"
+              sleep 30
+            elif echo "$output" | grep -q "already .*uploaded\|already exists"; then
+              echo "tessifc-$crate is already on the registry at this version, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          done
+
+  release:
+    name: github release
+    needs: [cli, wasm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect and checksum
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.tgz' \) -exec cp {} release/ \;
+          (cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}
+          generate_release_notes: true
+          files: release/*

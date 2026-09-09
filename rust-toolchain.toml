@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Pinned so that "cargo build" behaves identically for every contributor and in
+# CI. Bumping this is a deliberate act: it moves the MSRV, which is also
+# declared as rust-version in Cargo.toml.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

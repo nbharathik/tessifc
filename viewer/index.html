@@ -1,0 +1,773 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="Open, inspect, section and measure IFC models locally in the browser." />
+    <meta name="theme-color" content="#0b0c0e" />
+    <title>TessIFC viewer</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%230f1115'/><polygon points='32,6 56,19 32,32 8,19' fill='%2393b9fb'/><polygon points='8,19 32,32 32,58 8,45' fill='%233b82f6'/><polygon points='56,19 56,45 32,58 32,32' fill='%231e5bd0'/></svg>" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+    />
+    <script src="./src/boot.js"></script>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div id="splash" aria-hidden="true">
+      <div class="splash-mark"></div>
+      <div class="splash-bar"><i></i></div>
+    </div>
+
+    <a class="skip-link" href="#viewport">Skip to the 3D viewport</a>
+
+    <div id="app">
+      <header id="topbar">
+        <span class="brand" aria-hidden="true"></span>
+
+        <nav id="ribbon-tabs" role="tablist" aria-label="Command groups">
+          <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-file" tabindex="-1" data-tab="file">File</button>
+          <button class="rib-tab active" type="button" role="tab" aria-selected="true" aria-controls="rib-home" data-tab="home">Home</button>
+          <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-view" tabindex="-1" data-tab="view">View</button>
+          <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-analyze" tabindex="-1" data-tab="analyze">Analyze</button>
+          <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-review" tabindex="-1" data-tab="review">Review</button>
+        </nav>
+
+        <button class="rib-toggle" id="ribbon-toggle" type="button" aria-expanded="true" title="Collapse the ribbon (Ctrl F1)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 14 5-5 5 5" /></svg>
+          <span class="sr-only">Collapse the ribbon</span>
+        </button>
+
+        <span class="grow"></span>
+
+        <span id="topbar-right">
+          <span class="model-chip blank" id="model-chip">
+            <span class="dot" id="kernel-dot" aria-hidden="true"></span>
+            <span class="name" id="model-name">Starting the geometry kernel</span>
+            <span class="tag hidden" id="model-schema"></span>
+          </span>
+          <span class="bar-sep" aria-hidden="true"></span>
+          <span class="local-badge" title="Files are read in this browser and are never uploaded">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></svg>
+            Local only
+          </span>
+          <button class="icon-btn" id="open-settings" type="button" title="Settings (Ctrl ,)" aria-label="Settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg>
+          </button>
+          <button class="icon-btn" id="open-help" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M9.5 9.2a2.6 2.6 0 1 1 3.4 2.5c-.6.2-.9.8-.9 1.4v.4" /><path d="M12 17h.01" /></svg>
+          </button>
+        </span>
+      </header>
+
+      <div id="ribbon">
+        <div class="rib-strip" id="rib-file" role="tabpanel" aria-label="File">
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-open" type="button" title="Open an IFC file (Ctrl O)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V7h6l2 2h8v10z" /><path d="M12 12v5m-2-2 2 2 2-2" /></svg>
+                <span class="rib-label">Open</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Open</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-export" type="button" disabled title="Download the IFC source (Ctrl S)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h12l2 2v14H5z" /><path d="M8 4v6h8V4M8 16h8" /></svg>
+                <span class="rib-label">Export IFC</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-close" type="button" disabled title="Close the model and release its memory">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                <span class="rib-label">Close</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Model</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <div class="rib-stack">
+                <button class="rib-btn sm" id="cmd-settings" type="button">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" /></svg>
+                  <span class="rib-label">Settings</span>
+                </button>
+                <button class="rib-btn sm" id="cmd-help" type="button">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2" /><path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8" /></svg>
+                  <span class="rib-label">Shortcuts</span>
+                </button>
+              </div>
+            </div>
+            <span class="rib-glabel">Workspace</span>
+          </div>
+        </div>
+
+        <div class="rib-strip active" id="rib-home" role="tabpanel" aria-label="Home">
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-fit" type="button" disabled title="Frame the whole model (F)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5m13 5h5v-5" /></svg>
+                <span class="rib-label">Fit model</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-plan" type="button" disabled aria-pressed="false" title="Sectioned plan view, press again for 3D (P)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="14" /><path d="M9 5v5h6v9" /></svg>
+                <span class="rib-label">Plan</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Navigate</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-style" type="button" disabled title="Cycle the display style (D)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4z" /><path d="M4 12l8 4 8-4M4 17l8 4 8-4" /></svg>
+                <span class="rib-label" id="style-label">Shaded</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-theme" type="button" title="Interface theme: system, light or dark">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" /></svg>
+                <span class="rib-label" id="theme-label">System</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Display</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-spaces" type="button" disabled aria-pressed="false" title="Show space and zone volumes">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 7-4 7 4-7 4z" /><path d="m5 8v8l7 4 7-4V8M12 12v8" /></svg>
+                <span class="rib-label">Show spaces</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-openings" type="button" disabled aria-pressed="false" title="Show opening and void volumes">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="18" /><path d="M8 21V7h8v14M13 14h.01" /></svg>
+                <span class="rib-label">Show openings</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-references" type="button" disabled aria-pressed="false" title="Show grids, annotations and reference geometry">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16M7 4v16M12 4v16M17 4v16" /></svg>
+                <span class="rib-label">Show guides</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Model helpers</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <div class="rib-stack">
+                <button class="rib-btn sm" id="cmd-isolate" type="button" disabled title="Isolate the selection (I)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12" /></svg>
+                  <span class="rib-label">Isolate</span>
+                </button>
+                <button class="rib-btn sm" id="cmd-hide" type="button" disabled title="Hide the selection (H)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l16 16" /><path d="M9.9 5.8A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3.3 4M6.6 7.9A16 16 0 0 0 2.5 12S6 18.5 12 18.5a9 9 0 0 0 3.2-.6" /></svg>
+                  <span class="rib-label">Hide</span>
+                </button>
+              </div>
+              <div class="rib-stack">
+                <button class="rib-btn sm" id="cmd-show-all" type="button" disabled title="Show every element again (A)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 12h16M12 4v16" /></svg>
+                  <span class="rib-label">Show all</span>
+                </button>
+                <button class="rib-btn sm" id="cmd-clear" type="button" disabled title="Clear the selection (Esc)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                  <span class="rib-label">Deselect</span>
+                </button>
+              </div>
+              <div class="rib-stack">
+                <button class="rib-btn sm" id="cmd-focus" type="button" disabled title="Frame the selection (Shift F)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 3v3m0 12v3M3 12h3m12 0h3" /></svg>
+                  <span class="rib-label">Focus</span>
+                </button>
+                <button class="rib-btn sm" id="cmd-edit" type="button" disabled title="Edit the selected element (E)">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
+                  <span class="rib-label">Edit</span>
+                </button>
+              </div>
+            </div>
+            <span class="rib-glabel">Selection</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-measure" type="button" disabled aria-pressed="false" title="Measure point to point (M)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 17 12-12 2 2L7 19z" /><path d="M9 15l-2-2m5-1-2-2m5-1-2-2" /></svg>
+                <span class="rib-label">Measure</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-section" type="button" disabled aria-pressed="false" title="Section the model (X)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19 19 5" /><path d="M8 5h11v11M5 8v11h11" /></svg>
+                <span class="rib-label">Section</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Tools</span>
+          </div>
+        </div>
+
+        <div class="rib-strip" id="rib-view" role="tabpanel" aria-label="View">
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" type="button" data-view="perspective" disabled title="Isometric perspective (4)"><span class="glyph">ISO</span><span class="rib-label">Perspective</span></button>
+              <button class="rib-btn lg" type="button" data-view="top" disabled title="Top view (3)"><span class="glyph">TOP</span><span class="rib-label">Top</span></button>
+              <button class="rib-btn lg" type="button" data-view="front" disabled title="Front elevation (1)"><span class="glyph">FRT</span><span class="rib-label">Front</span></button>
+              <button class="rib-btn lg" type="button" data-view="right" disabled title="Right elevation (2)"><span class="glyph">RGT</span><span class="rib-label">Right</span></button>
+            </div>
+            <span class="rib-glabel">Standard views</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-theme-2" type="button" title="Interface theme: system, light or dark">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" /></svg>
+                <span class="rib-label" id="theme-label-2">System</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-canvas-theme" type="button" title="Viewport background: match the theme, light or dark">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m6 16 4-5 3 3.5L16 11l2 5z" /></svg>
+                <span class="rib-label" id="canvas-theme-label">Match theme</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Appearance</span>
+          </div>
+        </div>
+
+        <div class="rib-strip" id="rib-analyze" role="tabpanel" aria-label="Analyze">
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-measure-2" type="button" disabled aria-pressed="false" title="Measure point to point (M)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 17 12-12 2 2L7 19z" /><path d="M9 15l-2-2m5-1-2-2m5-1-2-2" /></svg>
+                <span class="rib-label">Measure</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-section-2" type="button" disabled aria-pressed="false" title="Section the model (X)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19 19 5" /><path d="M8 5h11v11M5 8v11h11" /></svg>
+                <span class="rib-label">Section</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Inspect geometry</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-model-stats" type="button" disabled title="Open the model ledger">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19V9h4v10M10 19V5h4v14M15 19v-7h4v7M4 20h16" /></svg>
+                <span class="rib-label">Statistics</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Report</span>
+          </div>
+        </div>
+
+        <div class="rib-strip" id="rib-review" role="tabpanel" aria-label="Review">
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-quality" type="button" disabled title="Open the conversion report">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6M4 20h16" /></svg>
+                <span class="rib-label">Quality</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-properties" type="button" disabled title="Open the properties panel">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 11v6M12 7h.01" /></svg>
+                <span class="rib-label">Properties</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Inspect</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-export-2" type="button" disabled title="Download the IFC source (Ctrl S)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h12l2 2v14H5z" /><path d="M8 4v6h8V4M8 16h8" /></svg>
+                <span class="rib-label">Export IFC</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Deliver</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="pending-bar" class="hidden">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01" /><path d="M10.3 4.3 2.6 18a1.9 1.9 0 0 0 1.7 2.9h15.4a1.9 1.9 0 0 0 1.7-2.9L13.7 4.3a1.9 1.9 0 0 0-3.4 0z" /></svg>
+        <span class="summary">Unsaved IFC edits</span>
+        <span class="detail grow" id="pending-detail">Download the IFC to keep this revision.</span>
+        <button class="btn sm" id="pending-export" type="button">Export IFC</button>
+      </div>
+
+      <main id="workspace">
+        <aside id="outliner" aria-label="Model structure">
+          <div class="panel-strip">
+            <button class="icon-btn sm" id="outliner-open" type="button" title="Show the structure panel (Ctrl B)" aria-label="Show the structure panel">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+            </button>
+            <span class="strip-label">Structure</span>
+          </div>
+          <div class="panel-head">
+            <div class="seg" id="outliner-switch" role="tablist" aria-label="Structure view">
+              <button type="button" role="tab" id="outliner-tab-spatial" aria-selected="true" aria-controls="tree-spatial" data-outliner="spatial">Spatial</button>
+              <button type="button" role="tab" id="outliner-tab-types" aria-selected="false" aria-controls="tree-types" tabindex="-1" data-outliner="types">Types</button>
+            </div>
+            <span class="grow"></span>
+            <button class="icon-btn sm" id="tree-expand" type="button" disabled title="Expand every branch" aria-label="Expand every branch">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
+            </button>
+            <button class="icon-btn sm" id="tree-collapse" type="button" disabled title="Collapse to storeys" aria-label="Collapse to storeys">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 5l4 4 4-4M8 19l4-4 4 4" /></svg>
+            </button>
+            <button class="icon-btn sm" id="tree-restore" type="button" disabled title="Restore visibility (A)" aria-label="Restore visibility">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /></svg>
+            </button>
+            <button class="icon-btn sm" id="outliner-close" type="button" title="Hide the structure panel (Ctrl B)" aria-label="Hide the structure panel">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 6-6 6 6 6" /></svg>
+            </button>
+          </div>
+
+          <div class="page search-row">
+            <label class="search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></svg>
+              <span class="sr-only">Search the model structure</span>
+              <input id="tree-search" type="search" placeholder="Search name, type or #id" autocomplete="off" disabled />
+              <kbd>Ctrl F</kbd>
+            </label>
+          </div>
+
+          <div class="tree" id="tree-spatial" role="tree" aria-label="Spatial structure">
+            <div class="empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V9l8-5 8 5v11z" /><path d="M9 20v-6h6v6" /></svg>
+              <strong>No model open</strong>
+              <span class="sub">Open an IFC to browse its project, site, building and storeys.</span>
+            </div>
+          </div>
+          <div class="tree hidden" id="tree-types" role="tree" aria-label="Element types"></div>
+
+          <div class="panel-foot">
+            <span><b id="stat-visible">0</b> visible</span>
+            <span><b id="stat-hidden">0</b> hidden</span>
+            <span class="grow"></span>
+            <span><b id="stat-classes">0</b> classes</span>
+          </div>
+        </aside>
+
+        <div id="viewer-host">
+          <div id="viewport" tabindex="0" aria-label="Interactive IFC viewport"></div>
+
+          <div id="gizmo-host" class="hidden"></div>
+
+          <div id="docks">
+            <div id="dock" role="toolbar" aria-label="Viewport tools">
+              <button class="icon-btn" id="dock-zoom-in" type="button" disabled title="Zoom in (+)" aria-label="Zoom in"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg></button>
+              <button class="icon-btn" id="dock-zoom-out" type="button" disabled title="Zoom out (-)" aria-label="Zoom out"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14" /></svg></button>
+              <button class="icon-btn" id="dock-fit" type="button" disabled title="Frame the model (F)" aria-label="Frame the model">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5m13 5h5v-5" /></svg>
+              </button>
+              <span class="dock-sep" aria-hidden="true"></span>
+              <button class="icon-btn" type="button" data-view="perspective" disabled title="Isometric perspective (4)" aria-label="Isometric perspective"><span class="glyph">ISO</span></button>
+              <button class="icon-btn" type="button" data-view="top" disabled title="Top view (3)" aria-label="Top view"><span class="glyph">T</span></button>
+              <button class="icon-btn" type="button" data-view="front" disabled title="Front elevation (1)" aria-label="Front elevation"><span class="glyph">F</span></button>
+              <button class="icon-btn" type="button" data-view="right" disabled title="Right elevation (2)" aria-label="Right elevation"><span class="glyph">R</span></button>
+              <span class="dock-sep" aria-hidden="true"></span>
+              <button class="icon-btn" id="dock-measure" type="button" disabled aria-pressed="false" title="Measure (M)" aria-label="Measure">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 17 12-12 2 2L7 19z" /><path d="M9 15l-2-2m5-1-2-2m5-1-2-2" /></svg>
+              </button>
+              <button class="icon-btn" id="dock-section" type="button" disabled aria-pressed="false" title="Section (X)" aria-label="Section">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19 19 5" /><path d="M8 5h11v11M5 8v11h11" /></svg>
+              </button>
+              <span class="dock-sep" aria-hidden="true"></span>
+              <button class="icon-btn" id="dock-style" type="button" disabled title="Display style (D)" aria-label="Display style">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4z" /><path d="M4 12l8 4 8-4" /></svg>
+              </button>
+            </div>
+            <div id="dock-selection" class="hidden" role="toolbar" aria-label="Selection tools">
+              <button class="icon-btn" id="dock-focus" type="button" disabled title="Frame the selection (Shift F)" aria-label="Frame the selection">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 3v3m0 12v3M3 12h3m12 0h3" /></svg>
+              </button>
+              <button class="icon-btn" id="dock-isolate" type="button" disabled aria-pressed="false" title="Isolate the selection (I)" aria-label="Isolate the selection">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12" /></svg>
+              </button>
+              <button class="icon-btn" id="dock-hide" type="button" disabled title="Hide the selection (H)" aria-label="Hide the selection">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l16 16" /><path d="M9.9 5.8A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3.3 4M6.6 7.9A16 16 0 0 0 2.5 12S6 18.5 12 18.5a9 9 0 0 0 3.2-.6" /></svg>
+              </button>
+              <span class="dock-sep" aria-hidden="true"></span>
+              <button class="icon-btn" id="dock-edit" type="button" disabled title="Edit attributes (E)" aria-label="Edit attributes">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
+              </button>
+            </div>
+          </div>
+
+          <p class="hint-bar hidden" id="hint-bar">Drag to orbit · Scroll at a detail to zoom · Double-click to frame</p>
+
+          <div class="card hidden" id="measure-card" role="region" aria-label="Measurements">
+            <div class="card-head">
+              <span class="grow">Measure</span>
+              <button class="icon-btn sm" id="measure-copy" type="button" disabled title="Copy all measurements" aria-label="Copy all measurements"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></svg></button>
+              <button class="icon-btn sm" id="measure-clear" type="button" title="Clear all measurements" aria-label="Clear all measurements"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button>
+            </div>
+            <span class="value" id="measure-value" aria-live="polite">Pick the first point</span>
+            <span class="detail" id="measure-detail">Snaps to corners and edges</span>
+            <ol class="measure-list hidden" id="measure-list" aria-label="Finished measurements"></ol>
+            <span class="detail hint">Backspace removes the last one, Esc leaves the tool</span>
+          </div>
+
+          <div class="card hidden" id="section-card" role="region" aria-label="Section plane">
+            <div class="card-head"><span class="grow">Section plane</span><span class="value mono" id="section-value" aria-live="polite">Z 0.000 m</span></div>
+            <div class="axis" role="group" aria-label="Section axis">
+              <button type="button" data-axis="x" aria-pressed="false">X</button>
+              <button type="button" data-axis="y" aria-pressed="false">Y</button>
+              <button type="button" class="active" data-axis="z" aria-pressed="true">Z</button>
+            </div>
+            <label class="row"><span class="sr-only">Section position</span><input id="section-range" type="range" min="0" max="1000" value="720" /></label>
+            <div class="row">
+              <button class="btn sm grow" id="section-flip" type="button">Flip side</button>
+              <button class="btn sm" id="section-cap" type="button" aria-pressed="true">Fill cut</button>
+              <button class="btn sm" id="section-off" type="button">Turn off</button>
+            </div>
+          </div>
+
+          <div id="dropzone">
+            <div class="dz-card">
+              <div class="dz-mark" aria-hidden="true"></div>
+              <h1 class="dz-title">TessIFC viewer</h1>
+              <p class="preview-label">v0.1 developer preview</p>
+              <p class="dz-sub">Open, inspect and measure your IFC model. Files stay in this browser.</p>
+              <div class="dz-actions">
+                <button class="btn primary lg" id="dz-open" type="button">Open IFC file</button>
+              </div>
+              <p class="dz-hint">or drop an .ifc file anywhere · IFC2X3, IFC4 and IFC4X3</p>
+              <div class="dz-caps" aria-label="What this viewer does">
+                <span>Orbit</span><span>Select</span><span>Inspect</span><span>Measure</span><span>Section</span><span>Edit</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="loading" class="hidden">
+            <div class="load-card">
+              <div class="load-mark" aria-hidden="true"></div>
+              <div class="load-name" id="load-name" aria-live="polite">Opening</div>
+              <div class="load-track" id="load-track"><i id="load-bar"></i></div>
+              <div class="load-detail" id="load-detail">Preparing</div>
+            </div>
+          </div>
+        </div>
+
+        <aside id="editor" class="collapsed" aria-label="Edit attributes">
+          <div class="panel-head">
+            <span class="panel-title">Edit attributes</span>
+            <span class="grow"></span>
+            <span class="tag hidden" id="editor-tag"></span>
+            <button class="icon-btn sm" id="editor-close" type="button" title="Close the edit panel (E)" aria-label="Close the edit panel">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+          <div class="panel-body scroll">
+            <div class="page">
+              <div class="empty" id="edit-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
+                <strong>Nothing to edit</strong>
+                <span class="sub">Select an element to change its text attributes. Every other source byte is preserved.</span>
+              </div>
+              <div class="hidden" id="edit-body">
+                <div class="group-title">Text attributes<span class="note" id="edit-class"></span></div>
+                <div class="edit-fields" id="edit-fields"></div>
+                <p class="note" id="edit-status"></p>
+                <div class="edit-actions">
+                  <button class="btn accent grow" id="edit-apply" type="button" disabled>Apply changes</button>
+                  <button class="btn" id="edit-revert" type="button" disabled>Revert</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <aside id="inspector" aria-label="Inspector">
+          <div class="panel-head">
+            <span class="panel-title" id="inspector-title">Properties</span>
+            <span class="grow"></span>
+            <span class="tag hidden" id="inspector-tag"></span>
+            <button class="icon-btn sm" id="inspector-close" type="button" title="Hide the inspector (\)" aria-label="Hide the inspector">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6" /></svg>
+            </button>
+          </div>
+
+          <div class="panel-body" id="tab-properties" role="tabpanel" aria-label="Properties">
+            <div class="page">
+              <div class="empty" id="properties-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 11v6M12 7h.01" /></svg>
+                <strong>Nothing selected</strong>
+                <span class="sub">Click any element in the viewport or the structure tree to read its IFC attributes.</span>
+              </div>
+
+              <div class="sel-card hidden" id="selection-card">
+                <div class="sel-head">
+                  <span class="grow">
+                    <strong class="sel-name" id="selection-name">Wall</strong>
+                    <span class="sel-class" id="selection-class">IFCWALL #0</span>
+                  </span>
+                  <button class="icon-btn sm" id="selection-details" type="button" title="Element details" aria-label="Element details">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z" /><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" /></svg>
+                  </button>
+                  <button class="icon-btn sm" id="selection-edit" type="button" title="Edit attributes (E)" aria-label="Edit attributes">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
+                  </button>
+                  <button class="icon-btn sm" id="selection-clear" type="button" title="Clear the selection (Esc)" aria-label="Clear the selection">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                  </button>
+                </div>
+              </div>
+
+              <label class="search hidden" id="property-search-box">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></svg>
+                <span class="sr-only">Filter properties</span>
+                <input id="property-search" type="search" placeholder="Filter properties" autocomplete="off" />
+              </label>
+
+              <div class="group-title hidden" id="property-heading">IFC attributes<span class="note" id="property-count">0 fields</span></div>
+              <dl class="prop-list" id="property-list"></dl>
+              <p class="note hidden" id="property-none">No property matches this filter.</p>
+            </div>
+          </div>
+
+          <div class="panel-body scroll hidden" id="tab-element" role="tabpanel" aria-label="Element">
+            <div class="page">
+              <div class="empty" id="element-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z" /><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" /></svg>
+                <strong>Nothing selected</strong>
+                <span class="sub">Select an element to see where it sits, how big it is and what its geometry costs.</span>
+              </div>
+              <div class="hidden" id="element-body">
+                <div class="sel-card" id="element-card">
+                  <div class="sel-head">
+                    <span class="grow">
+                      <strong class="sel-name" id="element-name">Wall</strong>
+                      <span class="sel-class" id="element-class">IFCWALL #0</span>
+                    </span>
+                  </div>
+                </div>
+
+                <div class="group-title">Placement<span class="note">IFC metres</span></div>
+                <dl class="kv facts">
+                  <dt>Centre</dt><dd id="element-centre">-</dd>
+                  <dt>Size</dt><dd id="element-size">-</dd>
+                  <dt>Min</dt><dd id="element-min">-</dd>
+                  <dt>Max</dt><dd id="element-max">-</dd>
+                </dl>
+
+                <div class="group-title">Geometry<span class="note">as rendered</span></div>
+                <dl class="kv facts">
+                  <dt>Mesh</dt><dd id="element-mesh">-</dd>
+                  <dt>Triangles</dt><dd id="element-triangles">-</dd>
+                  <dt>Materials</dt><dd id="element-materials">-</dd>
+                  <dt>Placement</dt><dd id="element-shared">-</dd>
+                  <dt>Visibility</dt><dd id="element-state">-</dd>
+                </dl>
+
+                <div class="group-title">Structure<span class="note">containment</span></div>
+                <ol class="el-path" id="element-path"></ol>
+                <p class="note hidden" id="element-path-none">Not placed in the spatial structure.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-body scroll hidden" id="tab-model" role="tabpanel" aria-label="Model">
+            <div class="page">
+              <div class="group-title">Geometry<span class="note">scene</span></div>
+              <dl class="kv metric-block">
+                <dt>IFC entities</dt><dd id="m-entities">-</dd>
+                <dt>Rendered products</dt><dd id="m-products">-</dd>
+                <dt>Triangles</dt><dd id="m-triangles">-</dd>
+                <dt>Unique meshes</dt><dd id="m-meshes">-</dd>
+                <dt>Shared placements</dt><dd id="m-shared">-</dd>
+                <dt>Draw calls</dt><dd id="m-draws">-</dd>
+                <dt>Overlaps skipped</dt><dd id="m-suppressed">-</dd>
+              </dl>
+
+              <div class="group-title">Pipeline<span class="note">this run</span></div>
+              <dl class="kv metric-block">
+                <dt>Parse</dt><dd id="m-parse">-</dd>
+                <dt>Tessellate</dt><dd id="m-geometry">-</dd>
+                <dt>Pack</dt><dd id="m-pack">-</dd>
+                <dt>GPU upload</dt><dd id="m-build">-</dd>
+                <dt>First paint</dt><dd id="m-first">-</dd>
+                <dt>Complete</dt><dd id="m-total">-</dd>
+              </dl>
+
+              <div class="group-title">Memory<span class="note">estimate</span></div>
+              <dl class="kv metric-block">
+                <dt>Source IFC</dt><dd id="m-mem-source">-</dd>
+                <dt>Parse image</dt><dd id="m-mem-image">-</dd>
+                <dt>Geometry pack</dt><dd id="m-mem-pack">-</dd>
+                <dt>GPU estimate</dt><dd id="m-mem-gpu">-</dd>
+              </dl>
+
+              <div class="group-title">Display<span class="note">this browser</span></div>
+              <dl class="kv metric-block">
+                <dt>Depth buffer</dt><dd id="m-depth">-</dd>
+                <dt>Antialiasing</dt><dd id="m-samples">-</dd>
+                <dt>Device pixels</dt><dd id="m-resolution">-</dd>
+              </dl>
+              <p class="note" id="m-display-note">Overlapping surfaces use a stable material priority. Source geometry is never changed.</p>
+            </div>
+          </div>
+
+          <div class="panel-body scroll hidden" id="tab-quality" role="tabpanel" aria-label="Quality">
+            <div class="page">
+              <div class="group-title">Conversion report<span class="note" id="quality-count">0</span></div>
+              <p class="note" id="quality-summary">Open an IFC to review its conversion diagnostics.</p>
+              <ol class="diag-list" id="diagnostic-list"></ol>
+            </div>
+          </div>
+        </aside>
+
+        <nav id="rail" role="tablist" aria-label="Inspector panels">
+          <button class="rail-btn active" type="button" role="tab" aria-selected="true" data-panel="properties" title="Properties" aria-label="Properties">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 11v6M12 7h.01" /></svg>
+          </button>
+          <button class="rail-btn" type="button" role="tab" aria-selected="false" tabindex="-1" data-panel="element" title="Element details" aria-label="Element details">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z" /><path d="M12 12 4 7.5M12 12l8-4.5M12 12v9" /></svg>
+          </button>
+          <button class="rail-btn" type="button" role="tab" aria-selected="false" tabindex="-1" data-panel="model" title="Model statistics" aria-label="Model statistics">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19V9h4v10M10 19V5h4v14M15 19v-7h4v7M4 20h16" /></svg>
+          </button>
+          <button class="rail-btn" type="button" role="tab" aria-selected="false" tabindex="-1" data-panel="quality" title="Conversion report" aria-label="Conversion report">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6M4 20h16" /></svg>
+            <span class="badge" id="quality-badge" data-count="0"></span>
+          </button>
+          <button class="rail-btn" id="rail-editor" type="button" aria-pressed="false" title="Edit attributes (E)" aria-label="Edit attributes">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
+          </button>
+        </nav>
+      </main>
+
+      <footer id="statusbar">
+        <span class="sb-item"><span class="dot" id="status-dot" aria-hidden="true"></span><span id="status-text">Starting the geometry kernel</span></span>
+        <span class="sb-sep" aria-hidden="true"></span>
+        <span class="sb-item" id="status-engine">TessIFC wasm</span>
+        <span class="sb-sep" aria-hidden="true"></span>
+        <span class="sb-item" id="status-counts"></span>
+        <span class="grow"></span>
+        <span class="sb-item shrink" id="status-offset"></span>
+        <span class="sb-sep" aria-hidden="true"></span>
+        <span class="sb-item"><kbd>?</kbd> shortcuts</span>
+      </footer>
+    </div>
+
+    <div id="toasts" aria-live="polite"></div>
+
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <div class="dlg-head">
+        <span class="grow" id="settings-title">Settings</span>
+        <button class="icon-btn sm" id="settings-close" type="button" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        </button>
+      </div>
+      <div class="dlg-body">
+        <div class="group-title">Rendering</div>
+        <div class="field">
+          <span class="field-label">Render scale<span class="hint">Lower draws fewer pixels. Higher sharpens edges.</span></span>
+          <select id="set-scale">
+            <option value="0.75">75%</option>
+            <option value="1">100%</option>
+            <option value="1.5" selected>150%</option>
+            <option value="2">200%</option>
+          </select>
+        </div>
+        <label class="field check">
+          <input type="checkbox" id="set-hidden" checked />
+          <span class="field-label">Start with model helpers hidden<span class="hint">Spaces, openings, guides and reference geometry stay out of the first view.</span></span>
+        </label>
+
+        <div class="group-title">Interface</div>
+        <div class="field">
+          <span class="field-label">Theme<span class="hint">Applies to the panels and the viewport.</span></span>
+          <select id="set-theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-label">Viewport background<span class="hint">Keep a dark viewport under a light interface, or the other way round.</span></span>
+          <select id="set-canvas">
+            <option value="match">Match theme</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+
+        <div class="group-title">Your data</div>
+        <p class="note">Every file is read in this tab. Nothing is uploaded and nothing is stored between sessions apart from the theme and viewport background choices.</p>
+      </div>
+      <div class="dlg-foot"><button class="btn primary" id="settings-done" type="button">Done</button></div>
+    </dialog>
+
+    <dialog id="help-dialog" aria-labelledby="help-title">
+      <div class="dlg-head">
+        <span class="grow" id="help-title">Keyboard shortcuts</span>
+        <button class="icon-btn sm" id="help-close" type="button" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        </button>
+      </div>
+      <div class="dlg-body">
+        <div class="key-cols">
+          <section>
+            <div class="group-title">Camera</div>
+            <div class="key-row"><span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd></span>Front, right, top, isometric</div>
+            <div class="key-row"><span><kbd>F</kbd></span>Frame the model</div>
+            <div class="key-row"><span><kbd>Shift</kbd><kbd>F</kbd></span>Frame the selection</div>
+            <div class="key-row"><span><kbd>P</kbd></span>Sectioned plan view</div>
+            <div class="key-row"><span>Left drag</span>Orbit</div>
+            <div class="key-row"><span>Right drag</span>Pan</div>
+            <div class="key-row"><span>Wheel / pinch</span>Zoom at the pointer</div>
+            <div class="key-row"><span><kbd>+</kbd><kbd>-</kbd></span>Zoom in / out</div>
+            <div class="key-row"><span>Two fingers</span>Pan and pinch to zoom</div>
+            <div class="key-row"><span>Double-click</span>Frame an element</div>
+
+            <div class="group-title">Selection</div>
+            <div class="key-row"><span>Click</span>Select one element</div>
+            <div class="key-row"><span><kbd>I</kbd></span>Isolate the selection</div>
+            <div class="key-row"><span><kbd>H</kbd></span>Hide the selection</div>
+            <div class="key-row"><span><kbd>A</kbd></span>Show everything again</div>
+            <div class="key-row"><span><kbd>E</kbd></span>Edit the selected element</div>
+            <div class="key-row"><span><kbd>Esc</kbd></span>Clear the selection or drop the active tool</div>
+          </section>
+          <section>
+            <div class="group-title">Tools</div>
+            <div class="key-row"><span><kbd>M</kbd></span>Measure point to point</div>
+            <div class="key-row"><span><kbd>Backspace</kbd></span>Remove the last measurement, while measuring</div>
+            <div class="key-row"><span><kbd>X</kbd></span>Section plane</div>
+            <div class="key-row"><span><kbd>D</kbd></span>Cycle shaded, x-ray and wireframe</div>
+
+            <div class="group-title">Structure panel</div>
+            <div class="key-row"><span><kbd>&uarr;</kbd><kbd>&darr;</kbd></span>Move between rows</div>
+            <div class="key-row"><span><kbd>&rarr;</kbd><kbd>&larr;</kbd></span>Open or close a branch</div>
+            <div class="key-row"><span><kbd>Enter</kbd></span>Select the element</div>
+            <div class="key-row"><span><kbd>Space</kbd></span>Show or hide the row</div>
+            <div class="key-row"><span><kbd>F</kbd></span>Frame the row</div>
+
+            <div class="group-title">Workspace</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>K</kbd></span>Command palette</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>O</kbd></span>Open a file</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>S</kbd></span>Export the IFC</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>F</kbd></span>Search the structure</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>B</kbd></span>Toggle the structure panel</div>
+            <div class="key-row"><span><kbd>\</kbd></span>Toggle the inspector</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>F1</kbd></span>Collapse the ribbon</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>,</kbd></span>Settings</div>
+            <div class="key-row"><span><kbd>?</kbd></span>This help</div>
+          </section>
+        </div>
+      </div>
+      <div class="dlg-foot"><button class="btn primary" id="help-done" type="button">Close</button></div>
+    </dialog>
+
+    <div id="palette-backdrop" class="hidden">
+      <div id="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+        <div class="pal-input">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6" /><path d="m16 16 4 4" /></svg>
+          <input id="palette-input" type="text" placeholder="Type a command" autocomplete="off" spellcheck="false" />
+          <kbd>Esc</kbd>
+        </div>
+        <div id="palette-list"></div>
+      </div>
+    </div>
+
+    <input id="file-input" type="file" accept=".ifc" hidden />
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

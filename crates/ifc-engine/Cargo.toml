@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "tessifc-engine"
+description = "Orchestration for TessIFC: settings, product selection, scheduling, streaming, diagnostics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+tessifc-step = { workspace = true }
+tessifc-schema = { workspace = true }
+tessifc-model = { workspace = true }
+tessifc-geom = { workspace = true }
+tessifc-mesh = { workspace = true }
+tessifc-pack = { workspace = true }
+serde = { workspace = true }
+glam = { workspace = true }
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+# Schema selection forwards down the whole dependency chain.
+[features]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
+# Evaluate products across a rayon pool. Native only: the wasm build stays
+# single-threaded and streams through `Engine::session` instead.
+parallel = ["dep:rayon"]
+schema-ifc2x3 = ["tessifc-schema/schema-ifc2x3", "tessifc-model/schema-ifc2x3", "tessifc-step/schema-ifc2x3", "tessifc-geom/schema-ifc2x3"]
+schema-ifc4 = ["tessifc-schema/schema-ifc4", "tessifc-model/schema-ifc4", "tessifc-step/schema-ifc4", "tessifc-geom/schema-ifc4"]
+schema-ifc4x3 = ["tessifc-schema/schema-ifc4x3", "tessifc-model/schema-ifc4x3", "tessifc-step/schema-ifc4x3", "tessifc-geom/schema-ifc4x3"]

@@ -1,0 +1,72 @@
+{
+  "name": "@tessifc/core",
+  "version": "0.1.0",
+  "description": "An Apache-2.0 IFC geometry kernel for the browser and Node: IFC-SPF in, render-ready meshes out",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "pkg/tessifc_wasm.js",
+  "types": "pkg/tessifc_wasm.d.ts",
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./pkg-node/tessifc_wasm.d.ts",
+        "default": "./pkg-node/tessifc_wasm.js"
+      },
+      "default": {
+        "types": "./pkg/tessifc_wasm.d.ts",
+        "default": "./pkg/tessifc_wasm.js"
+      }
+    },
+    "./web": {
+      "types": "./pkg/tessifc_wasm.d.ts",
+      "default": "./pkg/tessifc_wasm.js"
+    },
+    "./node": {
+      "types": "./pkg-node/tessifc_wasm.d.ts",
+      "default": "./pkg-node/tessifc_wasm.js"
+    },
+    "./pkg/*": "./pkg/*",
+    "./pkg-node/*": "./pkg-node/*"
+  },
+  "sideEffects": false,
+  "files": [
+    "pkg/",
+    "pkg-node/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "ifc",
+    "bim",
+    "geometry",
+    "step",
+    "wasm",
+    "webassembly",
+    "buildingsmart",
+    "tessellation",
+    "viewer"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/wasm"
+  },
+  "scripts": {
+    "build": "python ../../scripts/build-wasm.py",
+    "test": "node test/smoke.mjs",
+    "prepack": "node check-package.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

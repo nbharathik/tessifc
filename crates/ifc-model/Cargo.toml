@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "tessifc-model"
+description = "Typed views over a TessIFC model image: entities, attributes by name, inverse relationship index."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+tessifc-step = { workspace = true }
+tessifc-schema = { workspace = true }
+
+# Schema selection forwards down the whole dependency chain.
+[features]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
+schema-ifc2x3 = ["tessifc-schema/schema-ifc2x3", "tessifc-step/schema-ifc2x3"]
+schema-ifc4 = ["tessifc-schema/schema-ifc4", "tessifc-step/schema-ifc4"]
+schema-ifc4x3 = ["tessifc-schema/schema-ifc4x3", "tessifc-step/schema-ifc4x3"]

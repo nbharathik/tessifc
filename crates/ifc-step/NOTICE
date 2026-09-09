@@ -1,0 +1,24 @@
+TessIFC
+Copyright 2026 Bharathi Kannan
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+IFC schema definitions
+--------------------------------------------------------------------------------
+TessIFC generates its schema tables (crates/ifc-schema/src/gen/*.rs) from the
+official EXPRESS schema files published by buildingSMART International:
+
+  IFC2X3 TC1, IFC4 ADD2 TC1, IFC4X3 ADD2
+  (c) buildingSMART International Ltd.
+  https://technical.buildingsmart.org/standards/ifc/ifc-schema-specifications/
+  Licensed under Creative Commons Attribution-NoDerivatives 4.0 International
+  (CC BY-ND 4.0), https://creativecommons.org/licenses/by-nd/4.0/
+
+The EXPRESS files themselves are not redistributed with this repository. The
+committed Rust files are generated tables of names, types, ordering and
+inheritance derived from those schemas, attributed here as required.
+
+"IFC" and "buildingSMART" are trademarks of buildingSMART International Ltd.
+TessIFC is an independent implementation and is not endorsed by, affiliated
+with, or certified by buildingSMART International.

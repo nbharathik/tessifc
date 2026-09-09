@@ -1,0 +1,53 @@
+{
+  "name": "@tessifc/three",
+  "version": "0.1.0",
+  "description": "three.js meshes from a TessIFC model",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./build": "./src/build.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "ifc",
+    "bim",
+    "three",
+    "threejs",
+    "tessifc"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "adapters/three"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/build.test.mjs"
+  },
+  "peerDependencies": {
+    "three": ">=0.150.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  },
+  "peerDependenciesMeta": {
+    "three": {
+      "optional": false
+    }
+  }
+}

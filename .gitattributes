@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Normalise to LF in the repository so that a Windows and a Linux checkout
+# produce byte-identical files, which is what makes deterministic output and
+# `cargo fmt --check` in CI mean the same thing everywhere.
+* text=auto eol=lf
+
+*.rs   text eol=lf
+*.py   text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+
+*.wasm binary
+
+# Generated schema tables: large, machine written, and not worth reviewing
+# line by line in a pull request.
+crates/ifc-schema/src/gen/*.rs linguist-generated=true

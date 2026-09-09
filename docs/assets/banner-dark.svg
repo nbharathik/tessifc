@@ -1,0 +1,23 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="224" viewBox="0 0 600 224" role="img" aria-labelledby="title">
+  <title id="title">TessIFC, an IFC geometry kernel and viewer</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#181c24"/>
+      <stop offset="1" stop-color="#0b0d11"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(256 14)">
+    <rect width="88" height="88" rx="20" fill="url(#tile)"/>
+    <rect x="0.75" y="0.75" width="86.5" height="86.5" rx="19.25" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.5"/>
+    <g transform="translate(13.5 13.5) scale(0.953)">
+      <polygon points="32,6 56,19 32,32 8,19" fill="#93b9fb"/>
+      <polygon points="8,19 32,32 32,58 8,45" fill="#3b82f6"/>
+      <polygon points="56,19 56,45 32,58 32,32" fill="#1e5bd0"/>
+      <path d="M8 19 32 32M32 6 32 32M56 19 32 32M8 45 32 32M56 45 32 32" stroke="#0f1115" stroke-width="1.1" stroke-opacity="0.55" fill="none"/>
+    </g>
+  </g>
+  <text x="304.5" y="160" text-anchor="middle" font-family="Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="42" font-weight="800" letter-spacing="9" fill="#f4f6f9">TESSIFC</text>
+  <rect x="282" y="172" width="36" height="3" rx="1.5" fill="#3b82f6"/>
+  <text x="301" y="200" text-anchor="middle" font-family="Inter, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="600" letter-spacing="2.4" fill="#8b95a7">IFC GEOMETRY KERNEL AND VIEWER</text>
+</svg>

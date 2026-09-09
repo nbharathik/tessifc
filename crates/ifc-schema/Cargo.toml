@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "tessifc-schema"
+description = "Generated IFC2X3 / IFC4 / IFC4X3 schema tables: class ids, inheritance, attribute order."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+phf = { workspace = true }
+
+[features]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
+schema-ifc2x3 = []
+schema-ifc4 = []
+schema-ifc4x3 = []

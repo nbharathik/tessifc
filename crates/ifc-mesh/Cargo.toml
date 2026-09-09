@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "tessifc-mesh"
+description = "Mesh operations for TessIFC: triangulation, welding, normals, exact half-space clipping, booleans."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+glam = { workspace = true }
+thiserror = { workspace = true }
+earcutr = { workspace = true }
+
+[features]
+default = []
+# Mesh-mesh booleans. Optional: the default clip-only path does not need them.
+manifold = []

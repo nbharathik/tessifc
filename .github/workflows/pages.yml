@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Build the website and publish it to GitHub Pages: the landing page, the
+# rendered documentation and the viewer with the browser WASM package beside
+# it. Runs on every push to main so the site is never older than the branch,
+# and on demand.
+#
+# Enable it once in Settings, Pages, by setting the source to GitHub Actions.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. A newer push waits rather than cancelling, so the
+# site always ends on the newest commit.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build the site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: install wasm-bindgen-cli at the locked version
+        run: |
+          version=$(python - <<'EOF'
+          import re, pathlib
+          lock = pathlib.Path("Cargo.lock").read_text(encoding="utf-8")
+          match = re.search(r'name = "wasm-bindgen"\nversion = "([^"]+)"', lock)
+          print(match.group(1))
+          EOF
+          )
+          cargo install wasm-bindgen-cli --version "$version" --locked
+
+      - name: install binaryen for wasm-opt
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: build the browser package
+        run: python scripts/build-wasm.py --target web
+
+      # A project site lives under /<repo>/, so every URL the pages emit has to
+      # carry that prefix. A user site is served from the root instead.
+      - name: build the site
+        run: |
+          base="${{ github.event.repository.name }}"
+          if [ "$base" = "${{ github.repository_owner }}.github.io" ]; then
+            python scripts/build-site.py --base /
+          else
+            python scripts/build-site.py --base "/$base/"
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -47,10 +47,6 @@ PAGES = [
     ("coverage.md", "IFC coverage", "Which classes and representations are supported today."),
     ("editing.md", "Editing", "Changing attributes without rewriting the rest of the file."),
 ]
-EXTRA = [
-    (Path("CONTRIBUTING.md"), "contributing", "Contributing", "How to build, test and add evaluators."),
-    (Path("SECURITY.md"), "security", "Security", "How to report a vulnerability."),
-]
 
 SITE_MARKER = ".tessifc-site"
 SITE_SIGNATURE = "TessIFC generated website v1\n"
@@ -93,7 +89,6 @@ def rewrite_markdown(source: str, source_path: Path, staged_path: str) -> str:
     """
     source_path = source_path if source_path.is_absolute() else REPO / source_path
     known = {(REPO / "docs" / name).resolve(): f"docs/{page_stem(name)}.md" for name, _, _ in PAGES}
-    known.update({(REPO / path).resolve(): f"docs/{stem}.md" for path, stem, _, _ in EXTRA})
     assets = (REPO / "docs" / "assets").resolve()
 
     def target_url(target: str) -> str:
@@ -224,7 +219,6 @@ def stage_documents(docs: Path) -> None:
     shutil.copy2(site / "index.md", docs / "index.md")
     shutil.copy2(site / "docs-index.md", docs / "docs" / "index.md")
     sources = [(REPO / "docs" / name, page_stem(name), label, blurb) for name, label, blurb in PAGES]
-    sources += [(REPO / path, stem, label, blurb) for path, stem, label, blurb in EXTRA]
     for source, stem, label, description in sources:
         destination = f"docs/{stem}.md"
         content = rewrite_markdown(source.read_text(encoding="utf-8"), source, destination)
@@ -298,7 +292,7 @@ def build_contents(out: Path, base: str) -> int:
         return 1
 
     # Keep all previously published guide addresses, including URL fragments.
-    stems = [page_stem(name) for name, _, _ in PAGES] + [stem for _, stem, _, _ in EXTRA]
+    stems = [page_stem(name) for name, _, _ in PAGES]
     for stem in stems:
         (out / "docs" / f"{stem}.html").write_text(redirect(f"{base}docs/{stem}/"), encoding="utf-8")
 

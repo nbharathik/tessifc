@@ -40,7 +40,7 @@ class Page(HTMLParser):
 class MarkdownLinks(unittest.TestCase):
     def test_repository_links_are_rewritten_for_staged_markdown(self):
         source = (
-            "[Contribute](../CONTRIBUTING.md)\n"
+            "[SDK](../docs/sdk.md)\n"
             "[Preview](preview.md)\n"
             "[Header](igp-format.md#header)\n"
             "[Viewer](../viewer/README.md)\n"
@@ -49,7 +49,7 @@ class MarkdownLinks(unittest.TestCase):
         rewritten = site.rewrite_markdown(
             source, site.REPO / "docs" / "getting-started.md", "docs/getting-started.md"
         )
-        self.assertIn("(contributing.md)", rewritten)
+        self.assertIn("(sdk.md)", rewritten)
         self.assertIn("(preview.md)", rewritten)
         self.assertIn("(igp-format.md#header)", rewritten)
         self.assertIn(f"({site.REPO_URL}/blob/main/viewer/README.md)", rewritten)
@@ -59,7 +59,7 @@ class MarkdownLinks(unittest.TestCase):
         source = (
             "[External](https://example.org/guide.md#section)\n"
             "[Email](mailto:hello@example.org)\n"
-            "```markdown\n[Example](../CONTRIBUTING.md)\n```\n"
+            "```markdown\n[Example](../docs/sdk.md)\n```\n"
         )
         self.assertEqual(
             site.rewrite_markdown(
@@ -80,7 +80,6 @@ class GeneratedSite(unittest.TestCase):
         if site.build_contents(cls.out, "/tessifc") != 0:
             raise AssertionError("the real website build failed")
         cls.stems = [site.page_stem(source) for source, _, _ in site.PAGES]
-        cls.stems += [stem for _, stem, _, _ in site.EXTRA]
         cls.paths = [Path("index.html"), Path("docs/index.html")]
         cls.paths += [Path("docs") / stem / "index.html" for stem in cls.stems]
         cls.pages = {
@@ -104,7 +103,6 @@ class GeneratedSite(unittest.TestCase):
         historical = {
             "getting-started": "three-js",
             "preview": "v0-1-developer-preview",
-            "security": "v0-1-threat-model",
         }
         for stem, anchor in historical.items():
             with self.subTest(page=stem, anchor=anchor):

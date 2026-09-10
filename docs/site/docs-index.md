@@ -60,8 +60,3 @@ the command line and Rust.
     Schema recognition is broader than geometry support. Review the conversion
     report before using a mesh downstream. The [preview contract](preview.md)
     explains how to validate your results.
-
-## Contribute
-
-See [Contributing](contributing.md) for local development and adding evaluators.
-To report a vulnerability, follow the [security policy](security.md).

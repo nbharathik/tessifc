@@ -31,24 +31,43 @@ export async function checkTree(page, check) {
   });
   await page.evaluate(() => {
     const r = window.__tessifc.renderer, draw = r.draw;
-    window.__treeTest = { renders: 0, restore: () => { r.draw = draw; delete window.__treeTest; } };
+    const viewport = document.getElementById("viewport");
+    const released = () => { window.__treeTest.selectedAtRelease = window.__tessifc.state.selection?.record; };
+    window.__treeTest = { renders: 0, selectedAtRelease: null, restore: () => {
+      r.draw = draw;
+      viewport.removeEventListener("pointerup", released);
+      delete window.__treeTest;
+    } };
+    // Observe selection before pointerup finishes dispatching.
+    viewport.addEventListener("pointerup", released);
     r.draw = function (...args) {
       if (!args[0]) window.__treeTest.renders += 1;
       return draw.apply(this, args);
     };
   });
-  await page.mouse.click(point.x, point.y);
-  await page.waitForFunction((record) => window.__tessifc.state.selection?.record === record, point.record, { polling: 20 });
-  await page.waitForTimeout(250);
-  const click = await page.evaluate(() => {
-    const renders = window.__treeTest.renders;
-    window.__treeTest.restore();
-    const host = document.getElementById("tree-spatial");
-    const row = host.querySelector(".trow.selected");
-    const a = row?.getBoundingClientRect(), b = host.getBoundingClientRect();
-    return { renders, revealed: Boolean(row) && a.top >= b.top - 1 && a.bottom <= b.bottom + 1 };
-  });
-  check(click.renders === 1, `a click selects in its release handler and paints one frame (${click.renders})`);
+  let click;
+  try {
+    await page.mouse.click(point.x, point.y);
+    check(await page.evaluate((record) => window.__treeTest.selectedAtRelease === record, point.record),
+      "a click selects in its release handler");
+    // Selection is synchronous; its frame can wait for earlier GPU work to complete.
+    await page.waitForFunction((record) => {
+      const T = window.__tessifc;
+      return T.state.selection?.record === record && !T.renderer.dirty && !T.panelWork.frame;
+    }, point.record, { polling: 20 });
+    // Keep observing after the completed frame to catch duplicate settled redraws.
+    await page.waitForTimeout(250);
+    click = await page.evaluate(() => {
+      const renders = window.__treeTest.renders;
+      const host = document.getElementById("tree-spatial");
+      const row = host.querySelector(".trow.selected");
+      const a = row?.getBoundingClientRect(), b = host.getBoundingClientRect();
+      return { renders, revealed: Boolean(row) && a.top >= b.top - 1 && a.bottom <= b.bottom + 1 };
+    });
+  } finally {
+    await page.evaluate(() => window.__treeTest.restore());
+  }
+  check(click.renders === 1, `a click paints one frame (${click.renders})`);
   check(click.revealed, "the selected element's row is opened and scrolled into view in the structure panel");
 
   await page.click("#tree-expand");

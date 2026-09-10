@@ -149,11 +149,6 @@ cd viewer && npx playwright install chromium && npm test
 | [IGP format](docs/igp-format.md) | Mesh container and readers |
 | [Editing](docs/editing.md) | Source-preserving attribute changes |
 
-## Contributing
-
-[CONTRIBUTING.md](CONTRIBUTING.md) explains how to build, test and add
-evaluators. Report security issues through [SECURITY.md](SECURITY.md).
-
 ## Licence
 
 Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). TessIFC is an

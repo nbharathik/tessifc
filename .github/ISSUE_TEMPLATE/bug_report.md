@@ -38,7 +38,7 @@ paste here
 
 <!-- If it panicked, paste the panic message and set RUST_BACKTRACE=1 first.
      A panic in the parser is a security bug, not a correctness bug: it goes
-     straight to the top of the list. See SECURITY.md if the file came from an
+     straight to the top of the list. Mention if the file came from an
      untrusted source. -->
 
 ## The file

@@ -66,9 +66,6 @@ nav:
       - Reference:
           - IGP format: docs/igp-format.md
           - IFC coverage: docs/coverage.md
-      - Project:
-          - Contributing: docs/contributing.md
-          - Security: docs/security.md
   - Viewer: /tessifc/viewer/
 
 plugins:

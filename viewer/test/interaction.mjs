@@ -14,11 +14,26 @@ export async function checkInteraction(page, check) {
       }
     }
     if (!pointer) throw new Error("fixture has no pickable surface");
-    const before = r.project(pointer.point);
-    r.canvas.dispatchEvent(new WheelEvent("wheel", { clientX: pointer.px, clientY: pointer.py, deltaY: -100, cancelable: true }));
+    // Zoom must leave the orbit target alone, or rotating after it swings the
+    // model around a pivot that is no longer on it.
+    const world = () => r.camera.target.map((value, axis) => value + r.renderOrigin[axis]);
+    const pivotBefore = world();
+    const screenBefore = r.project(pivotBefore);
+    r.canvas.dispatchEvent(new WheelEvent("wheel", { clientX: pointer.px, clientY: pointer.py, deltaY: 240, cancelable: true }));
     r.render(true);
-    const after = r.project(pointer.point);
-    for (let step = 0; step < 25; step++) r.zoomAt(0.7, pointer.px, pointer.py, true);
+    const pivotAfter = world();
+    const screenAfter = r.project(pivotAfter);
+    const pivotMoved = Math.hypot(...pivotBefore.map((value, axis) => value - pivotAfter[axis]));
+    const pivotDrift = Math.hypot(screenBefore.x - screenAfter.x, screenBefore.y - screenAfter.y);
+    let orbitDrift = 0;
+    for (let step = 0; step < 24; step++) {
+      r.orbit(40, 7);
+      r.render(true);
+      const at = r.project(world());
+      orbitDrift = Math.max(orbitDrift, Math.hypot(at.x - screenAfter.x, at.y - screenAfter.y));
+    }
+    r.fit(); r.render(true);
+    for (let step = 0; step < 25; step++) r.zoomAt(0.7);
     const closeDistance = r.camera.distance;
     r.fit(); r.render(true);
     const saved = JSON.parse(JSON.stringify(r.camera));
@@ -32,12 +47,72 @@ export async function checkInteraction(page, check) {
     r.canvas.height = height;
     r.resizeDirty = true;
     r.fit(); r.render(true);
-    return { drift: Math.hypot(before.x - after.x, before.y - after.y), closeDistance, panDifference: Math.hypot(...firstPan.map((value, i) => value - secondPan[i])) };
+    return { pivotMoved, pivotDrift, orbitDrift, closeDistance, panDifference: Math.hypot(...firstPan.map((value, i) => value - secondPan[i])) };
   });
-  check(navigation.drift < 0.5, `zoom keeps a picked surface under the cursor (${navigation.drift.toFixed(3)} px)`);
+  check(navigation.pivotMoved < 1e-9, `zooming out leaves the orbit target where it was (${navigation.pivotMoved.toExponential(1)} m)`);
+  check(navigation.pivotDrift < 0.5, `the orbit target holds its place on screen through a zoom (${navigation.pivotDrift.toFixed(3)} px)`);
+  check(navigation.orbitDrift < 0.5, `a zoomed-out orbit turns about the target instead of swinging it (${navigation.orbitDrift.toFixed(3)} px)`);
   check(navigation.closeDistance < 0.01, "zoom reaches small details below the old one-centimetre pivot limit");
   check(navigation.panDifference < 1e-9, "pan distance is independent of drawing-buffer resolution");
   await page.waitForTimeout(150);
+  const unchanged = await page.evaluate(() => {
+    const r = window.__tessifc.renderer;
+    const camera = JSON.stringify(r.camera);
+    r.render(true);
+    r.orbit(0, 0); r.pan(0, 0);
+    return !r.dirty && JSON.stringify(r.camera) === camera;
+  });
+  check(unchanged, "zero-distance orbit and pan preserve the camera and its painted frame");
+  const wheelNotifications = await page.evaluate(() => {
+    const r = window.__tessifc.renderer, rect = r.canvas.getBoundingClientRect();
+    const draw = r.draw, resize = r.resize, change = r.onCameraChange;
+    const probe = window.__wheelFrameTest = { frames: 0, resizes: 0, changes: 0 };
+    r.draw = function (...args) {
+      if (!args[0]) probe.frames++;
+      return draw.apply(this, args);
+    };
+    r.resize = function (...args) { probe.resizes++; return resize.apply(this, args); };
+    r.onCameraChange = function (...args) { probe.changes++; return change.apply(this, args); };
+    probe.restore = () => { r.draw = draw; r.resize = resize; r.onCameraChange = change; delete window.__wheelFrameTest; };
+    r.canvas.dispatchEvent(new WheelEvent("wheel", {
+      clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, deltaY: -100, cancelable: true,
+    }));
+    return probe.changes;
+  });
+  try {
+    await page.waitForTimeout(220);
+    const wheel = await page.evaluate(() => ({
+      frames: window.__wheelFrameTest.frames,
+      resizes: window.__wheelFrameTest.resizes,
+      interacting: window.__tessifc.renderer.interacting,
+    }));
+    check(wheelNotifications === 1 && wheel.frames === 1 && wheel.resizes === 0 && !wheel.interacting,
+      "one wheel movement paints once without a duplicate settled frame or canvas resize");
+  } finally {
+    await page.evaluate(() => window.__wheelFrameTest.restore());
+  }
+  const dragStart = await page.evaluate(() => {
+    const r = window.__tessifc.renderer, rect = r.canvas.getBoundingClientRect();
+    window.__dragPickCount = 0;
+    window.__dragOriginalPick = r.pick;
+    r.pick = function (...args) { window.__dragPickCount++; return window.__dragOriginalPick.apply(this, args); };
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  });
+  let dragPicks;
+  try {
+    await page.mouse.move(dragStart.x, dragStart.y);
+    await page.mouse.down();
+    await page.mouse.move(dragStart.x + 35, dragStart.y + 12);
+    await page.mouse.move(dragStart.x, dragStart.y);
+    await page.mouse.up();
+    dragPicks = await page.evaluate(() => window.__dragPickCount);
+  } finally {
+    await page.evaluate(() => {
+      window.__tessifc.renderer.pick = window.__dragOriginalPick;
+      delete window.__dragOriginalPick; delete window.__dragPickCount;
+    });
+  }
+  check(dragPicks === 0, "an orbit that returns to its starting point does not pick or select on release");
   const before = await page.evaluate(() => window.__tessifc.renderer.camera.distance);
   await page.click("#dock-zoom-in");
   const after = await page.evaluate(() => window.__tessifc.renderer.camera.distance);

@@ -49,6 +49,7 @@ viewer/src/measure.js    snapping and measurement maths, pure and unit-tested
 viewer/src/navigation.js cursor anchors, wheel scaling and camera framing
 viewer/src/culling.js    conservative visibility tests for render batches
 viewer/src/scheduler.js  frame coalescing and responsive input tasks
+viewer/src/gpu-frame-gate.js nonblocking GPU frame pacing
 viewer/src/renderer.js   the WebGL2 renderer
 viewer/src/worker.js     the geometry worker
 viewer/src/igp.js        the IGP reader
@@ -76,9 +77,10 @@ zoom; render scale in Settings controls canvas sharpness separately.
 
 ## Navigation
 
-Scroll over a surface to zoom toward it. Trackpad deltas keep their magnitude,
-and the surface stays under the pointer during a wheel gesture. Double-click
-to frame an element or use the **+ / −** buttons and shortcuts. **F** restores
+Scroll to zoom along the view direction. Trackpad deltas keep their magnitude.
+Zooming leaves the orbit centre where it is, so a model stays centred however
+far out you go and rotating never swings it around the screen. Double-click an
+element to make it the new centre, or use the **+ / −** buttons and shortcuts. **F** restores
 the whole model; **Shift F** frames the current selection. Framing accounts
 for portrait viewports and millimetre-scale parts.
 
@@ -220,7 +222,8 @@ Two products that share a face, a slab edge flush with a wall, a finish on a
 floor, a column face in a facade panel, would otherwise fight for the pixel
 and flicker while the camera moves. The viewer settles them in three passes:
 
-1. An unbiased opaque pass writes canonical depth.
+1. An unbiased opaque pass writes canonical depth. Contested batches skip
+   shading in this pass because the following overlay supplies their colour.
 2. Materials whose bounding boxes overlap another opaque material of a
    different colour are redrawn in one deterministic colour order, with
    depth writes off and a polygon offset clamped to a 0.75 mm world-space
@@ -257,8 +260,8 @@ is antialiasing, not depth.
 target where the browser permits, down a 4x, 2x, 1x sample ladder within a
 sample-pixel budget. The default device pixel ratio is capped at 1.5, with
 separate ceilings on rendered pixels and sample pixels. Rendering runs only
-after model, camera or interface state changes. Selection uses a CPU bounds
-broad phase with a budget, then triangle tests, so it never stalls on a
+after model, camera or interface state changes. Selection uses a spatial
+hierarchy of record bounds, then budgeted triangle tests, so it never stalls on a
 synchronous GPU readback. Opaque singletons sharing a colour are submitted as
 bounded batches while repeated geometry stays instanced once its copies
 would cost more than a draw. Wire indices are prepared in idle time after a
@@ -267,27 +270,38 @@ triangles removed, is prepared once and reused when the finished pack is
 rebuilt after streaming. Hidden batches and batches outside the view are skipped before GPU
 submission; hidden records in mixed batches are clipped before rasterisation.
 Transparent parts retain their independent sorting order.
+Section clipping uses a separate shader, so an unsectioned view can reject
+occluded fragments before shading them.
 
-Complex scenes draw into a smaller offscreen target during orbit, pan and zoom,
-then return to full resolution when the gesture ends. Both targets are prepared
-before interaction and reused, so a gesture neither resizes the canvas nor
-reallocates its GPU buffers. The cache is bounded and included in the reported
-GPU memory estimate. The sampling grid stays fixed throughout each gesture.
-Geometry and picking accuracy are unchanged. The orientation gizmo updates once
-per rendered frame, and an empty measurement overlay does no drawing work.
+Orbit, pan and zoom keep the resting resolution and antialiasing by default,
+including on complex scenes. **Smooth motion** in Settings offers the usual
+trade instead: a scene that cannot keep up draws a smaller frame while a
+gesture is in progress, in at most two steps and only after several slow
+frames in a row, so a single stall never softens the view, and the resting
+frame is always full size. It is off because a frame here is normally bound by
+how much geometry it submits rather than by how many pixels it fills, so on
+large models it costs sharpness without buying frames; it is worth trying on a
+machine where fill is the limit. Render scale in Settings controls resting
+sharpness explicitly. The
+orientation gizmo shares scheduled view updates, and an empty measurement
+overlay does no drawing work.
 
 Normal motion shares animation frames. Discrete actions and overdue input frames
 can also render through a queued task when animation callbacks are delayed.
+When the GPU falls behind, pending camera changes share the next available
+frame. Completion checks never wait for the GPU, and the final camera position
+still draws after the gesture ends. Selections from a resting view use a shorter
+queue; motion keeps its existing allowance until outstanding frames complete.
 A click selects inside its own release handler, so the release and the
-selection share one frame. The viewer schedules no recurring rendering work
+selection share one frame. Repeated clicks on the current element reuse its
+selection and properties. The viewer schedules no recurring rendering work
 while idle.
 
 The render targets keep the largest frame they have drawn, so folding a panel
 back and forth allocates nothing after the first time; a smaller frame draws
 into a corner of them. A run of canvas size changes, a window being dragged,
 changes the drawing buffer once the size has settled, and the browser scales
-the last frame into the new box meanwhile. The gesture target is prepared after
-the frame that follows a resize, not inside it. Hiding, isolating and showing
+the last frame into the new box meanwhile. Hiding, isolating and showing
 read the overlapping-material plan off the record pairs found once at load, so
 a visibility change does not sweep the model again. The frame after a click or
 a visibility change carries the model and the selection card; the structure
@@ -328,6 +342,8 @@ dependency.
 
 `navigation.test.mjs` checks camera maths without a browser.
 `scheduler.test.mjs` checks frame coalescing, delayed callbacks and cancellation.
+`picking.test.mjs` compares spatial queries with the original bounds scan.
+`stream.test.mjs` checks memory accounting through append, replacement and deletion.
 `render.test.mjs` generates a first-party pavilion in memory, loads it in
 headless Chromium and reads the frame
 buffer back. It asserts that every product with geometry paints at least one
@@ -336,8 +352,8 @@ pixel, and that coplanar multi-colour fixtures keep one winner through
 sixteen orbit angles under both depth conventions. It also verifies cursor
 zoom, pan scaling, controls and mobile panels. Culling is compared against
 unculled pixels across display modes, sections and views; hidden and offscreen
-geometry must issue no mesh draws. Gesture tests verify reduced offscreen
-resolution, a fixed canvas, full-resolution restoration and target reuse.
+geometry must issue no mesh draws. Gesture tests verify full resolution,
+unchanged antialiasing, identical pixels at the same camera position and target reuse.
 Pointer and selection tests also run with animation callbacks held. The structure
 panel is checked for a one-frame click selection that reveals its row, sliced
 expansion, correct row states in lists the browser had skipped, and keyboard

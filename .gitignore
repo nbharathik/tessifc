@@ -27,3 +27,5 @@ Thumbs.db
 *.ifc
 *.ifczip
 *.igp
+CONTRIBUTING.md
+SECURITY.md

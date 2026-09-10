@@ -516,7 +516,7 @@ assert.match(
 );
 assert.match(
   renderer,
-  /for \(const batch of this\.opaqueBatches\) this\.drawBatch\(batch\);[\s\S]*?gl\.depthMask\(false\);[\s\S]*?gl\.depthFunc\(this\.reversedDepth \? gl\.GEQUAL : gl\.LEQUAL\);[\s\S]*?for \(const batch of this\.contestedOpaqueBatches\)/,
+  /for \(const batch of this\.opaqueBatches\) \{[\s\S]*?this\.drawBatch\(batch\);[\s\S]*?gl\.depthMask\(false\);[\s\S]*?gl\.depthFunc\(this\.reversedDepth \? gl\.GEQUAL : gl\.LEQUAL\);[\s\S]*?for \(const batch of this\.contestedOpaqueBatches\)/,
   "the deterministic overlay must read an unchanged canonical opaque depth buffer",
 );
 assert.match(

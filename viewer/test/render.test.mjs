@@ -10,7 +10,10 @@ import { instrumentViewer, serveViewer } from "./harness.mjs";
 import { pavilionFile } from "./fixture.mjs";
 import { checkInteraction } from "./interaction.mjs";
 import { checkRenderWork } from "./render-work.mjs";
+import { checkPicking } from "./picking-render.mjs";
 import { checkScheduling } from "./scheduling.mjs";
+import { checkGpuPacing } from "./gpu-pacing.mjs";
+import { checkSelectionUpdates } from "./selection-updates.mjs";
 import { checkTree } from "./tree.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -90,7 +93,10 @@ try {
   await page.waitForTimeout(800);
   await checkInteraction(page, check);
   await checkRenderWork(page, check);
+  await checkPicking(page, check);
   await checkScheduling(page, check);
+  await checkGpuPacing(page, check);
+  await checkSelectionUpdates(page, check);
   await checkTree(page, check);
 
   const display = await page.evaluate(() => window.__tessifc.renderer.displayInfo());

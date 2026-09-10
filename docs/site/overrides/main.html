@@ -1,0 +1,20 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "base.html" %}
+{% block extrahead %}
+  {{ super() }}
+  <script>
+    // Share the established preference with the viewer, before the first paint.
+    (() => {
+      try {
+        const mode = localStorage.getItem("tessifc.theme");
+        const index = ["system", "light", "dark"].indexOf(mode);
+        if (index < 0) return;
+        const dark = mode === "dark" || (mode === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        __md_set("__palette", { index, color: {
+          media: mode === "system" ? "(prefers-color-scheme)" : `(prefers-color-scheme: ${mode})`,
+          scheme: dark ? "slate" : "default", primary: "custom", accent: "custom",
+        }});
+      } catch { /* Storage can be unavailable in private browsing. */ }
+    })();
+  </script>
+{% endblock %}

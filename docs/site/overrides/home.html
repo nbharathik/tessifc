@@ -1,0 +1,63 @@
+{# SPDX-License-Identifier: Apache-2.0 #}
+{% extends "main.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <meta property="og:title" content="TessIFC · IFC geometry for your application">
+  <meta property="og:description" content="An open-source IFC geometry kernel in Rust. Building models in, render-ready meshes out.">
+  <meta property="og:image" content="{{ config.site_url }}assets/viewer.png">
+{% endblock %}
+
+{% block content %}
+<div class="tess-home">
+  <section class="tess-hero" aria-labelledby="hero-title">
+    <div class="tess-hero-copy">
+      <a class="tess-release" href="{{ 'docs/preview/' | url }}"><span></span>v0.1 developer preview</a>
+      <h1 id="hero-title">IFC files in.<br>Geometry out.</h1>
+      <p class="tess-lead">The open-source geometry kernel for building with IFC.</p>
+      <p class="tess-description">Read building models and turn them into render-ready meshes. Written in Rust, ready for the browser, Node.js and native applications.</p>
+      <div class="tess-actions">
+        <a class="md-button md-button--primary" href="{{ config.extra.viewer_url }}">Open the viewer <span class="twemoji">{% include ".icons/material/cube-scan.svg" %}</span></a>
+        <a class="md-button" href="{{ 'docs/getting-started/' | url }}">Get started</a>
+      </div>
+      <p class="tess-local"><span class="twemoji">{% include ".icons/material/lock-outline.svg" %}</span> Your files stay in your browser.</p>
+    </div>
+    <figure class="tess-preview">
+      <div class="tess-preview-bar"><span class="tess-preview-name"><span class="twemoji">{% include ".icons/material/cube-outline.svg" %}</span> TessIFC Viewer</span><span>Local workspace</span></div>
+      <a href="{{ config.extra.viewer_url }}" aria-label="Open the TessIFC model viewer">
+        <img src="{{ 'assets/viewer.png' | url }}" alt="TessIFC viewer showing a pavilion model, its spatial tree and the selected wall's IFC properties" width="1440" height="960" fetchpriority="high" decoding="async">
+      </a>
+      <figcaption>Explore the model. Inspect the detail.<span>Section, measure and edit.</span></figcaption>
+    </figure>
+  </section>
+
+  <section class="tess-pipeline" aria-label="Supported formats and runtimes">
+    <div><span class="tess-pipeline-label">Read</span><strong>IFC2X3 / IFC4 / IFC4X3</strong></div>
+    <span class="tess-pipeline-arrow" aria-hidden="true">{% include ".icons/material/arrow-right.svg" %}</span>
+    <div><span class="tess-pipeline-label">Process</span><strong>Rust + WebAssembly</strong></div>
+    <span class="tess-pipeline-arrow" aria-hidden="true">{% include ".icons/material/arrow-right.svg" %}</span>
+    <div><span class="tess-pipeline-label">Build with</span><strong>Meshes, metadata, diagnostics</strong></div>
+  </section>
+
+  <section class="tess-capabilities" aria-label="Kernel capabilities">
+    <div><span class="tess-feature-icon twemoji">{% include ".icons/material/layers-triple-outline.svg" %}</span><h2>Geometry that streams</h2><p>Receive meshes in batches while the model is evaluated. Keep your application responsive with worker-based processing.</p></div>
+    <div><span class="tess-feature-icon twemoji">{% include ".icons/material/vector-link.svg" %}</span><h2>Connected to the model</h2><p>Keep element IDs, colours, placements and reusable geometry. Every mesh stays linked to its source IFC element.</p></div>
+    <div><span class="tess-feature-icon twemoji">{% include ".icons/material/text-box-check-outline.svg" %}</span><h2>Clear about the results</h2><p>Inspect unsupported, repaired and degraded geometry per product, so you know what to accept in your pipeline.</p></div>
+  </section>
+
+  <section class="tess-quickstart" aria-label="Code examples">
+    {{ page.content }}
+  </section>
+
+  <section class="tess-resources" aria-labelledby="resources-title">
+    <div class="tess-section-heading"><h2 id="resources-title">A clear path from file to application</h2><a href="{{ 'docs/' | url }}">All documentation</a></div>
+    <div class="tess-resource-grid">
+      <a href="{{ 'docs/sdk/' | url }}"><span class="twemoji">{% include ".icons/material/code-braces.svg" %}</span><h3>Integrate the kernel</h3><p>APIs, packages, workers and memory ownership.</p><span class="tess-resource-link">SDK and API <span aria-hidden="true">↗</span></span></a>
+      <a href="{{ 'docs/coverage/' | url }}"><span class="twemoji">{% include ".icons/material/shape-outline.svg" %}</span><h3>Know the coverage</h3><p>Supported IFC geometry and the limits to plan for.</p><span class="tess-resource-link">Geometry reference <span aria-hidden="true">↗</span></span></a>
+      <a href="{{ 'docs/architecture/' | url }}"><span class="twemoji">{% include ".icons/material/source-branch.svg" %}</span><h3>Understand the pipeline</h3><p>From STEP parsing to reusable triangle meshes.</p><span class="tess-resource-link">Architecture <span aria-hidden="true">↗</span></span></a>
+    </div>
+  </section>
+
+  <aside class="tess-preview-note"><span class="twemoji">{% include ".icons/material/information-outline.svg" %}</span><p><strong>Built for integration and evaluation.</strong> TessIFC is in developer preview. Review <a href="{{ 'docs/preview/' | url }}">the preview contract</a> and conversion diagnostics before using geometry downstream.</p></aside>
+</div>
+{% endblock %}

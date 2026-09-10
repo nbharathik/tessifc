@@ -9,7 +9,15 @@ export async function checkTree(page, check) {
   if (await page.locator("#outliner.collapsed").count()) await page.click("#outliner-open");
   if (await page.locator("#inspector.collapsed").count()) await page.click('#rail [data-panel="properties"]');
   await page.waitForTimeout(120);
-  await page.evaluate(() => { window.__tessifc.renderer.fit(); window.__tessifc.render(); });
+  await page.evaluate(() => {
+    const T = window.__tessifc;
+    if (T.state.selection) T.shell.run("clear-selection");
+    T.renderer.fit(); T.render();
+  });
+  await page.waitForFunction(() => {
+    const T = window.__tessifc;
+    return T.state.selection === null && !T.renderer.dirty && !T.panelWork.frame;
+  }, null, { polling: 20 });
 
   const point = await page.evaluate(() => {
     const r = window.__tessifc.renderer, rect = r.canvas.getBoundingClientRect();
@@ -22,11 +30,11 @@ export async function checkTree(page, check) {
     throw new Error("fixture has no unobstructed pickable point");
   });
   await page.evaluate(() => {
-    const r = window.__tessifc.renderer, render = r.render;
-    window.__treeTest = { renders: 0, restore: () => { r.render = render; delete window.__treeTest; } };
-    r.render = function (...args) {
-      if (this.dirty || args[0]) window.__treeTest.renders += 1;
-      return render.apply(this, args);
+    const r = window.__tessifc.renderer, draw = r.draw;
+    window.__treeTest = { renders: 0, restore: () => { r.draw = draw; delete window.__treeTest; } };
+    r.draw = function (...args) {
+      if (!args[0]) window.__treeTest.renders += 1;
+      return draw.apply(this, args);
     };
   });
   await page.mouse.click(point.x, point.y);

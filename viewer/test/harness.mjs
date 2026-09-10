@@ -31,7 +31,8 @@ export async function instrumentViewer(page) {
     const response = await route.fetch();
     const source = await response.text();
     await route.fulfill({ response, body: source + `\nwindow.__tessifc = {
-      renderer, state, scheduleRender, tree,
+      renderer, state, scheduleRender, tree, tools, inspector, shell,
+      selectRecord, selectExpressId, receiveEntityInfo, receiveEntityError, runPanelWork, panelWork,
       render: () => renderer.render(true),
       pack: () => state.model?.pack ?? null,
       ready: () => Boolean(state.model),

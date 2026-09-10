@@ -113,6 +113,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-site.txt
+      - name: install the website dependencies
+        run: python -m pip install -r requirements-site.txt
       - name: install wasm-bindgen-cli at the locked version
         run: |
           version=$(python - <<'EOF'

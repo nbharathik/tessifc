@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: Apache-2.0
+# Use scripts/build-site.py to stage repository documentation and package the viewer.
+site_name: TessIFC
+site_description: An open-source IFC geometry kernel in Rust. From building models to render-ready meshes.
+site_url: https://nbharathik.github.io/tessifc/
+repo_url: https://github.com/nbharathik/tessifc
+repo_name: GitHub
+edit_uri: ""
+use_directory_urls: true
+
+theme:
+  name: material
+  custom_dir: docs/site/overrides
+  language: en
+  font: false
+  logo: favicon.svg
+  favicon: favicon.svg
+  icon:
+    repo: material/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Follow system theme
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.tabs.link
+    - toc.follow
+
+nav:
+  - Home: index.md
+  - Documentation:
+      - Overview: docs/index.md
+      - Start here:
+          - Getting started: docs/getting-started.md
+          - Developer preview: docs/preview.md
+      - Guides:
+          - SDK and API: docs/sdk.md
+          - Architecture: docs/architecture.md
+          - Editing: docs/editing.md
+      - Reference:
+          - IGP format: docs/igp-format.md
+          - IFC coverage: docs/coverage.md
+      - Project:
+          - Contributing: docs/contributing.md
+          - Security: docs/security.md
+  - Viewer: /tessifc/viewer/
+
+plugins:
+  - search:
+      lang: en
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: ignore
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+    absolute_links: ignore
+
+extra_css:
+  - stylesheets/extra.css
+extra_javascript:
+  - javascripts/extra.js
+extra:
+  generator: false

@@ -12,7 +12,7 @@ import {
   readIgp,
 } from "./igp.js";
 import { createPackAssembler, isIdentity } from "./stream.js";
-import { IfcRenderer } from "./renderer.js";
+import { DEFAULT_LOD_PIXELS as LOD_PIXELS, IfcRenderer } from "./renderer.js";
 import { createShell } from "./shell.js";
 import { createTree } from "./tree.js";
 import { createInspector } from "./inspector.js";
@@ -28,6 +28,24 @@ const HELPER_FILTERS = [
   { command: "openings", flag: INSTANCE_OPENING, label: "openings", title: "opening and void volumes" },
   { command: "references", flag: INSTANCE_REFERENCE, label: "guides", title: "grids, annotations and reference geometry" },
 ];
+
+const SETTINGS_KEY = "tessifc.settings";
+const DEFAULT_SETTINGS = { scale: 1.5, hideSemantic: true, adaptive: false, lod: true, coincident: true };
+
+/** Rendering settings from the last visit; a blocked or stale store falls back. */
+function loadSettings() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}");
+    if (!stored || typeof stored !== "object") return { ...DEFAULT_SETTINGS };
+    const settings = { ...DEFAULT_SETTINGS };
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      if (typeof stored[key] === typeof DEFAULT_SETTINGS[key]) settings[key] = stored[key];
+    }
+    return settings;
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
 
 const state = {
   worker: null,
@@ -52,7 +70,7 @@ const state = {
   hiddenInstanceFlags: DEFAULT_HIDDEN_INSTANCE_FLAGS,
   isolated: null,
   dragDepth: 0,
-  settings: { scale: 1.5, hideSemantic: true },
+  settings: loadSettings(),
 };
 
 let renderer;
@@ -138,6 +156,7 @@ renderer.onCameraChange = () => {
 };
 // A settled resize or a prepared gesture target needs a frame nobody else asked for.
 renderer.onDirty = () => scheduleRender(true);
+renderer.onFrameReady = () => scheduleRender(false, true);
 syncGizmo();
 
 // The frame after an input carries the model; the tree and the attribute list follow in
@@ -161,7 +180,9 @@ function runPanelWork() {
     const expressId = state.selection?.expressId ?? null;
     tree.select(expressId);
   }
-  if (properties !== undefined && state.selection) inspector.setProperties(properties);
+  if (properties && properties.selection === state.selection && properties.info === state.selection.info) {
+    inspector.setProperties(properties.info);
+  }
 }
 
 shell.on("resize", () => requestAnimationFrame(() => {
@@ -234,12 +255,39 @@ shell.on("canvasTheme", (theme) => {
 
 // -------------------------------------------------------------- settings
 
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+  } catch {
+    // A blocked storage backend must not break the interface.
+  }
+}
+
 $("set-theme").addEventListener("change", (event) => shell.applyTheme(event.target.value));
 $("set-canvas").addEventListener("change", (event) => shell.applyCanvasTheme(event.target.value));
 $("set-scale").addEventListener("change", (event) => {
   state.settings.scale = Number(event.target.value) || 1;
   renderer.setPixelRatioLimit?.(state.settings.scale);
   renderer.resize();
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-adaptive").addEventListener("change", (event) => {
+  state.settings.adaptive = event.target.checked;
+  renderer.setAdaptiveResolution?.(event.target.checked);
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-lod").addEventListener("change", (event) => {
+  state.settings.lod = event.target.checked;
+  renderer.setLodPixels?.(event.target.checked ? LOD_PIXELS : 0);
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-coincident").addEventListener("change", (event) => {
+  state.settings.coincident = event.target.checked;
+  renderer.setDepthTieBreak?.(event.target.checked);
+  saveSettings();
   scheduleRender(true);
 });
 $("set-hidden").addEventListener("change", (event) => {
@@ -253,6 +301,7 @@ $("set-hidden").addEventListener("change", (event) => {
       }
     }
   }
+  saveSettings();
   refreshVisibility();
 });
 
@@ -326,6 +375,10 @@ $("viewport").addEventListener("dblclick", (event) => {
   }
 });
 $("viewport").addEventListener("pointermove", (event) => {
+  if (pointerDown?.pointerId === event.pointerId &&
+      Math.hypot(event.clientX - pointerDown.x, event.clientY - pointerDown.y) > 4) {
+    pointerDown = null;
+  }
   if (tools.isMeasuring() && !renderer.interacting) tools.hoverMeasure(event.clientX, event.clientY);
 });
 window.addEventListener("keydown", (event) => {
@@ -353,12 +406,22 @@ function pickAtRelease(event) {
   else selectRecord(hit.record);
 }
 
-function selectExpressId(expressId) {
+function selectExpressId(expressId, refresh = false) {
   const records = state.model?.index.recordsByExpressId.get(expressId);
-  if (records?.length) selectRecord(records[0]);
+  if (records?.length) selectRecord(records[0], refresh);
 }
 
-function selectRecord(record) {
+function selectRecord(record, refresh = false) {
+  const selected = state.selection;
+  if (!refresh && selected?.record === record && selected.modelId === state.model.modelId &&
+      (selected.infoState === "pending" || selected.infoState === "ready")) {
+    const panel = shell.inspectorPanel();
+    if (!shell.panelVisible("inspector") || panel !== "element" && panel !== "properties") {
+      if (panel === "element") shell.setPanel("inspector", true);
+      else shell.setInspectorPanel("properties");
+    }
+    return;
+  }
   const { pack, index } = state.model;
   const className = String(pack.index.classes[pack.instances.classIds[record]] ?? "IfcUnknown");
   const expressId = pack.instances.expressIds[record];
@@ -369,7 +432,8 @@ function selectRecord(record) {
   let triangles = 0;
   for (const item of records) triangles += index.triangles[item];
 
-  state.selection = { record, records, expressId, className, requestId: ++state.requestId, editRequestId: 0 };
+  state.selection = { record, records, expressId, className, modelId: state.model.modelId,
+    requestId: ++state.requestId, editRequestId: 0, infoState: state.worker ? "pending" : "idle" };
   renderer.select(records);
   scheduleRender();
 
@@ -554,14 +618,9 @@ function toggleHelperFlag(flag) {
 }
 
 function syncHelperControls(pack) {
+  const availableFlags = pack && state.model?.pack === pack ? state.model.index.instanceFlags : 0;
   for (const item of HELPER_FILTERS) {
-    let available = false;
-    for (let record = 0; pack && record < pack.instances.count; record += 1) {
-      if (pack.instances.flags[record] & item.flag) {
-        available = true;
-        break;
-      }
-    }
+    const available = Boolean(availableFlags & item.flag);
     const visible = available && !(state.hiddenInstanceFlags & item.flag);
     shell.setEnabled(item.command, available);
     shell.setPressed(item.command, visible);
@@ -866,7 +925,6 @@ function showResult(data) {
     setDirty(false);
 
     tools.reset(true);
-    renderer.setVisibility(isRecordVisible);
     // A camera the user moved while the model was streaming in is theirs.
     tools.setView("perspective", !model.cameraKept);
 
@@ -911,7 +969,9 @@ function buildIndex(pack) {
 
   const total = pack.instances.count;
   const triangles = new Uint32Array(total);
+  let instanceFlags = 0;
   for (let record = 0; record < total; record += 1) {
+    instanceFlags |= pack.instances.flags[record];
     const expressId = pack.instances.expressIds[record];
     let records = recordsByExpressId.get(expressId);
     if (!records) recordsByExpressId.set(expressId, (records = []));
@@ -928,7 +988,7 @@ function buildIndex(pack) {
     const mesh = geometryById.get(pack.instances.geometryIds[record]);
     triangles[record] = mesh ? mesh.indices.length / 3 : 0;
   }
-  return { recordsByExpressId, geometryById, classes, triangles };
+  return { recordsByExpressId, geometryById, classes, triangles, instanceFlags };
 }
 
 function describeModel(data, pack, totalMs) {
@@ -1049,12 +1109,14 @@ function receiveEntityInfo(data) {
   if (!state.selection || data.requestId !== state.selection.requestId) return;
   if (data.expressId !== state.selection.expressId) return;
   state.selection.info = data.info;
-  panelWork.properties = data.info;
+  state.selection.infoState = "ready";
+  panelWork.properties = { selection: state.selection, info: data.info };
   schedulePanelWork();
 }
 
 function receiveEntityError(data) {
   if (!state.selection || data.requestId !== state.selection.requestId) return;
+  state.selection.infoState = "failed";
   inspector.setPropertyError(data.message);
 }
 
@@ -1110,7 +1172,7 @@ function receiveProductGeometry(data) {
     tree.syncVisibility(isRecordVisible);
     syncHelperControls(pack);
     scheduleVisibilityStats();
-    if (selected !== null) selectExpressId(selected);
+    if (selected !== null) selectExpressId(selected, true);
     inspector.setGeometryFacts({ pack, model: state.model });
     describeModel({ info: model.info, summary: model.summary }, pack, null);
     setStatus(`Edited, #${data.expressId} redrawn in ${duration(data.elapsedMs ?? 0)}`, "busy");
@@ -1138,6 +1200,7 @@ function receiveEditResult(data) {
   if (!state.selection || data.requestId !== state.selection.editRequestId) return;
   if (data.expressId !== state.selection.expressId) return;
   state.selection.info = data.info;
+  state.selection.infoState = "ready";
   state.dirty = true;
   setDirty(true);
   inspector.setEditResult(data.info, data.changed);
@@ -1219,6 +1282,12 @@ shell.applyTheme(shell.themeMode());
 for (const name of ["--canvas-light", "--canvas-dark", "--section-cap-light", "--section-cap-dark"]) cssToken(name);
 renderer.setPixelRatioLimit?.(state.settings.scale);
 $("set-scale").value = String(state.settings.scale);
+renderer.setAdaptiveResolution?.(state.settings.adaptive);
+$("set-adaptive").checked = state.settings.adaptive;
+renderer.setLodPixels?.(state.settings.lod ? LOD_PIXELS : 0);
+$("set-lod").checked = state.settings.lod;
+renderer.setDepthTieBreak?.(state.settings.coincident);
+$("set-coincident").checked = state.settings.coincident;
 tools.reset(false);
 tree.clear();
 enableModelCommands(false);

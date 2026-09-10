@@ -667,6 +667,18 @@
           </select>
         </div>
         <label class="field check">
+          <input type="checkbox" id="set-adaptive" />
+          <span class="field-label">Smooth motion<span class="hint">Draws fewer pixels while you drag a model that cannot hold the frame rate, and sharpens again the moment you stop.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-lod" checked />
+          <span class="field-label">Skip products under two pixels<span class="hint">Leaves out parts too small to see while the model is far away.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-coincident" checked />
+          <span class="field-label">Resolve coincident surfaces<span class="hint">Stops touching faces flickering against each other. Turning it off draws large models faster.</span></span>
+        </label>
+        <label class="field check">
           <input type="checkbox" id="set-hidden" checked />
           <span class="field-label">Start with model helpers hidden<span class="hint">Spaces, openings, guides and reference geometry stay out of the first view.</span></span>
         </label>
@@ -690,7 +702,7 @@
         </div>
 
         <div class="group-title">Your data</div>
-        <p class="note">Every file is read in this tab. Nothing is uploaded and nothing is stored between sessions apart from the theme and viewport background choices.</p>
+        <p class="note">Every file is read in this tab. Nothing is uploaded, and the only thing kept between sessions is the choices on this page.</p>
       </div>
       <div class="dlg-foot"><button class="btn primary" id="settings-done" type="button">Done</button></div>
     </dialog>

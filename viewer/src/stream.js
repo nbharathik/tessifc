@@ -22,6 +22,8 @@ export function createPackAssembler() {
   const geometryIds = new Set();
   const patchMeshes = new Set();
   let maxGeometryId = -1;
+  let geometryBytes = 0;
+  let normalsBytes = 0;
   let appendingPatch = false;
   const classes = [];
   const classIndex = new Map();
@@ -92,6 +94,8 @@ export function createPackAssembler() {
       if (geometryIds.has(mesh.id)) continue;
       geometryIds.add(mesh.id);
       geometry.push(mesh);
+      geometryBytes += mesh.positions.byteLength + mesh.indices.byteLength;
+      normalsBytes += mesh.positions.length * 4;
       if (appendingPatch) patchMeshes.add(mesh.id);
       if (Number.isFinite(mesh.id) && mesh.id > maxGeometryId) maxGeometryId = mesh.id;
     }
@@ -165,7 +169,12 @@ export function createPackAssembler() {
       patchMeshes.delete(id);
       geometryIds.delete(id);
     }
-    geometry = geometry.filter((mesh) => !dead.has(mesh.id));
+    geometry = geometry.filter((mesh) => {
+      if (!dead.has(mesh.id)) return true;
+      geometryBytes -= mesh.positions.byteLength + mesh.indices.byteLength;
+      normalsBytes -= mesh.positions.length * 4;
+      return false;
+    });
   }
 
   /** The signature `chunk` would have for these products, so a no-op patch is recognised. */
@@ -207,11 +216,8 @@ export function createPackAssembler() {
   function pack() {
     const instances = { count };
     for (const [name, [, width]] of Object.entries(COLUMNS)) instances[name] = columns[name].subarray(0, count * width);
-    let geometryBytes = 0;
-    for (const mesh of geometry) geometryBytes += mesh.positions.byteLength + mesh.indices.byteLength;
     let instanceBytes = 0;
     for (const name of Object.keys(COLUMNS)) instanceBytes += instances[name].byteLength;
-    const normalsBytes = geometry.reduce((sum, mesh) => sum + (mesh.positions.length / 3) * 3 * 4, 0);
     return {
       index: {
         ...(index ?? {}),

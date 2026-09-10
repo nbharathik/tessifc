@@ -7,12 +7,13 @@ export async function checkRenderWork(page, check) {
     "wire indices of a small model are prepared in idle time after the load");
   const result = await page.evaluate(() => {
     const r = window.__tessifc.renderer, gl = r.gl;
-    const saved = { camera: structuredClone(r.camera), style: r.style, section: { ...r.section }, predicate: r.visibilityPredicate };
+    const saved = { camera: structuredClone(r.camera), style: r.style, section: { ...r.section }, predicate: r.visibilityPredicate, prepass: r.contestedDepthPrepass };
     let calls = 0;
     const draw = gl.drawElementsInstanced.bind(gl);
     gl.drawElementsInstanced = (...args) => { calls++; return draw(...args); };
-    const capture = (cull) => {
+    const capture = (cull, prepass = saved.prepass) => {
       r.cullBatches = cull;
+      r.contestedDepthPrepass = prepass;
       calls = 0;
       r.render(true);
       const pixels = new Uint8Array(r.canvas.width * r.canvas.height * 4);
@@ -30,10 +31,11 @@ export async function checkRenderWork(page, check) {
             r.setVisibility((record) => saved.predicate(record) && record % 3 !== 0);
             r.camera.position[0] += r.renderBounds.radius * .7;
             r.camera.target[0] += r.renderBounds.radius * .7;
-            const a = capture(false), b = capture(true);
-            let differences = 0;
+            const a = capture(false), b = capture(true), original = capture(true, false);
+            let differences = 0, prepassDifferences = 0;
             for (let i = 0; i < a.pixels.length; i++) if (a.pixels[i] !== b.pixels[i]) differences++;
-            comparisons.push({ style, mode, section, differences, before: a.calls, after: b.calls });
+            for (let i = 0; i < b.pixels.length; i++) if (b.pixels[i] !== original.pixels[i]) prepassDifferences++;
+            comparisons.push({ style, mode, section, differences, prepassDifferences, before: a.calls, after: b.calls });
           }
         }
       }
@@ -51,13 +53,47 @@ export async function checkRenderWork(page, check) {
     } finally {
       gl.drawElementsInstanced = draw;
       r.cullBatches = true;
+      r.contestedDepthPrepass = saved.prepass;
       r.setVisibility(saved.predicate); r.camera = saved.camera; r.style = saved.style; r.section = saved.section;
       r.render(true);
     }
   });
   check(result.comparisons.every((row) => row.differences === 0), "culling preserves pixels across shading, wire, xray, orthographic views and sections");
+  check(result.comparisons.every((row) => row.prepassDifferences === 0),
+    "the contested depth prepass preserves pixels across display styles, cameras, hidden records and sections");
   check(result.hiddenCalls === 0, "hidden geometry issues no GPU mesh draws");
   check(result.outsideCalls === 0 && result.outsideBefore > 0 && result.outsideDifferences === 0, "offscreen geometry issues no GPU mesh draws and preserves the frame");
+  const shaderParity = await page.evaluate(() => {
+    const r = window.__tessifc.renderer, gl = r.gl;
+    const saved = { style: r.style, section: { ...r.section }, selected: r.selected.slice(), predicate: r.visibilityPredicate };
+    let differences = 0, programsDiffer = false;
+    const pixels = () => {
+      r.render(true);
+      const data = new Uint8Array(r.canvas.width * r.canvas.height * 4);
+      gl.readPixels(0, 0, r.canvas.width, r.canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, data);
+      return data;
+    };
+    try {
+      r.select([0]);
+      for (const style of ["shaded", "wire", "xray"]) {
+        r.setStyle(style);
+        r.setVisibility((record) => saved.predicate(record) && record % 3 !== 0);
+        r.setSection(false, "z", r.bounds.max[2] + r.bounds.radius, false, false);
+        const surface = pixels(), surfaceProgram = r.program;
+        // A cut beyond the model keeps every fragment but exercises the section shader.
+        r.section.active = true;
+        const section = pixels();
+        programsDiffer ||= surfaceProgram !== r.program;
+        for (let at = 0; at < surface.length; at++) if (surface[at] !== section[at]) differences++;
+      }
+      return { differences, programsDiffer, error: gl.getError() };
+    } finally {
+      r.setVisibility(saved.predicate); r.select(saved.selected);
+      r.style = saved.style; r.section = saved.section; r.render(true);
+    }
+  });
+  check(shaderParity.programsDiffer && shaderParity.differences === 0 && shaderParity.error === 0,
+    "the fast surface shader preserves section-shader pixels, selection and hidden geometry across display styles");
   const viewport = page.viewportSize();
   await page.setViewportSize({ width: 1280, height: 900 });
   const quality = await page.evaluate(() => {
@@ -73,7 +109,8 @@ export async function checkRenderWork(page, check) {
     const methods = ["createFramebuffer", "createRenderbuffer", "deleteFramebuffer", "deleteRenderbuffer",
       "renderbufferStorage", "renderbufferStorageMultisample"];
     const originals = new Map(methods.map((name) => [name, gl[name]]));
-    let allocations = 0, fixedCanvas = true, restored = true, movingWidth = 0, painted = false;
+    let allocations = 0, fixedCanvas = true, restored = true, fullQuality = true, painted = false;
+    let differences = 0;
     for (const name of methods) gl[name] = function (...args) {
       allocations++; return originals.get(name).apply(this, args);
     };
@@ -81,7 +118,8 @@ export async function checkRenderWork(page, check) {
       for (let gesture = 0; gesture < 4; gesture++) {
         r.batches = dense; r.beginInteraction(); r.batches = batches;
         r.orbit(4, 2); r.render(true);
-        movingWidth = r.target.width;
+        fullQuality &&= r.target.frameWidth === original[0] && r.target.frameHeight === original[1];
+        const movingTarget = r.target, movingSamples = r.target.samples;
         fixedCanvas &&= r.canvas.width === original[0] && r.canvas.height === original[1];
         const pixels = new Uint8Array(r.canvas.width * r.canvas.height * 4);
         gl.readPixels(0, 0, r.canvas.width, r.canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
@@ -90,13 +128,16 @@ export async function checkRenderWork(page, check) {
             Math.abs(pixels[at + 2] - pixels[2]) > 30) { painted = true; break; }
         }
         r.interacting = false; r.dirty = true; r.render(true);
-        restored &&= r.target.width === original[0] && r.target.height === original[1];
+        restored &&= r.target === movingTarget && r.target.samples === movingSamples;
+        const resting = new Uint8Array(pixels.length);
+        gl.readPixels(0, 0, r.canvas.width, r.canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, resting);
+        for (let at = 0; at < pixels.length; at++) if (pixels[at] !== resting[at]) differences++;
       }
       const cacheSize = r.targetCache.size;
       const memory = r.renderTargetBytes();
       const accounted = [...r.targetCache.values()].reduce((sum, target) => sum + target.estimatedBytes, 0);
       const error = gl.getError();
-      return { fixedCanvas, restored, movingWidth, original, allocations, painted, cacheSize, memory, accounted, error };
+      return { fixedCanvas, restored, fullQuality, differences, allocations, painted, cacheSize, memory, accounted, error };
     } finally {
       r.interacting = false; r.batches = batches;
       for (const [name, fn] of originals) gl[name] = fn;
@@ -104,11 +145,11 @@ export async function checkRenderWork(page, check) {
       r.render(true);
     }
   });
-  check(quality.movingWidth < quality.original[0] && quality.fixedCanvas && quality.restored,
-    "dense gestures render fewer pixels without resizing the canvas and restore full detail");
+  check(quality.fullQuality && quality.fixedCanvas && quality.restored && quality.differences === 0,
+    "dense gestures keep full resolution, antialiasing and identical pixels at the same camera position");
   check(quality.allocations === 0, "repeated gestures allocate and delete no GPU render targets");
-  check(quality.painted && quality.error === 0, "multisample resolve and scaled presentation draw the moving model without WebGL errors");
-  check(quality.cacheSize <= 2 && quality.memory === quality.accounted,
+  check(quality.painted && quality.error === 0, "multisample presentation draws the moving model without WebGL errors");
+  check(quality.cacheSize === 1 && quality.memory === quality.accounted,
     "render-target caching stays bounded and includes all target memory");
 
   // A panel folding and unfolding changes the canvas size; the targets grow at most once and are then reused.

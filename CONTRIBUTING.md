@@ -83,6 +83,7 @@ cargo test --locked --workspace
 python scripts/build-wasm.py --target both
 node bindings/wasm/test/smoke.mjs
 node adapters/three/test/build.test.mjs
+python -m pip install -r requirements-site.txt
 python -m unittest discover -s scripts -p 'test_*.py'
 npm ci --prefix viewer
 cd viewer

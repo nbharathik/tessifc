@@ -4,20 +4,27 @@
 //! meshes, colour-batched singletons, sortable translucents and CPU picking.
 //! A model arrives whole through `load` or as IGP chunks through `appendStream`.
 import { projectPoint } from "./measure.js";
-import { frameSphere, targetPlaneAnchor, wheelZoomFactor, zoomCamera } from "./navigation.js";
+import { frameSphere, wheelZoomFactor, zoomCamera } from "./navigation.js";
 import { boxInView, viewSidePlanes } from "./culling.js";
+import { buildBoundsTree, queryBoundsTree } from "./picking.js";
+import { createGpuFrameGate } from "./gpu-frame-gate.js";
 
 export const BATCH_VERTEX_LIMIT = 260_000;
 export const DEFAULT_PIXEL_RATIO_LIMIT = 1.5;
+export const DEFAULT_LOD_PIXELS = 2;
+
+// Motion resolution steps, and the frame periods that drop to the next one.
+// A scene that already holds 60 Hz never leaves the first step.
+export const MOTION_SCALES = [1, 0.6, 0.45];
+export const MOTION_SLOW_MS = 20;
+export const MOTION_VERY_SLOW_MS = 45;
+// Consecutive slow frames before a step down, so one stall cannot soften a view.
+export const MOTION_SLOW_FRAMES = 3;
 export const RENDER_PIXEL_BUDGET = 4_000_000;
 export const SAMPLE_PIXEL_BUDGET = 8_000_000;
 export const DEPTH_SLOPE_FACTOR_STEP = 1 / 32;
 export const DEPTH_OVERLAY_DISTANCE_TOLERANCE = 7.5e-4;
 export const PICK_DEPTH_TIE_TOLERANCE = 7.5e-4;
-
-const INTERACTION_PIXEL_BUDGET = 500_000;
-const DENSE_SCENE_DRAW_COUNT = 200;
-const DENSE_SCENE_INDEX_COUNT = 750_000;
 
 // A second canvas size change this soon after one is a panel or window animating:
 // the backing store and its targets are reallocated once, after the size settles.
@@ -35,6 +42,7 @@ const RENDER_UNIFORM_NAMES = [
   "uBaked",
   "uCameraPosition",
   "uPicking",
+  "uDepthOnly",
   "uStyle",
   "uSectionActive",
   "uSectionAxis",
@@ -44,6 +52,7 @@ const RENDER_UNIFORM_NAMES = [
   "uFogColor",
   "uVisibility",
   "uVisibilityWidth",
+  "uPlainBatch",
 ];
 
 /** Choose a stable drawing-buffer scale within device and fill-rate limits. */
@@ -244,9 +253,10 @@ export class IfcRenderer {
     this.contestedOpaqueBatches = [];
     this.transparentBatches = [];
     this.sortedBatches = [];
-    this.drawOrder = [];
     this.sharedGeometryBuffers = [];
     this.recordLocations = [];
+    this.pickTree = null;
+    this.pickCandidates = [];
     // Render views of each mesh, by mesh identity, so the finish reuses the stream's filtering.
     this.preparedByGeometry = new WeakMap();
     // Streaming keeps running bounds; the depth plan is refreshed on a timer.
@@ -278,7 +288,15 @@ export class IfcRenderer {
     this.cameraDepthRange = { near: 0.001, far: 1 };
     this.cameraForward = [0, 0, -1];
     this.visibility = new Uint8Array(0);
+    // What the caller asked for, before a record is dropped for being too small.
+    this.baseVisible = new Uint8Array(0);
     this.visibilityVersion = 0;
+    this.selectionVersion = 0;
+    // Products narrower than this many pixels are not drawn; zero draws them all.
+    this.lodPixels = DEFAULT_LOD_PIXELS;
+    this.lodHidden = new Uint8Array(0);
+    this.lodHiddenCount = 0;
+    this.lodState = null;
     this.viewPlanes = new Float64Array(16);
     this.cullBatches = true;
     this.visibilityTexture = null;
@@ -287,7 +305,6 @@ export class IfcRenderer {
     this.drag = null;
     this.interacting = false;
     this.wheelQualityTimer = 0;
-    this.zoomAnchor = null;
     this.pointers = new Map();
     this.pixelRatioLimit = DEFAULT_PIXEL_RATIO_LIMIT;
     this.renderPixelBudget = RENDER_PIXEL_BUDGET;
@@ -297,9 +314,17 @@ export class IfcRenderer {
     this.devicePixelRatio = 0;
     this.resizeDirty = true;
     this.gpuBufferBytes = 0;
-    // Gesture quality is chosen once at its boundary; resting frames use full resolution.
+    // Gestures keep the full sample grid unless a caller explicitly requests a lower scale.
     this.interactionScale = 1;
     this.gestureScale = 1;
+    // Off by default: measured frames here are bound by geometry, not by fill,
+    // so trading pixels for frames costs sharpness and returns nothing.
+    this.adaptiveResolution = false;
+    this.motionStep = 0;
+    this.slowFrames = 0;
+    this.slowStep = 0;
+    this.motionSteady = true;
+    this.lastMotionFrameAt = 0;
     // Render-only coincident-face suppression; the render tests prove it changes no pixel.
     this.suppressCoplanar = true;
     // Display floors from `displayColors`; zero draws the file's own values exactly.
@@ -307,6 +332,7 @@ export class IfcRenderer {
     this.minimumLuminance = MINIMUM_VISIBLE_LUMINANCE;
     // False lets coincident surfaces fight, for measuring how much they cover.
     this.depthTieBreak = true;
+    this.contestedDepthPrepass = true;
     // Opt-in bounded step for translucent faces; off because it looked worse around glass.
     this.translucentTieBreak = false;
     this.depthPlanExhausted = false;
@@ -332,6 +358,7 @@ export class IfcRenderer {
     this.dirty = true;
     this.onCameraChange = null;
     this.onDirty = null;
+    this.onFrameReady = null;
     // Streaming: the camera follows the growing model until the user takes it over.
     this.streaming = false;
     this.cameraTouched = false;
@@ -344,6 +371,14 @@ export class IfcRenderer {
     this.background = new Float32Array(CANVAS_COLORS.dark);
     this.sectionCapColor = SECTION_CAP_COLORS.dark;
     this.initGl();
+    this.idleGpuLimit = 1;
+    this.gpuPacingWidth = 0;
+    this.gpuPacingHeight = 0;
+    this.gpuPacing = createGpuFrameGate(this.gl, () => {
+      if (!this.dirty || this.contextLost) return;
+      if (this.onFrameReady) this.onFrameReady();
+      else this.render();
+    });
     this.bindControls();
     this.resize();
   }
@@ -354,8 +389,13 @@ export class IfcRenderer {
     this.clipControl = gl.getExtension("EXT_clip_control");
     this.polygonOffsetClamp = gl.getExtension("EXT_polygon_offset_clamp");
     this.reversedDepth = Boolean(this.clipControl && this.polygonOffsetClamp);
-    this.program = createProgram(gl, VERTEX_SHADER, FRAGMENT_SHADER);
-    this.uniforms = uniforms(gl, this.program, RENDER_UNIFORM_NAMES);
+    this.surfaceProgram = createProgram(gl, VERTEX_SHADER, FRAGMENT_SHADER);
+    this.surfaceUniforms = uniforms(gl, this.surfaceProgram, RENDER_UNIFORM_NAMES);
+    this.sectionProgram = createProgram(gl, VERTEX_SHADER,
+      FRAGMENT_SHADER.replace("#version 300 es", "#version 300 es\n#define SECTION"));
+    this.sectionUniforms = uniforms(gl, this.sectionProgram, RENDER_UNIFORM_NAMES);
+    this.program = this.surfaceProgram;
+    this.uniforms = this.surfaceUniforms;
     const viewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
     const renderbuffer = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
     this.maxCanvasSize = [
@@ -404,6 +444,8 @@ export class IfcRenderer {
   handleContextLost() {
     if (this.contextLost) return;
     this.contextLost = true;
+    this.gpuPacing.reset(true);
+    this.gpuPacingWidth = this.gpuPacingHeight = 0;
     if (this.wheelQualityTimer) clearTimeout(this.wheelQualityTimer);
     this.wheelQualityTimer = 0;
     this.clearTimers();
@@ -411,12 +453,16 @@ export class IfcRenderer {
     this.drag = null;
     this.interacting = false;
     this.gestureScale = 1;
+    this.motionStep = 0;
+    this.slowFrames = 0;
+    this.slowStep = 0;
+    this.motionSteady = true;
+    this.lastMotionFrameAt = 0;
     this.batches = [];
     this.opaqueBatches = [];
     this.contestedOpaqueBatches = [];
     this.transparentBatches = [];
     this.sortedBatches = [];
-    this.drawOrder = [];
     this.sharedGeometryBuffers = [];
     this.gpuBufferBytes = 0;
     this.target = null;
@@ -431,6 +477,7 @@ export class IfcRenderer {
     if (!this.contextLost || this.gl.isContextLost()) return;
     this.contextLost = false;
     this.initGl();
+    this.gpuPacing.reset();
     this.targetFailures.clear();
     this.targetFailureSize = "";
     this.resizeDirty = true;
@@ -662,7 +709,7 @@ export class IfcRenderer {
     this.target = saved;
     this.reversedDepth = saved?.reversed ?? false;
     this.applyDepthConvention();
-    this.dirty = true;
+    if (present) this.dirty = true;
   }
 
   /** Strict depth test for the current convention, so equal-priority duplicates keep the first fragment. */
@@ -714,6 +761,7 @@ export class IfcRenderer {
         bounds: offsetBounds(worldBounds, scale(this.renderOrigin, -1)),
       };
     }
+    this.pickTree = buildBoundsTree(this.recordLocations.length, (record) => this.recordLocations[record]?.bounds);
 
     this.renderColors = displayColors(pack, this.minimumAlpha, this.minimumLuminance);
     this.dimmedProducts = this.renderColors.raisedCount ?? 0;
@@ -735,7 +783,11 @@ export class IfcRenderer {
     this.depthConflictPairs = depthPlan.conflictPairs;
     this.contestedMaterials = depthPlan.contestedColors;
     this.depthPlanExhausted = Boolean(depthPlan.exhausted);
-    const plan = planRenderBatches(pack, undefined, this.renderColors, null, { geometryById });
+    const plan = planRenderBatches(pack, undefined, this.renderColors, null, {
+      geometryById,
+      contested: this.depthContested,
+      recordLocations: this.recordLocations,
+    });
     const preparedByKey = new Map();
     const sharedByKey = new Map();
     const suppressedByGeometry = new Map();
@@ -809,7 +861,8 @@ export class IfcRenderer {
       .sort((left, right) => left.depthRank - right.depthRank || left.sourceRecord - right.sourceRecord);
     this.transparentBatches = this.batches.filter((batch) => batch.transparent);
     for (let record = 0; record < pack.instances.count; record += 1) {
-      this.visibility[record * 2] = isVisible(record) ? 255 : 0;
+      this.baseVisible[record] = isVisible(record) ? 255 : 0;
+      this.visibility[record * 2] = this.baseVisible[record];
     }
     this.uploadVisibility();
     gpuBytes += this.visibility.byteLength;
@@ -885,7 +938,8 @@ export class IfcRenderer {
     const geometryById = geometryIndex(pack);
     for (let record = from; record < to; record += 1) {
       // Written first: a record without usable bounds must not keep the default visible byte.
-      this.visibility[record * 2] = isVisible(record) ? 255 : 0;
+      this.baseVisible[record] = isVisible(record) ? 255 : 0;
+      this.visibility[record * 2] = this.baseVisible[record];
       const geometry = geometryById.get(pack.instances.geometryIds[record]);
       if (!geometry) continue;
       const bounds = transformedBounds(geometry.bbox, pack.instances.transforms, record * 16);
@@ -901,7 +955,10 @@ export class IfcRenderer {
     this.depthOverlayPrecisionSafe = depthOverlayPrecisionSupported(grown.radius);
     this.uploadVisibility();
 
-    const plan = planRenderBatches(pack, undefined, this.renderColors, { from, to }, { geometryById });
+    const plan = planRenderBatches(pack, undefined, this.renderColors, { from, to }, {
+      geometryById,
+      recordLocations: this.recordLocations,
+    });
     const sharedByKey = new Map();
     let gpuBytes = 0;
     const prepare = (geometry, transparent) => this.prepareGeometry(geometry, this.suppressCoplanar && !transparent);
@@ -952,7 +1009,7 @@ export class IfcRenderer {
     this.depthOverlayPrecisionSafe = depthOverlayPrecisionSupported(this.renderBounds.radius);
     for (const batch of this.opaqueBatches) {
       batch.depthRank = this.depthRanks[batch.sourceRecord] ?? 0;
-      batch.depthContested = Boolean(this.depthContested[batch.sourceRecord]);
+      batch.depthContested = batch.records.some((record) => this.depthContested[record] === 1);
     }
     this.contestedOpaqueBatches = this.opaqueBatches
       .filter((batch) => batch.depthContested)
@@ -1016,11 +1073,15 @@ export class IfcRenderer {
     if (count <= this.visibilityCapacity && this.visibilityTexture) return;
     const previous = this.visibility;
     const previousCount = this.visibilityCapacity;
+    const previousBase = this.baseVisible;
     if (this.visibilityTexture) this.gl.deleteTexture(this.visibilityTexture);
     let capacity = Math.max(1, this.visibilityCapacity);
     while (capacity < count) capacity *= 2;
     this.createVisibilityTexture(capacity);
-    if (previous && previousCount) this.visibility.set(previous.subarray(0, previousCount * 2));
+    if (previous && previousCount) {
+      this.visibility.set(previous.subarray(0, previousCount * 2));
+      this.baseVisible.set(previousBase.subarray(0, previousCount));
+    }
     this.uploadVisibility();
   }
 
@@ -1111,7 +1172,7 @@ export class IfcRenderer {
       records: Uint32Array.from(records),
       color: null,
       depthRank: this.depthRanks[records[0]] ?? 0,
-      depthContested: Boolean(this.depthContested[records[0]]),
+      depthContested: records.some((record) => this.depthContested[record] === 1),
       sourceRecord: records[0],
       sortCenter,
       sortHalfExtents,
@@ -1188,7 +1249,7 @@ export class IfcRenderer {
       records: Uint32Array.from(items, (item) => item.record),
       color: Float32Array.from(color, (value) => value / 255),
       depthRank: this.depthRanks[items[0]?.record] ?? 0,
-      depthContested: Boolean(this.depthContested[items[0]?.record]),
+      depthContested: items.some((item) => this.depthContested[item.record] === 1),
       sourceRecord: items[0]?.record ?? Number.MAX_SAFE_INTEGER,
       sortCenter: boundsCenter(sortBounds),
       sortHalfExtents: boundsHalfExtents(sortBounds),
@@ -1208,6 +1269,7 @@ export class IfcRenderer {
   }
 
   clear() {
+    this.gpuPacing?.cancelRetry();
     const gl = this.gl;
     if (this.wheelQualityTimer) clearTimeout(this.wheelQualityTimer);
     this.wheelQualityTimer = 0;
@@ -1216,7 +1278,6 @@ export class IfcRenderer {
     this.gestureScale = 1;
     this.drag = null;
     this.pointers.clear();
-    this.zoomAnchor = null;
     for (const batch of this.batches) {
       gl.deleteVertexArray(batch.vao);
       for (const buffer of batch.buffers) gl.deleteBuffer(buffer);
@@ -1229,10 +1290,11 @@ export class IfcRenderer {
     this.contestedOpaqueBatches = [];
     this.transparentBatches = [];
     this.sortedBatches = [];
-    this.drawOrder = [];
     this.sharedGeometryBuffers = [];
     this.gpuBufferBytes = 0;
     this.recordLocations = [];
+    this.pickTree = null;
+    this.pickCandidates.length = 0;
     this.pack = null;
     this.bounds = emptyBounds();
     this.renderOrigin = [0, 0, 0];
@@ -1259,11 +1321,16 @@ export class IfcRenderer {
   }
 
   dispose() {
+    this.gpuPacing.dispose();
     if (this.wheelQualityTimer) clearTimeout(this.wheelQualityTimer);
     this.clearTimers();
     this.releaseRenderTarget();
     this.clear();
-    this.gl.deleteProgram(this.program);
+    this.gl.deleteProgram(this.surfaceProgram);
+    this.gl.deleteProgram(this.sectionProgram);
+    this.gl.deleteProgram(this.capProgram);
+    this.gl.deleteVertexArray(this.capVao);
+    this.gl.deleteBuffer(this.capBuffer);
     this.canvas.remove();
   }
 
@@ -1329,9 +1396,13 @@ export class IfcRenderer {
       this.resize(force);
     }
     if (!force && !this.dirty) return;
+    const replacedBacking = this.canvas.width !== this.gpuPacingWidth || this.canvas.height !== this.gpuPacingHeight;
+    const moving = this.interacting && (!this.drag || this.drag.moved || this.pointers.size > 1 || this.wheelQualityTimer);
+    if (!this.gpuPacing.allow(force || replacedBacking, moving || this.streaming ? 2 : this.idleGpuLimit)) return;
+    this.adaptMotionScale(performance.now());
     const gl = this.gl;
     const offscreen = this.ensureRenderTarget();
-    if (!this.interacting && this.pack && !this.interactionPrepared && !this.interactionPrepareFrame && !this.interactionPrepareTimer) {
+    if (this.chooseGestureScale() < 1 && !this.interacting && this.pack && !this.interactionPrepared && !this.interactionPrepareFrame && !this.interactionPrepareTimer) {
       // A task posted from inside the next frame runs after that frame is committed, so a
       // fold or resize pays for one target now and the gesture target after it has painted.
       this.interactionPrepareFrame = requestAnimationFrame(() => {
@@ -1346,6 +1417,7 @@ export class IfcRenderer {
     const height = offscreen ? this.target.frameHeight : this.canvas.height;
     // The projection is built only after target creation settles the depth convention.
     this.updateCameraMatrices();
+    this.applyLod();
     gl.bindFramebuffer(gl.FRAMEBUFFER, offscreen ? this.target.framebuffer : null);
     gl.viewport(0, 0, width, height);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
@@ -1360,6 +1432,9 @@ export class IfcRenderer {
       }
     }
     this.dirty = false;
+    this.gpuPacingWidth = this.canvas.width;
+    this.gpuPacingHeight = this.canvas.height;
+    this.gpuPacing.committed();
   }
 
   bindProgram(program, locations, picking, projection) {
@@ -1369,6 +1444,7 @@ export class IfcRenderer {
     gl.uniformMatrix4fv(locations.uView, false, this.view);
     gl.uniform3fv(locations.uCameraPosition, this.camera.position);
     gl.uniform1i(locations.uPicking, picking ? 1 : 0);
+    gl.uniform1i(locations.uDepthOnly, 0);
     gl.uniform1i(locations.uStyle, this.style === "xray" ? 1 : this.style === "wire" ? 2 : 0);
     gl.uniform1i(locations.uSectionActive, this.section.active ? 1 : 0);
     gl.uniform1i(locations.uSectionAxis, this.section.axis);
@@ -1384,6 +1460,9 @@ export class IfcRenderer {
 
   draw(picking, projection = this.projection) {
     const gl = this.gl;
+    // Only sectioned views need fragment discard, which inhibits early depth rejection.
+    this.program = this.section.active ? this.sectionProgram : this.surfaceProgram;
+    this.uniforms = this.section.active ? this.sectionUniforms : this.surfaceUniforms;
     this.updateBatchVisibility();
     this.bindProgram(this.program, this.uniforms, picking, projection);
     const wire = !picking && this.style === "wire";
@@ -1393,7 +1472,24 @@ export class IfcRenderer {
       gl.disable(gl.POLYGON_OFFSET_FILL);
       gl.depthMask(true);
       this.applyDepthConvention();
-      for (const batch of this.opaqueBatches) this.drawBatch(batch);
+      // The overlay supplies every visible sample of contested batches; their base pass only needs depth.
+      const prepass = this.contestedDepthPrepass && this.depthTieBreak &&
+        this.depthOverlayPrecisionSafe && this.contestedOpaqueBatches.length > 0;
+      let depthOnly = false;
+      for (const batch of this.opaqueBatches) {
+        if (batch.culled) continue;
+        const next = prepass && batch.depthContested;
+        if (next !== depthOnly) {
+          gl.colorMask(!next, !next, !next, !next);
+          gl.uniform1i(this.uniforms.uDepthOnly, next ? 1 : 0);
+          depthOnly = next;
+        }
+        this.drawBatch(batch);
+      }
+      if (depthOnly) {
+        gl.colorMask(true, true, true, true);
+        gl.uniform1i(this.uniforms.uDepthOnly, 0);
+      }
 
       if (this.depthTieBreak && this.depthOverlayPrecisionSafe && this.contestedOpaqueBatches.length) {
         const offset = depthOverlayOffset(this.reversedDepth);
@@ -1401,6 +1497,7 @@ export class IfcRenderer {
         gl.depthMask(false);
         gl.depthFunc(this.reversedDepth ? gl.GEQUAL : gl.LEQUAL);
         for (const batch of this.contestedOpaqueBatches) {
+          if (batch.culled) continue;
           const maximumDepth = this.depthOverlayMaximumDepthForBatch(batch);
           this.applyOverlayOffset(offset, maximumDepth);
           this.drawBatch(batch);
@@ -1474,6 +1571,7 @@ export class IfcRenderer {
     const gl = this.gl;
     gl.bindVertexArray(batch.vao);
     gl.uniform1i(locations.uBaked, batch.baked ? 1 : 0);
+    gl.uniform1i(locations.uPlainBatch, batch.allRecordsVisible && !batch.anyRecordSelected ? 1 : 0);
     if (batch.baked) gl.vertexAttrib4fv(5, batch.color);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, wire ? batch.wireBuffer : batch.indexBuffer);
     gl.drawElementsInstanced(
@@ -1546,8 +1644,16 @@ export class IfcRenderer {
       this.target?.frameHeight ?? this.canvas.height, this.viewPlanes);
     for (const batch of this.batches) {
       if (batch.visibilityVersion !== this.visibilityVersion) {
-        batch.hasVisibleRecords = batch.records.some((record) => this.visibility[record * 2] >= 128);
+        let visible = 0;
+        for (const record of batch.records) if (this.visibility[record * 2] >= 128) visible += 1;
+        batch.hasVisibleRecords = visible > 0;
+        batch.allRecordsVisible = visible === batch.records.length;
         batch.visibilityVersion = this.visibilityVersion;
+      }
+      if (batch.selectionVersion !== this.selectionVersion) {
+        batch.anyRecordSelected = this.selected.length > 0 &&
+          batch.records.some((record) => this.visibility[record * 2 + 1] !== 0);
+        batch.selectionVersion = this.selectionVersion;
       }
       batch.culled = this.cullBatches && (
         !batch.hasVisibleRecords || !boxInView(batch.sortCenter, batch.sortHalfExtents, this.viewPlanes)
@@ -1559,7 +1665,7 @@ export class IfcRenderer {
     if (picking || this.style === "wire") return this.batches;
     const sortAll = this.style === "xray";
     const source = sortAll ? this.batches : this.transparentBatches;
-    if (source.length < 2) return this.batches;
+    if (source.length < 2) return source;
     const dx = this.camera.target[0] - this.camera.position[0];
     const dy = this.camera.target[1] - this.camera.position[1];
     const dz = this.camera.target[2] - this.camera.position[2];
@@ -1580,11 +1686,7 @@ export class IfcRenderer {
       const depthOrder = right.sortDepth - left.sortDepth;
       return Math.abs(depthOrder) > 1e-9 ? depthOrder : left.sortOrder - right.sortOrder;
     });
-    if (sortAll) return this.sortedBatches;
-    this.drawOrder.length = 0;
-    for (const batch of this.opaqueBatches) this.drawOrder.push(batch);
-    for (const batch of this.sortedBatches) this.drawOrder.push(batch);
-    return this.drawOrder;
+    return this.sortedBatches;
   }
 
   ensureWireBuffer(batch) {
@@ -1729,6 +1831,11 @@ export class IfcRenderer {
     // Two bytes a record: drawn and selected; a selection spans a product's records.
     this.visibility = new Uint8Array(this.visibilityTextureWidth * height * 2);
     for (let at = 0; at < this.visibility.length; at += 2) this.visibility[at] = 255;
+    this.baseVisible = new Uint8Array(this.visibilityTextureWidth * height);
+    this.baseVisible.fill(255);
+    this.lodHidden = new Uint8Array(this.baseVisible.length);
+    this.lodHiddenCount = 0;
+    this.lodState = null;
     this.visibilityHeight = height;
     this.visibilityCapacity = recordCount;
     this.visibilityTexture = gl.createTexture();
@@ -1892,11 +1999,106 @@ export class IfcRenderer {
     this.visibilityPredicate = predicate;
     if (!this.pack || !this.visibilityTexture) return;
     for (let record = 0; record < this.pack.instances.count; record += 1) {
-      this.visibility[record * 2] = predicate(record) ? 255 : 0;
+      this.baseVisible[record] = predicate(record) ? 255 : 0;
+      this.visibility[record * 2] = this.baseVisible[record];
     }
+    this.lodState = null;
     this.updateVisibleBounds(predicate);
     this.applyDepthPlan(this.depthPlanFor(predicate));
     this.uploadVisibility();
+  }
+
+  /** Pixels per metre at one metre for the current camera, or null when there is no scale. */
+  pixelsPerMetre(viewportHeight) {
+    if (this.camera.mode === "perspective") {
+      return viewportHeight / (2 * Math.tan(this.camera.fov / 2));
+    }
+    return viewportHeight / Math.max(2 * this.camera.orthoScale, 1e-6);
+  }
+
+  /**
+   * Stop drawing products narrower than `lodPixels` on screen. The answer only
+   * changes once the camera has moved a meaningful fraction of the way toward
+   * them, so the sweep is skipped on most frames of an orbit.
+   */
+  applyLod() {
+    if (!this.pack || !this.visibilityTexture) return false;
+    const count = this.pack.instances.count;
+    const height = this.target?.frameHeight ?? this.canvas.height;
+    const threshold = this.lodPixels;
+    if (!threshold && !this.lodHiddenCount) return false;
+    const state = this.lodState;
+    // Projected size changes with distance, so far from the model a long step
+    // still cannot change any answer.
+    const away = Math.hypot(
+      this.camera.position[0] - this.renderBounds.center[0],
+      this.camera.position[1] - this.renderBounds.center[1],
+      this.camera.position[2] - this.renderBounds.center[2],
+    );
+    const epsilon = Math.max(0.25, this.renderBounds.radius * 0.01, away * 0.02);
+    if (
+      state && state.threshold === threshold && state.height === height &&
+      state.mode === this.camera.mode && state.orthoScale === this.camera.orthoScale &&
+      state.version === this.visibilityVersion &&
+      Math.hypot(
+        state.position[0] - this.camera.position[0],
+        state.position[1] - this.camera.position[1],
+        state.position[2] - this.camera.position[2],
+      ) < epsilon
+    ) return false;
+
+    const scale = this.pixelsPerMetre(height);
+    const [px, py, pz] = this.camera.position;
+    const perspective = this.camera.mode === "perspective";
+    let changed = 0;
+    for (let record = 0; record < count; record += 1) {
+      const location = this.recordLocations[record];
+      let hide = 0;
+      // A selected product stays drawn, so a tree click never highlights nothing.
+      if (threshold && location && this.baseVisible[record] && !this.visibility[record * 2 + 1]) {
+        const { min, max } = location.bounds;
+        const radius = 0.5 * Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+        let pixels;
+        if (perspective) {
+          const away = Math.hypot((min[0] + max[0]) / 2 - px, (min[1] + max[1]) / 2 - py, (min[2] + max[2]) / 2 - pz);
+          // Inside the product's own sphere it fills the view; the frustum owns that case.
+          pixels = away <= radius ? Infinity : (radius * 2 * scale) / away;
+        } else {
+          pixels = radius * 2 * scale;
+        }
+        hide = pixels < threshold ? 1 : 0;
+      }
+      if (hide === this.lodHidden[record]) continue;
+      this.lodHidden[record] = hide;
+      this.lodHiddenCount += hide ? 1 : -1;
+      this.visibility[record * 2] = hide ? 0 : this.baseVisible[record];
+      changed += 1;
+    }
+    this.lodState = {
+      threshold, height, mode: this.camera.mode, orthoScale: this.camera.orthoScale,
+      position: this.camera.position.slice(), version: this.visibilityVersion,
+    };
+    if (!changed) return false;
+    this.uploadVisibility();
+    this.lodState.version = this.visibilityVersion;
+    return true;
+  }
+
+  /** Off draws every coincident face once, which is faster and can flicker. */
+  setDepthTieBreak(active) {
+    const wanted = active !== false;
+    if (wanted === this.depthTieBreak) return;
+    this.depthTieBreak = wanted;
+    this.dirty = true;
+  }
+
+  /** Below this projected width a product is left out; zero draws them all. */
+  setLodPixels(pixels) {
+    const value = Math.max(0, Number(pixels) || 0);
+    if (value === this.lodPixels) return;
+    this.lodPixels = value;
+    this.lodState = null;
+    this.dirty = true;
   }
 
   /** The plan for a visible set: read off the load-time pairs when it is a subset, planned in full otherwise. */
@@ -1932,6 +2134,7 @@ export class IfcRenderer {
     for (const record of this.selected) this.visibility[record * 2 + 1] = 0;
     this.selected = recordList(records).filter((record) => record * 2 + 1 < this.visibility.length);
     for (const record of this.selected) this.visibility[record * 2 + 1] = 255;
+    this.selectionVersion += 1;
     this.uploadVisibility();
   }
 
@@ -1968,7 +2171,6 @@ export class IfcRenderer {
       this.camera.up = [0, 0, 1];
     }
     this.dirty = true;
-    this.zoomAnchor = null;
     this.onCameraChange?.();
   }
 
@@ -1994,7 +2196,6 @@ export class IfcRenderer {
       this.camera.position = add(center, scale(direction, radius * 3));
     }
     this.dirty = true;
-    this.zoomAnchor = null;
     this.onCameraChange?.();
   }
 
@@ -2065,7 +2266,12 @@ export class IfcRenderer {
     const MAX_NARROW_RECORDS = 512;
     let tested = 0;
     const candidates = [];
-    for (let record = 0; record < this.recordLocations.length; record += 1) {
+    const records = this.pickTree
+      ? queryBoundsTree(this.pickTree, ray.origin, ray.direction, this.pickCandidates)
+      : null;
+    const count = records ? records.length : this.recordLocations.length;
+    for (let at = 0; at < count; at += 1) {
+      const record = records ? records[at] : at;
       const location = this.recordLocations[record];
       if (!location || this.visibility[record * 2] < 128) continue;
       const distance = rayBounds(ray.origin, ray.direction, location.bounds);
@@ -2164,21 +2370,10 @@ export class IfcRenderer {
     return { point: hit, distance: closest, triangle };
   }
 
-  /** Use an exact surface once per gesture, then reuse the anchor during wheel input. */
-  zoomAt(factor, clientX, clientY, reuse = false) {
+  /** Zoom along the view direction; the orbit target stays put, so rotation stays centred. */
+  zoomAt(factor) {
     if (!this.pack || factor === 1) return;
-    const rect = this.canvas.getBoundingClientRect();
-    clientX ??= rect.left + rect.width / 2;
-    clientY ??= rect.top + rect.height / 2;
-    if (!reuse || !this.zoomAnchor || Math.hypot(clientX - this.zoomAnchor.x, clientY - this.zoomAnchor.y) > 8) {
-      const ray = this.pointerRay(clientX, clientY);
-      const hit = this.pickRecord(ray);
-      this.zoomAnchor = {
-        x: clientX, y: clientY,
-        point: hit?.point ? sub(hit.point, this.renderOrigin) : targetPlaneAnchor(this.camera, ray),
-      };
-    }
-    if (zoomCamera(this.camera, factor, this.zoomAnchor.point)) {
+    if (zoomCamera(this.camera, factor)) {
       this.cameraTouched = true;
       this.dirty = true;
       this.onCameraChange?.();
@@ -2186,23 +2381,60 @@ export class IfcRenderer {
   }
 
   chooseGestureScale() {
-    const dense = this.batches.length > DENSE_SCENE_DRAW_COUNT || this.batches.reduce(
-      (total, batch) => total + batch.indexCount * batch.instanceCount, 0,
-    ) > DENSE_SCENE_INDEX_COUNT;
-    const ratio = renderPixelRatio(
-      this.canvasCssWidth, this.canvasCssHeight, this.devicePixelRatio,
-      this.pixelRatioLimit, this.renderPixelBudget, this.maxCanvasSize,
-    );
-    const pixels = this.canvasCssWidth * this.canvasCssHeight * ratio * ratio;
-    return dense
-      ? Math.min(1, Math.max(0.5, Math.sqrt(INTERACTION_PIXEL_BUDGET / Math.max(pixels, 1))))
-      : 1;
+    if (!this.adaptiveResolution) return this.interactionScale;
+    return Math.min(this.interactionScale, MOTION_SCALES[this.motionStep] ?? 1);
   }
 
+  /** Only a gesture that never went slow earns a step back, so a heavy model
+   *  does not stutter at the start of every drag. */
   beginInteraction() {
     if (this.interacting) return;
+    if (this.motionSteady) this.motionStep = Math.max(0, this.motionStep - 1);
+    this.motionSteady = true;
+    this.slowFrames = 0;
+    this.lastMotionFrameAt = 0;
     this.gestureScale = this.chooseGestureScale();
     this.interacting = true;
+  }
+
+  /**
+   * Drop a step while a gesture is not holding its frame rate. Steps only ever
+   * go down inside one gesture, so the scale cannot oscillate mid-drag.
+   */
+  adaptMotionScale(now) {
+    if (!this.adaptiveResolution || !this.interacting) {
+      this.lastMotionFrameAt = 0;
+      this.slowFrames = 0;
+      return;
+    }
+    const previous = this.lastMotionFrameAt;
+    this.lastMotionFrameAt = now;
+    if (!previous) return;
+    const period = now - previous;
+    const wanted = period > MOTION_VERY_SLOW_MS ? 2 : period > MOTION_SLOW_MS ? 1 : 0;
+    if (wanted > 0) this.motionSteady = false;
+    if (wanted <= this.motionStep) {
+      this.slowFrames = 0;
+      return;
+    }
+    // The gentlest verdict in the run wins, so one spike inside it cannot overshoot.
+    this.slowStep = this.slowFrames ? Math.min(this.slowStep, wanted) : wanted;
+    this.slowFrames += 1;
+    if (this.slowFrames < MOTION_SLOW_FRAMES) return;
+    this.slowFrames = 0;
+    this.motionStep = this.slowStep;
+    this.gestureScale = this.chooseGestureScale();
+  }
+
+  /** Off keeps every gesture at full size; on trades pixels for frames. */
+  setAdaptiveResolution(active) {
+    const wanted = active !== false;
+    if (wanted === this.adaptiveResolution) return;
+    this.adaptiveResolution = wanted;
+    if (!wanted) this.motionStep = 0;
+    this.gestureScale = this.chooseGestureScale();
+    this.interactionPrepared = false;
+    this.dirty = true;
   }
 
   bindControls() {
@@ -2215,7 +2447,6 @@ export class IfcRenderer {
     this.canvas.addEventListener("contextmenu", (event) => event.preventDefault());
     this.canvas.addEventListener("pointerdown", (event) => {
       if (event.button > 2) return;
-      this.zoomAnchor = null;
       this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
       this.canvas.setPointerCapture(event.pointerId);
       this.beginInteraction();
@@ -2239,7 +2470,7 @@ export class IfcRenderer {
         const cx = (after[0].x + after[1].x) / 2;
         const cy = (after[0].y + after[1].y) / 2;
         const nextSpan = span(after);
-        if (nextSpan > 2 && span(before) > 2) this.zoomAt(span(before) / nextSpan, cx, cy, true);
+        if (nextSpan > 2 && span(before) > 2) this.zoomAt(span(before) / nextSpan);
         this.pan(cx - (before[0].x + before[1].x) / 2, cy - (before[0].y + before[1].y) / 2);
         this.cameraTouched = true;
         return;
@@ -2259,9 +2490,8 @@ export class IfcRenderer {
       const remaining = this.pointers.values().next().value;
       this.drag = remaining ? { ...remaining, startX: remaining.x, startY: remaining.y, moved: true, pan: this.camera.mode !== "perspective" } : null;
       this.interacting = this.pointers.size > 0 || Boolean(this.wheelQualityTimer);
-      this.zoomAnchor = null;
-      this.resizeDirty = true;
-      this.dirty = true;
+      if (!this.interacting && this.target?.slot === "gesture") this.dirty = true;
+      // Notify the scheduler of the boundary without redrawing an unchanged full-quality frame.
       this.onCameraChange?.();
     };
     this.canvas.addEventListener("pointerup", releasePointer);
@@ -2273,26 +2503,23 @@ export class IfcRenderer {
         event.preventDefault();
         const factor = wheelZoomFactor(event.deltaY, event.deltaMode, this.canvasCssHeight);
         if (factor === 1 || !this.pack) return;
-        this.zoomAt(factor, event.clientX, event.clientY, Boolean(this.wheelQualityTimer));
         this.beginInteraction();
+        this.zoomAt(factor);
         this.cameraTouched = true;
         if (this.wheelQualityTimer) clearTimeout(this.wheelQualityTimer);
         this.wheelQualityTimer = setTimeout(() => {
           this.wheelQualityTimer = 0;
-          this.zoomAnchor = null;
           this.interacting = this.pointers.size > 0;
-          this.resizeDirty = true;
-          this.dirty = true;
+          if (!this.interacting && this.target?.slot === "gesture") this.dirty = true;
           this.onCameraChange?.();
         }, 120);
-        this.dirty = true;
-        this.onCameraChange?.();
       },
       { passive: false },
     );
   }
 
   orbit(dx, dy) {
+    if (dx === 0 && dy === 0) return;
     const offset = sub(this.camera.position, this.camera.target);
     let radius = Math.max(length(offset), 0.001);
     let azimuth = Math.atan2(offset[1], offset[0]) - dx * 0.006;
@@ -2328,6 +2555,7 @@ export class IfcRenderer {
   }
 
   pan(dx, dy) {
+    if (dx === 0 && dy === 0) return;
     const forward = normalize(sub(this.camera.target, this.camera.position));
     const right = normalize(cross(forward, this.camera.up));
     const up = normalize(cross(right, forward));
@@ -2383,6 +2611,7 @@ uniform mat4 uView;
 uniform bool uBaked;
 uniform sampler2D uVisibility;
 uniform int uVisibilityWidth;
+uniform bool uPlainBatch;
 out vec3 vWorld;
 out vec4 vColor;
 out float vDepth;
@@ -2397,11 +2626,17 @@ void main() {
   vColor = aColor;
   vDepth = length(view.xyz);
   vRecord = aRecord;
-  int record = int(aRecord + 0.5);
-  ivec2 visibilityCoordinate = ivec2(record % uVisibilityWidth, record / uVisibilityWidth);
-  vec2 recordState = texelFetch(uVisibility, visibilityCoordinate, 0).rg;
-  vVisible = recordState.r;
-  vSelected = recordState.g;
+  // Skipping the per-vertex fetch matters: most batches are wholly visible and unselected.
+  if (uPlainBatch) {
+    vVisible = 1.0;
+    vSelected = 0.0;
+  } else {
+    int record = int(aRecord + 0.5);
+    ivec2 visibilityCoordinate = ivec2(record % uVisibilityWidth, record / uVisibilityWidth);
+    vec2 recordState = texelFetch(uVisibility, visibilityCoordinate, 0).rg;
+    vVisible = recordState.r;
+    vSelected = recordState.g;
+  }
   gl_Position = uProjection * view;
   // Fully hidden triangles are clipped before rasterisation, including mixed batches.
   if (vVisible < 0.5) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
@@ -2416,6 +2651,7 @@ flat in float vRecord;
 flat in float vVisible;
 flat in float vSelected;
 uniform bool uPicking;
+uniform bool uDepthOnly;
 uniform int uStyle;
 uniform bool uSectionActive;
 uniform int uSectionAxis;
@@ -2430,9 +2666,11 @@ vec3 safeNormalize(vec3 value, vec3 fallback) {
   return magnitudeSquared > 1e-20 ? value * inversesqrt(magnitudeSquared) : fallback;
 }
 void main() {
-  if (vVisible < 0.5) discard;
+  #ifdef SECTION
   float coordinate = uSectionAxis == 0 ? vWorld.x : (uSectionAxis == 1 ? vWorld.y : vWorld.z);
   if (uSectionActive && (coordinate - uSectionValue) * uSectionSign > 0.0) discard;
+  #endif
+  if (uDepthOnly) { outColor = vec4(0.0); return; }
   if (uPicking) {
     float id = vRecord + 1.0;
     vec3 bytes = vec3(mod(id, 256.0), mod(floor(id / 256.0), 256.0), mod(floor(id / 65536.0), 256.0));
@@ -2581,6 +2819,24 @@ function depthBoundsOverlap(left, right) {
   return true;
 }
 
+// Coincident faces fight; interpenetrating solids do not. Two boxes can only
+// hold a shared surface where one of their face planes meets another's.
+export const COINCIDENT_PLANE_FRACTION = 2e-5;
+
+export function boundsShareFacePlane(left, right, tolerance) {
+  for (let axis = 0; axis < 3; axis += 1) {
+    const lowLeft = left.min[axis], highLeft = left.max[axis];
+    const lowRight = right.min[axis], highRight = right.max[axis];
+    if (
+      Math.abs(lowLeft - lowRight) <= tolerance ||
+      Math.abs(highLeft - highRight) <= tolerance ||
+      Math.abs(lowLeft - highRight) <= tolerance ||
+      Math.abs(highLeft - lowRight) <= tolerance
+    ) return true;
+  }
+  return false;
+}
+
 // Past this many pair tests the sweep stops and every opaque material counts
 // as contested: extra draws instead of fighting surfaces on a hostile file.
 export const MAX_DEPTH_PAIR_TESTS = 4_000_000;
@@ -2604,6 +2860,8 @@ export function planDepthMaterials(
   const keys = new Uint32Array(count);
   const records = [];
   const opaqueColors = new Set();
+  const extentMin = [Infinity, Infinity, Infinity];
+  const extentMax = [-Infinity, -Infinity, -Infinity];
   for (let record = 0; record < count; record += 1) {
     if (!isVisible(record)) continue;
     const key = packedRgbaKey(colors, record);
@@ -2612,8 +2870,21 @@ export function planDepthMaterials(
     opaqueColors.add(key);
     const candidate = recordBounds?.[record];
     const bounds = candidate?.bounds ?? candidate;
-    if (validDepthBounds(bounds)) records.push({ record, key, bounds });
+    if (!validDepthBounds(bounds)) continue;
+    records.push({ record, key, bounds });
+    for (let axis = 0; axis < 3; axis += 1) {
+      if (bounds.min[axis] < extentMin[axis]) extentMin[axis] = bounds.min[axis];
+      if (bounds.max[axis] > extentMax[axis]) extentMax[axis] = bounds.max[axis];
+    }
   }
+  const diagonal = Math.hypot(
+    Math.max(0, extentMax[0] - extentMin[0]),
+    Math.max(0, extentMax[1] - extentMin[1]),
+    Math.max(0, extentMax[2] - extentMin[2]),
+  );
+  const planeTolerance = Number.isFinite(options.planeTolerance)
+    ? options.planeTolerance
+    : diagonal * COINCIDENT_PLANE_FRACTION;
 
   records.sort((left, right) => {
     const x = left.bounds.min[0] - right.bounds.min[0];
@@ -2646,6 +2917,7 @@ export function planDepthMaterials(
     }
     for (const other of active) {
       if (other.key === current.key || !depthBoundsOverlap(other.bounds, current.bounds)) continue;
+      if (!boundsShareFacePlane(other.bounds, current.bounds, planeTolerance)) continue;
       const low = Math.min(other.key, current.key);
       const high = Math.max(other.key, current.key);
       conflictKeys.add(`${low}:${high}`);
@@ -2665,9 +2937,15 @@ export function planDepthMaterials(
     pairs = null;
   }
 
+  // Only a record with an overlapping partner needs the overlay; without the
+  // pairs the whole colour is taken, because any of its records may be the one.
   const contested = new Uint8Array(count);
-  for (let record = 0; record < count; record += 1) {
-    if (colors[record * 4 + 3] === 255 && contestedColors.has(keys[record])) contested[record] = 1;
+  if (pairs) {
+    for (const record of pairs) contested[record] = 1;
+  } else {
+    for (let record = 0; record < count; record += 1) {
+      if (colors[record * 4 + 3] === 255 && contestedColors.has(keys[record])) contested[record] = 1;
+    }
   }
   return {
     ranks: rankPlan.ranks,
@@ -2675,6 +2953,7 @@ export function planDepthMaterials(
     colors: rankPlan.colors,
     opaqueColors: opaqueColors.size,
     contestedColors: contestedColors.size,
+    contestedRecords: contested.reduce((total, flag) => total + flag, 0),
     conflictPairs: conflictKeys.size,
     exhausted,
     pairs: pairs ? Uint32Array.from(pairs) : null,
@@ -2692,6 +2971,7 @@ export function restrictDepthPlan(base, colors, recordCount, isVisible) {
   const count = Math.max(0, Math.min(Math.floor(recordCount), Math.floor(colors.length / 4)));
   const contestedColors = new Set();
   const conflictKeys = new Set();
+  const contested = new Uint8Array(count);
   for (let at = 0; at + 1 < pairs.length; at += 2) {
     const first = pairs[at];
     const second = pairs[at + 1];
@@ -2701,14 +2981,13 @@ export function restrictDepthPlan(base, colors, recordCount, isVisible) {
     conflictKeys.add(firstKey < secondKey ? `${firstKey}:${secondKey}` : `${secondKey}:${firstKey}`);
     contestedColors.add(firstKey);
     contestedColors.add(secondKey);
+    contested[first] = 1;
+    contested[second] = 1;
   }
-  const contested = new Uint8Array(count);
   const opaqueColors = new Set();
   for (let record = 0; record < count; record += 1) {
     if (colors[record * 4 + 3] !== 255 || !isVisible(record)) continue;
-    const key = packedRgbaKey(colors, record);
-    opaqueColors.add(key);
-    if (contestedColors.has(key)) contested[record] = 1;
+    opaqueColors.add(packedRgbaKey(colors, record));
   }
   return {
     ranks: base.ranks,
@@ -2716,6 +2995,7 @@ export function restrictDepthPlan(base, colors, recordCount, isVisible) {
     colors: base.colors,
     opaqueColors: opaqueColors.size,
     contestedColors: contestedColors.size,
+    contestedRecords: contested.reduce((total, flag) => total + flag, 0),
     conflictPairs: conflictKeys.size,
     exhausted: false,
     pairs,
@@ -2775,10 +3055,91 @@ function applyDisplayFloors(colors, from, to, minimumAlpha, minimumLuminance) {
 /** Reused opaque geometry is instanced only once its copies would cost this many vertices. */
 export const INSTANCE_MIN_VERTICES = 4096;
 
+// Batches are culled whole, so records are grouped by locality first: a batch
+// spread over the model has a bounding box the size of the model.
+const SPATIAL_GRID_BITS = 8;
+
+function spreadBits(value) {
+  let bits = value & 0xff;
+  bits = (bits | (bits << 8)) & 0x00f00f;
+  bits = (bits | (bits << 4)) & 0x0c30c3;
+  bits = (bits | (bits << 2)) & 0x249249;
+  return bits;
+}
+
+/** Interleaved cell index of `bounds`' centre inside `extent`, so near records sort together. */
+export function spatialKey(bounds, extent) {
+  const cells = (1 << SPATIAL_GRID_BITS) - 1;
+  const cell = (axis) => {
+    const span = extent.max[axis] - extent.min[axis];
+    if (!(span > 0)) return 0;
+    const centre = (bounds.min[axis] + bounds.max[axis]) / 2;
+    const at = Math.floor(((centre - extent.min[axis]) / span) * cells);
+    return Math.max(0, Math.min(cells, Number.isFinite(at) ? at : 0));
+  };
+  return (spreadBits(cell(0)) | (spreadBits(cell(1)) << 1) | (spreadBits(cell(2)) << 2)) >>> 0;
+}
+
+// A batch is worth splitting only once it carries enough work to pay for the draw.
+const LOCALITY_CELLS_PER_AXIS = 8;
+const MIN_SPLIT_VERTEX_FRACTION = 1 / 32;
+
+function boundsSpan(min, max) {
+  return Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+}
+
+/** Grow batches until they run out of vertex room or leave their neighbourhood. */
+function localityChunker(extent, vertexLimit) {
+  const span = extent ? boundsSpan(extent.min, extent.max) / LOCALITY_CELLS_PER_AXIS : Infinity;
+  const minimumVertices = vertexLimit * MIN_SPLIT_VERTEX_FRACTION;
+  let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  return {
+    /** True when `bounds` belongs in the next batch instead of this one. */
+    breaks(bounds, vertices, count, accumulated) {
+      if (!count) return false;
+      if (accumulated + vertices > vertexLimit) return true;
+      if (!bounds || !extent || count < 2 || accumulated < minimumVertices) return false;
+      return boundsSpan(
+        [Math.min(min[0], bounds.min[0]), Math.min(min[1], bounds.min[1]), Math.min(min[2], bounds.min[2])],
+        [Math.max(max[0], bounds.max[0]), Math.max(max[1], bounds.max[1]), Math.max(max[2], bounds.max[2])],
+      ) > span;
+    },
+    add(bounds) {
+      if (!bounds) return;
+      for (let axis = 0; axis < 3; axis += 1) {
+        if (bounds.min[axis] < min[axis]) min[axis] = bounds.min[axis];
+        if (bounds.max[axis] > max[axis]) max[axis] = bounds.max[axis];
+      }
+    },
+    reset() {
+      min = [Infinity, Infinity, Infinity];
+      max = [-Infinity, -Infinity, -Infinity];
+    },
+  };
+}
+
+function recordExtent(locations, first, last) {
+  const extent = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+  for (let record = first; record < last; record += 1) {
+    const bounds = locations?.[record]?.bounds;
+    if (!bounds) continue;
+    for (let axis = 0; axis < 3; axis += 1) {
+      if (bounds.min[axis] < extent.min[axis]) extent.min[axis] = bounds.min[axis];
+      if (bounds.max[axis] > extent.max[axis]) extent.max[axis] = bounds.max[axis];
+    }
+  }
+  return Number.isFinite(extent.min[0]) ? extent : null;
+}
+
 /** Plan batches for `pack`, or its `range`; `options.instanceMinVertices` overrides `INSTANCE_MIN_VERTICES`. */
 export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors = null, range = null, options = {}) {
   const geometryById = options.geometryById ?? geometryIndex(pack);
   const shade = colors ?? displayColors(pack);
+  // A batch is redrawn as one unit, so a contested record must not carry
+  // uncontested neighbours into the overlay pass.
+  const contested = options.contested ?? null;
+  const contestKey = (record) => (contested?.[record] ? 1 : 0);
+  const locations = options.recordLocations ?? null;
   const instanceMinVertices = Number.isFinite(options.instanceMinVertices)
     ? Math.max(0, options.instanceMinVertices)
     : INSTANCE_MIN_VERTICES;
@@ -2807,12 +3168,26 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
     }
     opaqueGeometryUse.set(geometryId, (opaqueGeometryUse.get(geometryId) ?? 0) + 1);
     const colorKey = Array.from(shade.subarray(record * 4, record * 4 + 4)).join(",");
-    const key = `${geometryId}:0:${colorKey}`;
+    const key = `${geometryId}:0:${colorKey}:${contestKey(record)}`;
     if (!byGeometry.has(key)) {
       byGeometry.set(key, { geometry: geometryById.get(geometryId), transparent: false, records: [] });
     }
     byGeometry.get(key).records.push(record);
   }
+
+  const extent = locations ? recordExtent(locations, first, last) : null;
+  const keyed = new Map();
+  const localityKey = (record) => {
+    if (!extent) return record;
+    let key = keyed.get(record);
+    if (key === undefined) {
+      const bounds = locations[record]?.bounds;
+      key = bounds ? spatialKey(bounds, extent) : 0xffffffff;
+      keyed.set(record, key);
+    }
+    return key;
+  };
+  const byLocality = (left, right) => localityKey(left) - localityKey(right) || left - right;
 
   const instanced = [];
   const byColor = new Map();
@@ -2820,13 +3195,30 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
     const uses = opaqueGeometryUse.get(group.geometry.id) ?? 0;
     const vertices = group.geometry.positions.length / 3;
     if (uses > 1 && uses * vertices >= instanceMinVertices) {
-      instanced.push(group);
+      if (!extent || group.records.length < 2) {
+        instanced.push(group);
+        continue;
+      }
+      group.records.sort(byLocality);
+      const chunker = localityChunker(extent, vertexLimit);
+      let records = [];
+      for (const record of group.records) {
+        const bounds = locations[record]?.bounds;
+        if (chunker.breaks(bounds, vertices, records.length, records.length * vertices)) {
+          instanced.push({ ...group, records });
+          records = [];
+          chunker.reset();
+        }
+        records.push(record);
+        chunker.add(bounds);
+      }
+      if (records.length) instanced.push({ ...group, records });
       continue;
     }
     // Small reused geometry joins the colour batches one copy per record.
     for (const record of group.records) {
       const color = Array.from(shade.subarray(record * 4, record * 4 + 4));
-      const key = color.join(",");
+      const key = `${color.join(",")}:${contestKey(record)}`;
       if (!byColor.has(key)) byColor.set(key, { color, items: [] });
       byColor.get(key).items.push({ record, geometry: group.geometry });
     }
@@ -2834,6 +3226,8 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
 
   const baked = [];
   for (const material of byColor.values()) {
+    if (extent) material.items.sort((left, right) => byLocality(left.record, right.record));
+    const chunker = localityChunker(extent, vertexLimit);
     let items = [];
     let vertexCount = 0;
     const flush = () => {
@@ -2846,12 +3240,15 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
       });
       items = [];
       vertexCount = 0;
+      chunker.reset();
     };
     for (const item of material.items) {
       const vertices = item.geometry.positions.length / 3;
-      if (items.length && vertexCount + vertices > vertexLimit) flush();
+      const bounds = locations?.[item.record]?.bounds;
+      if (chunker.breaks(bounds, vertices, items.length, vertexCount)) flush();
       items.push(item);
       vertexCount += vertices;
+      chunker.add(bounds);
     }
     flush();
   }

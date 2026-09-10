@@ -7,17 +7,25 @@ export async function checkScheduling(page, check) {
   await page.evaluate(() => {
     const r = window.__tessifc.renderer;
     const request = window.requestAnimationFrame, cancel = window.cancelAnimationFrame;
-    const render = r.render, pick = r.pick;
+    const draw = r.draw, pick = r.pick;
     const callbacks = new Map();
-    const probe = window.__blockedAnimationTest = { frames: 0, picks: 0 };
+    const probe = window.__blockedAnimationTest = { frames: 0, gestureFrames: 0, picks: 0, paintedCamera: null };
     let next = 1;
     window.requestAnimationFrame = (callback) => { const id = next++; callbacks.set(id, callback); return id; };
     window.cancelAnimationFrame = (id) => callbacks.delete(id);
-    r.render = function (...args) { probe.frames++; return render.apply(this, args); };
+    r.draw = function (...args) {
+      const result = draw.apply(this, args);
+      if (!args[0]) {
+        probe.frames++;
+        if (this.target?.slot === "gesture") probe.gestureFrames++;
+        probe.paintedCamera = JSON.stringify(this.camera);
+      }
+      return result;
+    };
     r.pick = function (...args) { probe.picks++; return pick.apply(this, args); };
     probe.restore = () => {
       window.requestAnimationFrame = request; window.cancelAnimationFrame = cancel;
-      r.render = render; r.pick = pick;
+      r.draw = draw; r.pick = pick;
       for (const callback of callbacks.values()) request(callback);
       delete window.__blockedAnimationTest;
     };
@@ -36,10 +44,63 @@ export async function checkScheduling(page, check) {
     }));
     check(during.position.some((value, i) => Math.abs(value - before[i]) > 1e-6) && during.frames > 0,
       "pointer orbit paints while animation callbacks are held");
+    const finalCamera = await page.evaluate(() => {
+      const r = window.__tessifc.renderer;
+      r.orbit(5, 3);
+      const camera = JSON.stringify(r.camera);
+      return { camera, pending: r.dirty && window.__blockedAnimationTest.paintedCamera !== camera };
+    });
+    check(finalCamera.pending, "the final camera update remains pending before release");
     await page.mouse.up();
-    await page.waitForFunction((frames) => window.__blockedAnimationTest.frames > frames, during.frames, { polling: 20 });
+    await page.waitForFunction((camera) => window.__blockedAnimationTest.paintedCamera === camera, finalCamera.camera, { polling: 20 });
     check(await page.evaluate(() => !window.__tessifc.renderer.interacting),
-      "pointer release restores the resting frame without an animation callback");
+      "pointer release paints the final pending camera without an animation callback");
+
+    const settledFrames = await page.evaluate(() => window.__blockedAnimationTest.frames);
+    await page.mouse.down({ button: "right" });
+    await page.mouse.move(x + 30, y + 20);
+    await page.mouse.up({ button: "right" });
+    await page.waitForTimeout(80);
+    check(await page.evaluate((frames) => window.__blockedAnimationTest.frames === frames && !window.__tessifc.renderer.resizeDirty, settledFrames),
+      "a stationary pointer gesture submits no frame and requests no canvas resize");
+
+    await page.evaluate(() => {
+      const r = window.__tessifc.renderer;
+      r.setInteractionScale(.5);
+      r.render(true);
+    });
+    try {
+      await page.mouse.down({ button: "right" });
+      await page.mouse.move(x + 45, y + 30);
+      await page.waitForFunction(() => window.__tessifc.renderer.target?.slot === "gesture", null, { polling: 20 });
+      await page.mouse.up({ button: "right" });
+      await page.waitForFunction(() => window.__tessifc.renderer.target?.slot === "full", null, { polling: 20 });
+      check(await page.evaluate(() => {
+        const r = window.__tessifc.renderer;
+        return r.target.frameWidth === r.canvas.width && r.target.frameHeight === r.canvas.height && !r.interacting;
+      }), "an explicit reduced gesture scale restores full quality on release without an animation callback");
+      const wheelBefore = await page.evaluate(({ x, y }) => {
+        const r = window.__tessifc.renderer, probe = window.__blockedAnimationTest;
+        const before = { frames: probe.frames, gestureFrames: probe.gestureFrames };
+        r.canvas.dispatchEvent(new WheelEvent("wheel", { clientX: x, clientY: y, deltaY: -80, cancelable: true }));
+        return before;
+      }, { x: x + 45, y: y + 30 });
+      await page.waitForFunction(() => {
+        const r = window.__tessifc.renderer;
+        return !r.wheelQualityTimer && !r.dirty && r.target?.slot === "full";
+      }, null, { polling: 20 });
+      check(await page.evaluate((before) => {
+        const probe = window.__blockedAnimationTest;
+        return probe.frames === before.frames + 2 && probe.gestureFrames === before.gestureFrames + 1;
+      }, wheelBefore), "an explicit reduced wheel scale paints its moving and restored frames without animation callbacks");
+    } finally {
+      await page.mouse.up({ button: "right" });
+      await page.evaluate(() => {
+        const r = window.__tessifc.renderer;
+        r.setInteractionScale(1);
+        r.render(true);
+      });
+    }
 
     const point = await page.evaluate(() => {
       const r = window.__tessifc.renderer, rect = r.canvas.getBoundingClientRect();

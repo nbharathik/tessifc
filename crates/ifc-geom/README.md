@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc-geom
 
-Part of [TessIFC](../../README.md), an Apache-2.0 IFC geometry kernel.
+Part of [TessIFC](../../README.md).
 
 IFC geometry evaluation: units, placements, curves, profiles, solids, styles
 and provenance. A `Registry` maps an IFC class to its evaluator; an `EvalCtx`

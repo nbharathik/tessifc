@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc-engine
 
-Part of [TessIFC](../../README.md), an Apache-2.0 IFC geometry kernel.
+Part of [TessIFC](../../README.md).
 
 Orchestration: from a parsed model to placed geometry. The engine decides
 which products to evaluate, evaluates them, in batches or all at once and on

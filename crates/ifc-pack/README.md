@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc-pack
 
-Part of [TessIFC](../../README.md), an Apache-2.0 IFC geometry kernel.
+Part of [TessIFC](../../README.md).
 
 The IGP (IFC Geometry Pack) v0 writer. IGP is a GLB-shaped
 container: a 24-byte header, a JSON index padded to eight bytes, and a binary

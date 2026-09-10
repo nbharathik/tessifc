@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc-mesh
 
-Part of [TessIFC](../../README.md), an Apache-2.0 IFC geometry kernel.
+Part of [TessIFC](../../README.md).
 
 Mesh operations with no IFC in them: polygon triangulation, vertex welding,
 normals, half-space clipping, structured subtraction and bounded cell booleans. The

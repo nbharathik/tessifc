@@ -11,6 +11,7 @@ import { pavilionFile } from "./fixture.mjs";
 import { checkInteraction } from "./interaction.mjs";
 import { checkRenderWork } from "./render-work.mjs";
 import { checkPicking } from "./picking-render.mjs";
+import { checkDeltaRendering } from "./delta-render.mjs";
 import { checkScheduling } from "./scheduling.mjs";
 import { checkGpuPacing } from "./gpu-pacing.mjs";
 import { checkSelectionUpdates } from "./selection-updates.mjs";
@@ -94,6 +95,7 @@ try {
   await checkInteraction(page, check);
   await checkRenderWork(page, check);
   await checkPicking(page, check);
+  await checkDeltaRendering(page, check);
   await checkScheduling(page, check);
   await checkGpuPacing(page, check);
   await checkSelectionUpdates(page, check);

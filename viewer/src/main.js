@@ -20,6 +20,9 @@ import { createTools } from "./tools.js";
 import { createGizmo } from "./gizmo.js";
 import { createFrameScheduler, createTaskQueue } from "./scheduler.js";
 import { bytes, coordinate, count, duration, errorText, plural } from "./format.js";
+import { startFileSession } from "./file-session.js";
+import { createSessionPanel } from "./session-panel.js";
+import { PROVIDERS, createBrowserAssistant } from "./assistant.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -64,6 +67,9 @@ const state = {
   stream: null,
   selection: null,
   dirty: false,
+  revisionPending: null,
+  fileSession: null,
+  scriptHistory: { undo: 0, redo: 0 },
   hiddenClasses: new Set(),
   hiddenRecords: new Set(),
   shownRecords: new Set(),
@@ -84,6 +90,25 @@ try {
 const shell = createShell();
 const tools = createTools({ renderer, shell, scheduleRender });
 const inspector = createInspector({ onApplyEdits: applyEdits });
+const assistant = createBrowserAssistant({
+  inspect: (code, selection) => runBrowserScript(code, selection, { commit: false }),
+  execute: (script, selection) => runBrowserScript(script, selection),
+  undo: () => browserHistoryAction("undo"),
+  context: assistantContext,
+});
+const sessionPanel = createSessionPanel({
+  shell,
+  getSession: () => state.fileSession,
+  getSelection: selectionSummary,
+  hasModel: () => Boolean(state.model && !state.model.stale),
+  browser: {
+    run: (script, selection) => runBrowserScript(script, selection),
+    undo: () => browserHistoryAction("undo"),
+    redo: () => browserHistoryAction("redo"),
+    history: () => state.scriptHistory,
+  },
+  assistant,
+});
 const tree = createTree({
   onVisibility: setNodeVisible,
   onSelect: (expressId) => selectExpressId(expressId),
@@ -118,6 +143,8 @@ function renderScene() {
   syncMemoryNextFrame = false;
   renderer.render();
   tools.drawOverlay();
+  // A highlight fade keeps asking for frames until it is done.
+  if (renderer.animating) renderScheduler.request(false);
   if (syncGizmoNextFrame) {
     syncGizmoNextFrame = false;
     syncGizmo();
@@ -195,6 +222,7 @@ shell.on("resize", () => requestAnimationFrame(() => {
 shell.register([
   { id: "open", label: "Open IFC file", section: "File", hint: "Ctrl O", run: () => $("file-input").click() },
   { id: "export", label: "Export IFC", section: "File", hint: "Ctrl S", disabled: true, run: requestExport },
+  { id: "update-ifc", label: "Update from edited IFC", section: "File", disabled: true, run: () => $("revision-input").click() },
   { id: "close", label: "Close model", section: "File", disabled: true, run: closeModel },
   { id: "settings", label: "Settings", section: "Workspace", hint: "Ctrl ,", run: shell.openSettings },
   { id: "help", label: "Keyboard shortcuts", section: "Workspace", hint: "?", run: shell.openHelp },
@@ -225,6 +253,9 @@ shell.register([
   { id: "toggle-outliner", label: "Toggle the structure panel", section: "Panels", hint: "Ctrl B", run: () => shell.togglePanel("outliner") },
   { id: "toggle-inspector", label: "Toggle the inspector", section: "Panels", hint: "\\", run: () => shell.togglePanel("inspector") },
   { id: "toggle-editor", label: "Toggle the edit panel", section: "Panels", hint: "E", run: () => setEditor(!shell.panelVisible("editor")) },
+  { id: "toggle-session", label: "Toggle the session panel", section: "Panels", run: () => shell.togglePanel("session") },
+  { id: "session-script", label: "Python script panel", section: "Session", run: () => sessionPanel.open("script") },
+  { id: "session-assistant", label: "Assistant panel", section: "Session", run: () => sessionPanel.open("assistant") },
   { id: "properties", label: "Show properties", section: "Panels", run: () => shell.setInspectorPanel("properties") },
   { id: "element", label: "Show element details", section: "Panels", run: () => shell.setInspectorPanel("element") },
   { id: "model-stats", label: "Show model statistics", section: "Panels", disabled: true, run: () => shell.setInspectorPanel("model") },
@@ -290,6 +321,33 @@ $("set-coincident").addEventListener("change", (event) => {
   saveSettings();
   scheduleRender(true);
 });
+// The assistant fields write straight through; the panel re-reads them on its next refresh.
+function syncAssistantFields() {
+  const settings = assistant.settings();
+  const provider = PROVIDERS[settings.provider] ?? PROVIDERS.off;
+  $("set-assistant-provider").value = settings.provider;
+  $("set-assistant-model").value = settings.model;
+  $("set-assistant-model").placeholder = provider.model ?? "";
+  $("set-assistant-url").value = settings.baseUrl;
+  $("set-assistant-key").value = settings.key;
+  $("set-assistant-model-row").classList.toggle("hidden", settings.provider === "off");
+  $("set-assistant-url-row").classList.toggle("hidden", settings.provider !== "compatible");
+  $("set-assistant-key-row").classList.toggle("hidden", settings.provider === "off");
+}
+$("set-assistant-provider").addEventListener("change", (event) => {
+  const provider = PROVIDERS[event.target.value] ?? PROVIDERS.off;
+  assistant.update({ provider: event.target.value, model: provider.model ?? "", baseUrl: provider.baseUrl ?? "" });
+  syncAssistantFields();
+  sessionPanel.refresh();
+});
+for (const [id, key] of [["set-assistant-model", "model"], ["set-assistant-url", "baseUrl"], ["set-assistant-key", "key"]]) {
+  $(id).addEventListener("input", (event) => {
+    assistant.update({ [key]: event.target.value.trim() });
+    sessionPanel.refresh();
+  });
+}
+$("assistant-settings").addEventListener("click", () => shell.openSettings());
+
 $("set-hidden").addEventListener("change", (event) => {
   state.settings.hideSemantic = event.target.checked;
   state.hiddenInstanceFlags = event.target.checked ? DEFAULT_HIDDEN_INSTANCE_FLAGS : 0;
@@ -309,8 +367,14 @@ $("set-hidden").addEventListener("change", (event) => {
 
 $("file-input").addEventListener("change", (event) => {
   const [file] = event.target.files;
-  if (file) openFile(file);
+  if (file) openFile(file, { detachSession: true });
   event.target.value = "";
+});
+
+$("revision-input").addEventListener("change", (event) => {
+  const [file] = event.target.files;
+  event.target.value = "";
+  if (file) updateFromFile(file).catch((error) => shell.toast(errorText(error), "error"));
 });
 
 window.addEventListener("dragenter", (event) => {
@@ -336,7 +400,7 @@ window.addEventListener("drop", (event) => {
   state.dragDepth = 0;
   endDrag();
   const [file] = event.dataTransfer.files;
-  if (file) openFile(file);
+  if (file) openFile(file, { detachSession: true });
 });
 window.addEventListener("beforeunload", (event) => {
   if (!state.dirty) return;
@@ -432,8 +496,11 @@ function selectRecord(record, refresh = false) {
   let triangles = 0;
   for (const item of records) triangles += index.triangles[item];
 
+  // A refresh of the element already shown keeps its attributes on screen until the new ones arrive.
+  const quiet = refresh && selected?.expressId === expressId && selected.modelId === state.model.modelId;
   state.selection = { record, records, expressId, className, modelId: state.model.modelId,
-    requestId: ++state.requestId, editRequestId: 0, infoState: state.worker ? "pending" : "idle" };
+    requestId: ++state.requestId, editRequestId: 0, infoState: state.worker ? "pending" : "idle",
+    info: quiet ? selected.info : undefined };
   renderer.select(records);
   scheduleRender();
 
@@ -458,8 +525,10 @@ function selectRecord(record, refresh = false) {
     extent: bounds ? { min: toIfc(bounds.min), max: toIfc(bounds.max) } : null,
     path: tree.pathOf(expressId),
     state: describeVisibility(records),
+    quiet,
   });
   syncIsolation(isIsolated(records));
+  sessionPanel.setSelection(true);
   panelWork.selection = true;
   schedulePanelWork();
   for (const id of ["isolate", "hide", "clear-selection", "focus", "edit"]) shell.setEnabled(id, true);
@@ -473,10 +542,26 @@ function selectRecord(record, refresh = false) {
   });
 }
 
+/** The selection as a script target: express id, class, and the GlobalId once its attributes arrived. */
+function selectionSummary() {
+  const selection = state.selection;
+  if (!selection || selection.modelId !== state.model?.modelId) return null;
+  const fields = Array.isArray(selection.info?.fields) ? selection.info.fields : [];
+  const field = (name) => fields.find((item) => item.name === name)?.value ?? null;
+  const node = state.model.hierarchy?.nodes?.find((item) => item.expressId === selection.expressId);
+  return {
+    expressId: selection.expressId,
+    className: selection.className,
+    globalId: field("GlobalId") ?? node?.globalId ?? null,
+    name: field("Name") ?? node?.name ?? null,
+  };
+}
+
 function clearSelection() {
   renderer.select(null);
   scheduleRender();
   state.selection = null;
+  sessionPanel.setSelection(false);
   inspector.clearSelection();
   panelWork.selection = true;
   schedulePanelWork();
@@ -511,6 +596,7 @@ function isRecordVisible(record) {
 }
 
 function isRecordVisibleInPack(pack, record) {
+  if (pack.instances.active && !pack.instances.active[record]) return false;
   if (state.isolated && !state.isolated.has(record)) return false;
   if (state.hiddenRecords.has(record)) return false;
   if (state.shownRecords.has(record)) return true;
@@ -644,9 +730,10 @@ function scheduleVisibilityStats() {
   if (statsFrame) return;
   statsFrame = requestAnimationFrame(() => {
     statsFrame = 0;
-    const total = state.model?.pack.instances.count ?? 0;
+    const instances = state.model?.pack.instances;
+    const total = instances?.activeCount ?? instances?.count ?? 0;
     let visible = 0;
-    for (let record = 0; record < total; record += 1) if (isRecordVisible(record)) visible += 1;
+    for (let record = 0; record < (instances?.count ?? 0); record += 1) if (isRecordVisible(record)) visible += 1;
     $("stat-visible").textContent = count(visible);
     $("stat-hidden").textContent = count(total - visible);
   });
@@ -684,6 +771,16 @@ function startWorker() {
         return shell.toast(data.message, "error");
       case "product-geometry":
         return receiveProductGeometry(data);
+      case "script-result":
+        receiveScriptResult(data);
+        break;
+      case "script-error":
+        receiveScriptError(data);
+        break;
+      case "revision-result":
+        return receiveRevision(data);
+      case "revision-error":
+        return receiveRevisionError(data);
       default:
         break;
     }
@@ -714,6 +811,7 @@ function startWorker() {
     worker.terminate();
     state.worker = null;
     state.workerReady = false;
+    if (state.revisionPending) finishRevision(new Error("The geometry worker stopped."));
     state.converting = false;
     state.loadOutcome = "failed";
     abandonStream();
@@ -755,7 +853,11 @@ function workerFailed(data) {
 
 // ------------------------------------------------------------ model load
 
-async function openFile(file) {
+async function openFile(file, { detachSession = false } = {}) {
+  if (state.revisionPending) {
+    shell.toast("Wait for the current IFC update to finish.", "info");
+    return;
+  }
   if (!file.name.toLowerCase().endsWith(".ifc")) {
     shell.toast("Choose an IFC-SPF file with the .ifc extension.", "error");
     return;
@@ -768,6 +870,7 @@ async function openFile(file) {
     if (!window.confirm("This model has unsaved IFC edits. Discard them and open another file?")) return;
     state.replaceApproved = file;
   }
+  if (detachSession) detachFileSession();
   if (state.converting) {
     state.queuedFile = file;
     state.jobId += 1;
@@ -917,6 +1020,7 @@ function showResult(data) {
       summary: data.summary,
       hierarchy: data.hierarchy,
       modelId: data.modelId,
+      revision: data.revision ?? "0",
       index: buildIndex(pack),
       file: state.pendingFile,
     };
@@ -971,6 +1075,7 @@ function buildIndex(pack) {
   const triangles = new Uint32Array(total);
   let instanceFlags = 0;
   for (let record = 0; record < total; record += 1) {
+    if (pack.instances.active && !pack.instances.active[record]) continue;
     instanceFlags |= pack.instances.flags[record];
     const expressId = pack.instances.expressIds[record];
     let records = recordsByExpressId.get(expressId);
@@ -1014,11 +1119,12 @@ function describeModel(data, pack, totalMs) {
 function enableModelCommands(enabled) {
   for (const id of [
     "fit", "zoom-in", "zoom-out", "plan", "style", "measure", "section", "show-all", "export", "close",
-    "quality", "model-stats", "tree-expand", "tree-collapse",
+    "quality", "model-stats", "tree-expand", "tree-collapse", "update-ifc",
     "spaces", "openings", "references",
     "view:perspective", "view:top", "view:front", "view:right",
   ]) shell.setEnabled(id, enabled);
   $("tree-search").disabled = !enabled;
+  sessionPanel.refresh();
 }
 
 /** After a failed load, the chip names the model still open, or nothing. */
@@ -1046,6 +1152,8 @@ function abandonStream() {
 
 /** Put the chrome back to its no-model state. The model chip and the dropzone belong to the caller. */
 function clearModelUi() {
+  state.scriptHistory = { undo: 0, redo: 0 };
+  sessionPanel.refresh();
   tools.reset(false);
   tree.clear();
   inspector.clear();
@@ -1079,8 +1187,13 @@ function disposeModel() {
 }
 
 function closeModel() {
+  if (state.revisionPending) {
+    shell.toast("Wait for the current IFC update to finish.", "info");
+    return;
+  }
   if (state.dirty && !window.confirm("This model has unsaved IFC edits. Discard them and close it?")) return;
   const activeId = state.model?.modelId;
+  detachFileSession();
   if (state.converting) {
     // Cancel the job the way a replacement open does: a fresh worker holds no model.
     state.jobId += 1;
@@ -1120,9 +1233,84 @@ function receiveEntityError(data) {
   inspector.setPropertyError(data.message);
 }
 
+/** Run a browser script in the worker; resolves with the script report and, after a commit, the impact. */
+function runBrowserScript(source, selection = null, { commit = true } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!state.model || !state.workerReady) return reject(new Error("Open a model before running a script."));
+    if (state.fileSession) return reject(new Error("This model follows a local session; its scripts run there."));
+    if (state.revisionPending || state.converting) return reject(new Error("Wait for the current update to finish."));
+    if (state.model.stale) return reject(new Error("Reopen the model to restore synchronization."));
+    const requestId = ++state.requestId;
+    state.revisionPending = { requestId, script: true, resolve, reject };
+    state.worker.postMessage({
+      type: "run-script", requestId, modelId: state.model.modelId, source: String(source ?? ""), selection, commit,
+      patch: revisionOptions(),
+    });
+  });
+}
+
+function browserHistoryAction(action) {
+  return new Promise((resolve, reject) => {
+    if (!state.model || !state.workerReady) return reject(new Error("Open a model first."));
+    if (state.revisionPending || state.converting) return reject(new Error("Wait for the current update to finish."));
+    if (state.model.stale) return reject(new Error("Reopen the model to restore synchronization."));
+    const requestId = ++state.requestId;
+    state.revisionPending = { requestId, script: true, resolve, reject };
+    state.worker.postMessage({ type: "script-history", requestId, modelId: state.model.modelId, action, patch: revisionOptions() });
+  });
+}
+
+function receiveScriptResult(data) {
+  if (data.modelId !== state.model?.modelId || data.requestId !== state.revisionPending?.requestId) return;
+  if (data.history) state.scriptHistory = data.history;
+  finishRevision(null, { ...data.result, impact: null, history: data.history ?? null });
+  sessionPanel.refresh();
+}
+
+function receiveScriptError(data) {
+  if (data.modelId !== state.model?.modelId || data.requestId !== state.revisionPending?.requestId) return;
+  if (data.history) state.scriptHistory = data.history;
+  finishRevision(new Error(data.message));
+  sessionPanel.refresh();
+}
+
+/** What the browser assistant learns about the open model and the selection. */
+async function assistantContext() {
+  const model = state.model;
+  if (!model) return "No model is open.";
+  const info = model.info ?? {};
+  const products = Object.entries(info.products ?? {}).sort((left, right) => right[1] - left[1]).slice(0, 40)
+    .map(([name, total]) => `${name} ${total}`).join(", ");
+  const storeys = (model.hierarchy?.nodes ?? []).filter((node) => node.class === "IfcBuildingStorey").slice(0, 20)
+    .map((node) => `#${node.expressId} ${node.name ?? "unnamed"}`).join("; ");
+  const lines = [
+    `File: ${model.file?.name ?? "model.ifc"} (${info.schema ?? "unknown schema"}), revision ${model.revision}, lengths in the model's length unit.`,
+    `Products by class: ${products || "none"}.`,
+  ];
+  if (storeys) lines.push(`Storeys: ${storeys}.`);
+  const selection = selectionSummary();
+  if (selection) {
+    const fields = (state.selection?.info?.fields ?? []).filter((field) => field.raw && field.raw !== "$").slice(0, 40)
+      .map((field) => `${field.name}=${field.raw}`).join(", ");
+    lines.push(`Selected in the viewer (the \`selected\` entity): #${selection.expressId} ${selection.className}${fields ? ` with ${fields}` : ""}.`);
+  } else {
+    lines.push("Nothing is selected in the viewer.");
+  }
+  return lines.join("\n");
+}
+
 function applyEdits(changes) {
   if (!state.selection || !state.model) return;
+  if (state.fileSession) {
+    inspector.setEditError("This model follows an external IFC file. Edit it in the connected authoring process.");
+    return;
+  }
+  if (state.revisionPending || state.model.stale) {
+    inspector.setEditError("Wait for the current update, or reopen the model if synchronization failed.");
+    return;
+  }
   state.selection.editRequestId = ++state.requestId;
+  state.revisionPending = { requestId: state.selection.editRequestId, attributeEdit: true };
   inspector.setEditPending();
   try {
     const { assembler, pack } = state.model;
@@ -1134,12 +1322,13 @@ function applyEdits(changes) {
       changes,
       // The patch must land in the same pack space, above every geometry id in use.
       patch: assembler
-        ? { modelOffset: pack.index.model_offset ?? [0, 0, 0], firstGeometryId: assembler.nextGeometryId() }
+        ? { baseRevision: state.model.revision, modelOffset: pack.index.model_offset ?? [0, 0, 0], firstGeometryId: assembler.nextGeometryId() }
         : null,
     });
   } catch (error) {
     // Never leave the editor stuck on its pending state.
     inspector.setEditError(errorText(error));
+    finishRevision(error);
   }
 }
 
@@ -1166,7 +1355,7 @@ function receiveProductGeometry(data) {
     state.shownRecords = recordsOf(shownIds, index);
     state.isolated = isolatedIds ? recordsOf(isolatedIds, index) : null;
     state.model = { ...model, pack, index };
-    const rebuilt = renderer.reload(pack, isRecordVisible);
+    const rebuilt = renderer.applyDelta(pack, result, isRecordVisible);
     state.model = { ...state.model, ...rebuilt };
     tree.build(pack, model.hierarchy, index);
     tree.syncVisibility(isRecordVisible);
@@ -1197,6 +1386,11 @@ function recordsOf(expressIds, index) {
 }
 
 function receiveEditResult(data) {
+  if (data.modelId === state.model?.modelId) {
+    state.dirty = true;
+    setDirty(true);
+    finishRevision();
+  }
   if (!state.selection || data.requestId !== state.selection.editRequestId) return;
   if (data.expressId !== state.selection.expressId) return;
   state.selection.info = data.info;
@@ -1208,13 +1402,184 @@ function receiveEditResult(data) {
 }
 
 function receiveEditError(data) {
+  if (data.requestId === state.revisionPending?.requestId) finishRevision(new Error(data.message));
   if (!state.selection || data.requestId !== state.selection.editRequestId) return;
   inspector.setEditError(data.message);
 }
 
+function revisionOptions() {
+  const { pack, assembler, revision } = state.model;
+  return { baseRevision: revision, modelOffset: pack.index.model_offset ?? [0, 0, 0],
+    firstGeometryId: assembler.nextGeometryId(), selectedExpressId: state.selection?.expressId ?? null };
+}
+
+/** Ingest a saved version while retaining the open scene and its user state. */
+async function updateFromFile(file) {
+  if (!state.model || !state.workerReady) throw new Error("Open a model before updating it.");
+  if (state.revisionPending || state.converting) throw new Error("An IFC update is already running.");
+  if (state.model.stale) throw new Error("Reopen the model to restore synchronization.");
+  if (!file.size || !/\.ifc$/i.test(file.name)) throw new Error("Choose a nonempty IFC file.");
+  if (state.dirty && !window.confirm("Replace the current unsaved edits with this IFC revision?")) {
+    throw new Error("Update cancelled.");
+  }
+  const requestId = ++state.requestId;
+  const modelId = state.model.modelId;
+  const promise = new Promise((resolve, reject) => {
+    state.revisionPending = { requestId, file: { name: file.name, size: file.size }, resolve, reject };
+  });
+  setStatus("Reading the edited IFC", "busy");
+  try {
+    const buffer = await file.arrayBuffer();
+    if (state.model?.modelId !== modelId) throw new Error("The model changed during the update.");
+    state.worker.postMessage({ type: "update-revision", requestId, modelId, buffer, patch: revisionOptions() }, [buffer]);
+    setStatus("Evaluating affected objects", "busy");
+  } catch (error) {
+    finishRevision(error);
+    shell.toast(errorText(error), "error");
+  }
+  return promise;
+}
+
+function detachFileSession() {
+  if (!state.fileSession) return;
+  state.fileSession.stop();
+  state.fileSession = null;
+  sessionPanel.setStatus(null);
+}
+
+function finishRevision(error = null, result = null) {
+  const pending = state.revisionPending;
+  state.revisionPending = null;
+  if (error) pending?.reject?.(error);
+  else pending?.resolve?.(result);
+}
+
+function productIdentities(model, ids) {
+  const nodes = new Map((model.hierarchy?.nodes ?? []).map((node) => [node.expressId, node]));
+  return [...ids].map((id) => ({ id, guid: nodes.get(id)?.globalId ?? null }));
+}
+
+function restoreIdentities(identities, hierarchy, fullRebuild) {
+  const guidIds = new Map();
+  for (const node of hierarchy?.nodes ?? []) {
+    if (!node.globalId) continue;
+    guidIds.set(node.globalId, guidIds.has(node.globalId) ? null : node.expressId);
+  }
+  return identities.map(({ id, guid }) => guid ? guidIds.get(guid) : fullRebuild ? null : id)
+    .filter((id) => Number.isInteger(id));
+}
+
+function receiveRevision(data) {
+  const model = state.model;
+  if (!model || data.modelId !== model.modelId) return;
+  if (data.revision === model.revision) return;
+  if (data.requestId !== state.revisionPending?.requestId || data.baseRevision !== model.revision) {
+    model.stale = true;
+    setStatus("IFC revision mismatch; reopen the model", "err");
+    finishRevision(new Error("The received IFC revision has an unexpected base."));
+    return;
+  }
+  const pending = state.revisionPending;
+  try {
+    const impact = data.impact;
+    const chunk = data.buffer ? readIgp(data.buffer) : null;
+    if (!chunk) throw new Error("The IFC update is missing its geometry payload.");
+    const hidden = productIdentities(model, expressIdsOf(state.hiddenRecords));
+    const shown = productIdentities(model, expressIdsOf(state.shownRecords));
+    const isolated = state.isolated ? productIdentities(model, expressIdsOf(state.isolated)) : null;
+    const selected = productIdentities(model, state.selection ? [state.selection.expressId] : []);
+    let assembler = model.assembler;
+    let result;
+    if (impact.fullRebuild) {
+      assembler = createPackAssembler();
+      assembler.append(chunk);
+      result = { changed: true };
+    } else {
+      result = assembler.replaceProducts([...new Set([...impact.affectedProducts, ...impact.removedProducts])], chunk);
+    }
+    const pack = assembler.pack();
+    pack.index.georef = chunk.index.georef;
+    const index = buildIndex(pack);
+    const restore = (items) => recordsOf(restoreIdentities(items, data.hierarchy, impact.fullRebuild), index);
+    state.hiddenRecords = restore(hidden);
+    state.shownRecords = restore(shown);
+    state.isolated = isolated ? restore(isolated) : null;
+    const summary = { ...model.summary, products: index.recordsByExpressId.size,
+      triangles: index.triangles.reduce((sum, value) => sum + value, 0) };
+    state.model = { ...model, assembler, pack, index, revision: data.revision, info: data.info,
+      hierarchy: data.hierarchy, summary, stale: false, file: pending.file ?? model.file };
+    let rendered = {};
+    if (result.changed) {
+      rendered = impact.fullRebuild ? renderer.reload(pack, isRecordVisible) : renderer.applyDelta(pack, result, isRecordVisible);
+      tools.clearMeasurement();
+    }
+    state.model = { ...state.model, ...rendered,
+      lastUpdate: { ...impact, ...data.timings, revision: data.revision, renderer: rendered.patchStats ?? null } };
+    tree.build(pack, data.hierarchy, index);
+    tree.syncVisibility(isRecordVisible);
+    syncHelperControls(pack);
+    scheduleVisibilityStats();
+    const selectedId = restoreIdentities(selected, data.hierarchy, impact.fullRebuild)[0];
+    if (selectedId != null && index.recordsByExpressId.has(selectedId)) selectExpressId(selectedId, true);
+    else clearSelection();
+    if (data.entityInfo && state.selection?.expressId === (data.infoId ?? data.expressId)) {
+      state.selection.info = data.entityInfo;
+      state.selection.infoState = "ready";
+      if (data.attributeEdit) inspector.setEditResult(data.entityInfo, data.changed);
+      else inspector.setProperties(data.entityInfo);
+    }
+    if (result.changed && !impact.fullRebuild) {
+      const touched = new Set([...impact.affectedProducts, ...(impact.metadataProducts ?? [])]);
+      renderer.flash?.([...recordsOf(touched, index)]);
+    }
+    state.dirty = data.attributeEdit || Boolean(data.script);
+    setDirty(state.dirty);
+    if (data.history) state.scriptHistory = data.history;
+    state.pendingFile = state.model.file;
+    inspector.setGeometryFacts({ pack, model: state.model });
+    inspector.setQuality(pack.index.diagnostics ?? [], renderer);
+    describeModel({ info: data.info, summary }, pack, null);
+    const updated = impact.affectedProducts.length;
+    const deleted = impact.removedProducts.length;
+    const label = impact.fullRebuild ? "Full geometry refresh" : `${updated} geometry updates, ${deleted} removed`;
+    setStatus(`Revision ${data.revision}: ${label}`, "on");
+    $("status-text").title = (impact.reasons ?? []).slice(0, 30).map((item) => `#${item.expressId}: ${item.reason}`).join("\n");
+    scheduleRender(true);
+    sessionPanel.refresh();
+    finishRevision(null, pending.script
+      ? { ...data.script, impact: state.model.lastUpdate, history: data.history ?? null }
+      : state.model.lastUpdate);
+  } catch (error) {
+    state.model.revision = data.revision;
+    state.model.stale = true;
+    state.dirty = data.attributeEdit || Boolean(data.script);
+    setDirty(state.dirty);
+    setStatus("IFC updated; the view needs reopening", "err");
+    shell.toast(`The IFC revision was committed, but the scene could not be updated: ${errorText(error)}`, "error", 0);
+    finishRevision(error);
+  }
+}
+
+function receiveRevisionError(data) {
+  if (data.modelId !== state.model?.modelId || data.requestId !== state.revisionPending?.requestId) return;
+  if (data.committed) {
+    state.model.revision = data.revision;
+    state.model.stale = true;
+  }
+  if (data.history) state.scriptHistory = data.history;
+  inspector.setEditError(data.message);
+  setStatus(data.committed ? "IFC updated; reopen to synchronize" : "IFC update rejected; previous revision retained", "err");
+  shell.toast(data.message, "error");
+  const error = new Error(data.message);
+  error.revisionRejected = !data.committed;
+  error.script = data.script ?? null;
+  finishRevision(error);
+  sessionPanel.refresh();
+}
+
 function setDirty(dirty) {
   shell.setDirty("export", dirty);
-  $("pending-bar").classList.toggle("hidden", !dirty);
+  $("save-revision").classList.toggle("hidden", !dirty);
 }
 
 // ---------------------------------------------------------------- export
@@ -1282,6 +1647,7 @@ shell.applyTheme(shell.themeMode());
 for (const name of ["--canvas-light", "--canvas-dark", "--section-cap-light", "--section-cap-dark"]) cssToken(name);
 renderer.setPixelRatioLimit?.(state.settings.scale);
 $("set-scale").value = String(state.settings.scale);
+syncAssistantFields();
 renderer.setAdaptiveResolution?.(state.settings.adaptive);
 $("set-adaptive").checked = state.settings.adaptive;
 renderer.setLodPixels?.(state.settings.lod ? LOD_PIXELS : 0);
@@ -1294,6 +1660,19 @@ enableModelCommands(false);
 clearSelection();
 startWorker();
 scheduleRender();
+
+if (new URLSearchParams(location.search).get("session") === "file") {
+  state.fileSession = startFileSession({
+    ready: () => state.workerReady && !state.converting && !state.revisionPending && !state.model?.stale,
+    loaded: () => Boolean(state.model),
+    open: openFile,
+    update: updateFromFile,
+    report: (message) => setStatus(message, "err"),
+    status: (session) => {
+      if (state.fileSession) sessionPanel.setStatus(session);
+    },
+  });
+}
 
 const splash = $("splash");
 splash.classList.add("done");

@@ -12,9 +12,13 @@ const COLUMNS = {
   colors: [Uint8Array, 4],
   flags: [Uint16Array, 1],
   provenance: [Uint32Array, 1],
+  active: [Uint8Array, 1],
 };
 
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+// Slots are encoded in Float32 GPU attributes. Retired slots are not recycled:
+// column storage grows with total revision parts until an explicit reopen.
+export const MAX_INSTANCE_SLOTS = 2 ** 24;
 
 /** A growing pack; `pack()` views point into assembler storage and last until the next append. */
 export function createPackAssembler() {
@@ -31,7 +35,7 @@ export function createPackAssembler() {
   // and every chunk's column is remapped onto the merged table.
   const provenance = [];
   const provenanceIndex = new Map();
-  const diagnostics = [];
+  let diagnostics = [];
   let columns = allocate(1024);
   let count = 0;
   let bytes = 0;
@@ -40,6 +44,8 @@ export function createPackAssembler() {
   let headerFlags = 0;
   let chunks = 0;
   let sharedRecords = 0;
+  let activeCount = 0;
+  let streamFinished = false;
 
   function allocate(capacity) {
     const out = { capacity };
@@ -48,6 +54,7 @@ export function createPackAssembler() {
   }
 
   function ensureCapacity(needed) {
+    if (needed > MAX_INSTANCE_SLOTS) throw new Error("The scene reached its stable-slot limit; reopen a saved revision to reclaim retired slots.");
     if (needed <= columns.capacity) return;
     let capacity = columns.capacity;
     while (capacity < needed) capacity *= 2;
@@ -67,7 +74,7 @@ export function createPackAssembler() {
   }
 
   function provenanceId(row) {
-    const key = `${row?.rep}|${row?.item}|${row?.evaluator}|${row?.boolean}`;
+    const key = JSON.stringify(row ?? null);
     let id = provenanceIndex.get(key);
     if (id === undefined) {
       id = provenance.length;
@@ -79,6 +86,7 @@ export function createPackAssembler() {
 
   /** Add one chunk. Returns the record range it occupies. */
   function append(chunk) {
+    ensureCapacity(count + chunk.instances.count);
     if (!index) {
       // Model-wide index fields come from the first chunk; later ones repeat them.
       index = {
@@ -102,7 +110,6 @@ export function createPackAssembler() {
     const remap = chunk.index.classes.map((name) => classId(String(name)));
     const provenanceRemap = (chunk.index.provenance ?? []).map((row) => provenanceId(row));
     const added = chunk.instances.count;
-    ensureCapacity(count + added);
     for (const [name, [, width]] of Object.entries(COLUMNS)) {
       // An optional column is absent from a pack written before it existed.
       const source = chunk.instances[name];
@@ -110,60 +117,120 @@ export function createPackAssembler() {
       columns[name].set(source.subarray(0, added * width), count * width);
     }
     for (let record = 0; record < added; record += 1) {
+      columns.active[count + record] = chunk.instances.active?.[record] ?? 1;
+      if (columns.active[count + record]) activeCount += 1;
       const local = chunk.instances.classIds[record];
       columns.classIds[count + record] = remap[local] ?? classId("IfcUnknown");
+      columns.provenance[count + record] = 0xffffffff;
       if (chunk.instances.provenance) {
         const row = chunk.instances.provenance[record];
-        columns.provenance[count + record] = provenanceRemap[row] ?? 0;
+        columns.provenance[count + record] = provenanceRemap[row] ?? 0xffffffff;
       }
-      if (!isIdentity(chunk.instances.transforms, record * 16)) sharedRecords += 1;
+      if (columns.active[count + record] && !isIdentity(chunk.instances.transforms, record * 16)) sharedRecords += 1;
     }
     for (const item of chunk.index.diagnostics ?? []) diagnostics.push(item);
-    if (chunk.index.stats) stats = { ...stats, ...chunk.index.stats };
+    if (chunk.index.stats && !appendingPatch) stats = { ...stats, ...chunk.index.stats };
     headerFlags = chunk.flags;
     const from = count;
     count += added;
     bytes += chunk.bytes;
     chunks += 1;
+    if (!appendingPatch && (chunk.stream?.final || chunk.index.stream?.final)) streamFinished = true;
     return { from, to: count };
   }
 
   /** Replace every record of these products with those of `chunk`; reports whether drawn geometry changed. */
   function replaceProducts(expressIds, chunk) {
-    const removing = new Set(expressIds);
-    const before = signature(removing);
-    // Unchanged records stay where they are, so nothing downstream has to be rebuilt.
-    if (before === chunkSignature(chunk, removing)) return { from: count, to: count, removed: 0, changed: false };
-    let write = 0;
-    for (let record = 0; record < count; record += 1) {
-      if (removing.has(columns.expressIds[record])) continue;
-      if (write !== record) {
-        for (const [name, [, width]] of Object.entries(COLUMNS)) {
-          columns[name].copyWithin(write * width, record * width, (record + 1) * width);
-        }
-      }
-      write += 1;
+    const requested = new Set(expressIds);
+    const oldMeshes = new Map(geometry.map((mesh) => [mesh.id, mesh]));
+    const newMeshes = new Map(chunk.geometry.map((mesh) => [mesh.id, mesh]));
+    const offset = index?.model_offset ?? [0, 0, 0];
+    if (!equalArray(offset, chunk.index.model_offset ?? [0, 0, 0])) {
+      throw new Error("A product patch must use the existing model offset.");
     }
-    const removed = count - write;
-    count = write;
-    prunePatchMeshes();
+    const before = new Map(), after = new Map();
+    for (let record = 0; record < count; record++) {
+      if (!columns.active[record] || !requested.has(columns.expressIds[record])) continue;
+      const id = columns.expressIds[record];
+      if (!before.has(id)) before.set(id, []);
+      before.get(id).push(record);
+    }
+    for (let record = 0; record < chunk.instances.count; record++) {
+      const id = chunk.instances.expressIds[record];
+      if (!requested.has(id)) throw new Error(`Product patch contains unrequested IFC entity #${id}.`);
+      if (chunk.instances.active?.[record] === 0) continue;
+      const geometryId = chunk.instances.geometryIds[record];
+      if (!newMeshes.has(geometryId) && !oldMeshes.has(geometryId)) throw new Error("Product patch references missing geometry.");
+      if (!after.has(id)) after.set(id, []);
+      after.get(id).push(record);
+    }
+    // Match complete part sets, including render metadata. Hashes only select
+    // candidates; exact equality confirms reuse, so collisions cannot hide edits.
+    const previous = { instances: columns, index: { classes, provenance } };
+    const changedProducts = [...requested].filter((id) => !sameParts(
+      previous, before.get(id) ?? [], oldMeshes,
+      chunk, after.get(id) ?? [], new Map([...oldMeshes, ...newMeshes]),
+    ));
+    const changed = new Set(changedProducts);
+    const empty = { from: count, to: count };
+    const nextDiagnostics = [...new Map([
+      ...diagnostics.filter((item) => !requested.has(item.expressId ?? item.express_id ?? item.id)),
+      ...(chunk.index.diagnostics ?? []),
+    ].map((item) => [JSON.stringify(item), item])).values()];
+    const diagnosticsChanged = JSON.stringify(diagnostics) !== JSON.stringify(nextDiagnostics);
+    if (!changed.size) {
+      if (diagnosticsChanged) diagnostics = nextDiagnostics;
+      return { ...empty, appended: empty, removed: 0, removedRecords: [], changedProducts, changed: diagnosticsChanged, metadataOnly: diagnosticsChanged };
+    }
+
+    const records = [];
+    for (let record = 0; record < chunk.instances.count; record++) {
+      if (changed.has(chunk.instances.expressIds[record]) && chunk.instances.active?.[record] !== 0) records.push(record);
+    }
+    const replacement = selectRecords(chunk, records);
+    replacement.index = { ...replacement.index, diagnostics: [] };
+    for (const mesh of replacement.geometry) {
+      if (oldMeshes.has(mesh.id) && !sameMesh(oldMeshes.get(mesh.id), mesh)) {
+        throw new Error(`Product patch reuses geometry ID ${mesh.id} for different geometry.`);
+      }
+    }
+    // Allocate before deactivating anything. Existing rows are never compacted
+    // or reused: GPU IDs and pending picks continue to identify the same slot.
+    ensureCapacity(count + records.length);
+    diagnostics = nextDiagnostics;
+    const removedRecords = [];
+    for (const id of changedProducts) for (const record of before.get(id) ?? []) {
+      columns.active[record] = 0;
+      activeCount -= 1;
+      if (!isIdentity(columns.transforms, record * 16)) sharedRecords -= 1;
+      removedRecords.push(record);
+    }
     appendingPatch = true;
     let range;
     try {
-      range = append(chunk);
+      range = append(replacement);
     } finally {
       appendingPatch = false;
     }
-    const after = signature(removing);
-    return { ...range, removed, changed: before !== after };
+    prunePatchMeshes();
+    const meshes = new Map(geometry.map((mesh) => [mesh.id, mesh]));
+    const products = new Set();
+    let triangles = 0;
+    for (let record = 0; record < count; record++) if (columns.active[record]) {
+      products.add(columns.expressIds[record]);
+      triangles += (meshes.get(columns.geometryIds[record])?.indices.length ?? 0) / 3;
+    }
+    stats = { ...stats, products: products.size, triangles };
+    return { ...range, appended: range, removed: removedRecords.length, removedRecords, changedProducts, changed: true };
   }
 
-  /** Drop meshes an earlier patch left unreferenced. Streamed meshes stay: a later chunk may still use them. */
+  /** Retire unused meshes; initial-stream geometry stays until the final chunk arrives. */
   function prunePatchMeshes() {
-    if (!patchMeshes.size) return;
-    const live = new Set(columns.geometryIds.subarray(0, count));
+    if (!patchMeshes.size && !streamFinished) return;
+    const live = new Set();
+    for (let record = 0; record < count; record++) if (columns.active[record]) live.add(columns.geometryIds[record]);
     const dead = new Set();
-    for (const id of patchMeshes) if (!live.has(id)) dead.add(id);
+    for (const mesh of geometry) if (!live.has(mesh.id) && (streamFinished || patchMeshes.has(mesh.id))) dead.add(mesh.id);
     if (!dead.size) return;
     for (const id of dead) {
       patchMeshes.delete(id);
@@ -177,44 +244,9 @@ export function createPackAssembler() {
     });
   }
 
-  /** The signature `chunk` would have for these products, so a no-op patch is recognised. */
-  function chunkSignature(chunk, expressIds) {
-    const byId = new Map(chunk.geometry.map((mesh) => [mesh.id, mesh]));
-    const parts = [];
-    const { instances } = chunk;
-    for (let record = 0; record < instances.count; record += 1) {
-      if (!expressIds.has(instances.expressIds[record])) continue;
-      const mesh = byId.get(instances.geometryIds[record]);
-      const at = record * 16;
-      parts.push(
-        `${instances.expressIds[record]}:${instances.colors.subarray(record * 4, record * 4 + 4).join(",")}:` +
-          `${Array.from(instances.transforms.subarray(at, at + 16)).join(",")}:` +
-          (mesh ? hashTyped(mesh.positions) + ":" + hashTyped(mesh.indices) : "none"),
-      );
-    }
-    return parts.sort().join("|");
-  }
-
-  /** A string that changes when the drawn triangles or colours of these products change. */
-  function signature(expressIds) {
-    const byId = new Map(geometry.map((mesh) => [mesh.id, mesh]));
-    const parts = [];
-    for (let record = 0; record < count; record += 1) {
-      if (!expressIds.has(columns.expressIds[record])) continue;
-      const mesh = byId.get(columns.geometryIds[record]);
-      const at = record * 16;
-      parts.push(
-        `${columns.expressIds[record]}:${columns.colors.subarray(record * 4, record * 4 + 4).join(",")}:` +
-          `${Array.from(columns.transforms.subarray(at, at + 16)).join(",")}:` +
-          (mesh ? hashTyped(mesh.positions) + ":" + hashTyped(mesh.indices) : "none"),
-      );
-    }
-    return parts.sort().join("|");
-  }
-
   /** The pack so far, shaped exactly like `readIgp`'s result. */
   function pack() {
-    const instances = { count };
+    const instances = { count, activeCount };
     for (const [name, [, width]] of Object.entries(COLUMNS)) instances[name] = columns[name].subarray(0, count * width);
     let instanceBytes = 0;
     for (const name of Object.keys(COLUMNS)) instanceBytes += instances[name].byteLength;
@@ -260,6 +292,64 @@ export function isIdentity(transforms, offset) {
     if (transforms[offset + index] !== IDENTITY[index]) return false;
   }
   return true;
+}
+
+function equalArray(left, right) {
+  if (left === right) return true;
+  if (!left || !right || left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) if (!Object.is(left[i], right[i])) return false;
+  return true;
+}
+
+function sameMesh(left, right) {
+  return left === right || Boolean(left && right &&
+    (left.primitive ?? "triangles") === (right.primitive ?? "triangles") &&
+    (left.closed ?? null) === (right.closed ?? null) &&
+    equalArray(left.bbox, right.bbox) && equalArray(left.positions, right.positions) && equalArray(left.indices, right.indices));
+}
+
+function partMetadata(pack, record) {
+  const { instances, index } = pack;
+  return JSON.stringify([
+    index.classes[instances.classIds[record]], instances.flags?.[record] ?? 0,
+    Array.from(instances.colors.subarray(record * 4, record * 4 + 4)),
+    Array.from(instances.transforms.subarray(record * 16, record * 16 + 16)),
+    index.provenance?.[instances.provenance?.[record]] ?? null,
+  ]);
+}
+
+function sameParts(left, leftRecords, leftMeshes, right, rightRecords, rightMeshes) {
+  if (leftRecords.length !== rightRecords.length) return false;
+  const candidates = new Map();
+  const keyOf = (pack, record, mesh) => partMetadata(pack, record) +
+    (mesh ? `${hashTyped(mesh.positions)}:${hashTyped(mesh.indices)}` : "none");
+  for (const record of leftRecords) {
+    const mesh = leftMeshes.get(left.instances.geometryIds[record]);
+    const key = keyOf(left, record, mesh);
+    if (!candidates.has(key)) candidates.set(key, []);
+    candidates.get(key).push(mesh);
+  }
+  for (const record of rightRecords) {
+    const mesh = rightMeshes.get(right.instances.geometryIds[record]);
+    const matches = candidates.get(keyOf(right, record, mesh));
+    const match = matches?.findIndex((candidate) => sameMesh(candidate, mesh)) ?? -1;
+    if (match < 0) return false;
+    matches.splice(match, 1);
+  }
+  return true;
+}
+
+function selectRecords(chunk, records) {
+  const instances = { count: records.length };
+  for (const [name, [Type, width]] of Object.entries(COLUMNS)) {
+    const source = chunk.instances[name];
+    if (!source) continue;
+    const target = new Type(records.length * width);
+    for (let i = 0; i < records.length; i++) target.set(source.subarray(records[i] * width, (records[i] + 1) * width), i * width);
+    instances[name] = target;
+  }
+  const used = new Set(instances.geometryIds);
+  return { ...chunk, instances, geometry: chunk.geometry.filter((mesh) => used.has(mesh.id)) };
 }
 
 /** A cheap content hash of a typed array, for change detection only. */

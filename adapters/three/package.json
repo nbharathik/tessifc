@@ -8,7 +8,8 @@
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./build": "./src/build.js"
+    "./build": "./src/build.js",
+    "./retained": "./src/retained.js"
   },
   "files": [
     "src/",

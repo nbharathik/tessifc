@@ -269,6 +269,8 @@ export class IfcRenderer {
     this.renderOrigin = [0, 0, 0];
     this.renderBounds = emptyBounds();
     this.selected = [];
+    // Records fading out of a highlight after a revision; null when idle.
+    this.flashState = null;
     this.style = "shaded";
     // The cut is kept in world coordinates: the render origin moves with every load.
     this.section = { active: false, axis: 2, world: 0, sign: 1 };
@@ -732,6 +734,7 @@ export class IfcRenderer {
   }
 
   load(pack, isVisible = () => true) {
+    isVisible = activePredicate(pack, isVisible);
     this.visibilityPredicate = isVisible;
     if (this.contextLost) {
       // Nothing can reach a dead context; the restore rebuilds from this pack.
@@ -751,7 +754,9 @@ export class IfcRenderer {
     this.depthOverlayPrecisionSafe = depthOverlayPrecisionSupported(this.renderBounds.radius);
     this.createVisibilityTexture(pack.instances.count);
     const geometryById = geometryIndex(pack);
+    this.recordLocations = Array(pack.instances.count).fill(null);
     for (let record = 0; record < pack.instances.count; record += 1) {
+      if (!isActiveRecord(pack, record)) continue;
       const geometryId = pack.instances.geometryIds[record];
       const geometry = geometryById.get(geometryId);
       if (!geometry) continue;
@@ -767,7 +772,7 @@ export class IfcRenderer {
     this.dimmedProducts = this.renderColors.raisedCount ?? 0;
     this.darkProducts = this.renderColors.brightenedCount ?? 0;
     // Planned once over every record; each visible set, this one included, is read off its pairs.
-    const everyRecord = () => true;
+    const everyRecord = (record) => isActiveRecord(pack, record);
     const basePlan = planDepthMaterials(
       this.renderColors,
       this.recordLocations,
@@ -914,6 +919,7 @@ export class IfcRenderer {
 
   /** Draw records `from..to` of the assembled pack as lean batches; the finish does the full analysis. */
   appendStream(pack, from, to, isVisible = () => true) {
+    isVisible = activePredicate(pack, isVisible);
     this.visibilityPredicate = isVisible;
     if (this.contextLost) {
       this.pack = pack;
@@ -940,6 +946,7 @@ export class IfcRenderer {
       // Written first: a record without usable bounds must not keep the default visible byte.
       this.baseVisible[record] = isVisible(record) ? 255 : 0;
       this.visibility[record * 2] = this.baseVisible[record];
+      if (!isActiveRecord(pack, record)) continue;
       const geometry = geometryById.get(pack.instances.geometryIds[record]);
       if (!geometry) continue;
       const bounds = transformedBounds(geometry.bbox, pack.instances.transforms, record * 16);
@@ -1020,7 +1027,7 @@ export class IfcRenderer {
     const bounds = emptyBounds();
     for (let record = 0; record < count; record += 1) {
       const location = this.recordLocations[record];
-      if (location && isVisible(record)) includeBounds(bounds, location.bounds);
+      if (location && isActiveRecord(this.pack, record) && isVisible(record)) includeBounds(bounds, location.bounds);
     }
     finishBounds(bounds);
     this.renderBounds = bounds;
@@ -1066,6 +1073,178 @@ export class IfcRenderer {
   reload(pack, isVisible = () => true) {
     this.cameraTouched = true;
     return this.finishStream(pack, isVisible);
+  }
+
+  /** Replace affected bounded batches while keeping every other GPU allocation. */
+  applyDelta(pack, delta, isVisible = () => true) {
+    if (!this.pack) throw new Error("Load a model before applying a scene delta.");
+    const previousOffset = this.pack.index.model_offset ?? [0, 0, 0];
+    const nextOffset = pack.index.model_offset ?? [0, 0, 0];
+    if (previousOffset.length !== nextOffset.length || previousOffset.some((value, axis) => value !== nextOffset[axis])) {
+      throw new Error("A selective scene delta cannot change the model offset.");
+    }
+    isVisible = activePredicate(pack, isVisible);
+    if (!delta.changed) return { ...this.deltaSummary(), patchStats: { reusedBatches: this.batches.length, rebuiltBatches: 0, createdBatches: 0, uploadedBytes: 0 } };
+    const selectedIds = new Set(this.selected.map((record) => this.pack.instances.expressIds[record]));
+    const count = pack.instances.count;
+    if (!this.contextLost && count > Math.min(2 ** 24, this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) ** 2)) {
+      throw new Error("This GPU cannot index more stable IFC slots; reopen a saved revision to reclaim retired slots.");
+    }
+    if (this.contextLost) {
+      // Context restoration consumes this latest logical scene, including tombstones.
+      this.pack = pack;
+      this.visibilityPredicate = isVisible;
+      this.recordLocations = Array(count).fill(null);
+      this.pickTree = null;
+      this.bounds = computeModelBounds(pack, isVisible);
+      this.renderBounds = offsetBounds(this.bounds, scale(this.renderOrigin, -1));
+      return { ...this.deltaSummary(), patchStats: { deferred: true, reusedBatches: 0, rebuiltBatches: 0, createdBatches: 0, uploadedBytes: 0 } };
+    }
+
+    const previous = {
+      pack: this.pack, recordLocations: this.recordLocations, renderColors: this.renderColors,
+      depthRanks: this.depthRanks, depthContested: this.depthContested,
+    };
+    const geometryById = geometryIndex(pack);
+    const locations = Array(count).fill(null);
+    for (let record = 0; record < count; record++) {
+      if (!isActiveRecord(pack, record)) continue;
+      const geometry = geometryById.get(pack.instances.geometryIds[record]);
+      if (!geometry) continue;
+      const bounds = transformedBounds(geometry.bbox, pack.instances.transforms, record * 16);
+      if (validDepthBounds(bounds)) locations[record] = { geometry, bounds: offsetBounds(bounds, scale(this.renderOrigin, -1)) };
+    }
+    const colors = displayColors(pack, this.minimumAlpha, this.minimumLuminance);
+    const allActive = (record) => isActiveRecord(pack, record);
+    const basePlan = planDepthMaterials(colors, locations, count, allActive, { collectPairs: true });
+    const depthPlan = restrictDepthPlan(basePlan, colors, count, isVisible) ??
+      planDepthMaterials(colors, locations, count, isVisible);
+    const removed = new Set(delta.removedRecords ?? []);
+    const replacing = new Set();
+    const records = new Set();
+    for (const batch of this.batches) {
+      if (!batch.records.some((record) => removed.has(record) || !isActiveRecord(pack, record) ||
+          Boolean(previous.depthContested[record]) !== Boolean(depthPlan.contested[record]))) continue;
+      replacing.add(batch);
+      for (const record of batch.records) if (isActiveRecord(pack, record)) records.add(record);
+    }
+    const range = delta.appended ?? delta;
+    for (let record = range.from; record < range.to; record++) if (isActiveRecord(pack, record)) records.add(record);
+    const plan = planRenderBatches(pack, undefined, colors, null, {
+      geometryById, contested: depthPlan.contested, recordLocations: locations, records,
+    });
+    const retained = this.batches.filter((batch) => !replacing.has(batch));
+    const created = [], createdShared = [];
+    const sharedByKey = new Map();
+    for (const batch of this.batches) if (batch.sharedGeometry) {
+      sharedByKey.set(`${batch.sharedGeometry.geometry.id}:${Number(batch.transparent)}`, batch.sharedGeometry);
+    }
+    this.pack = pack;
+    this.recordLocations = locations;
+    this.renderColors = colors;
+    this.depthRanks = depthPlan.ranks;
+    this.depthContested = depthPlan.contested;
+    this.cancelWirePreparation();
+    try {
+      const prepare = (geometry, transparent) => this.prepareGeometry(geometry, this.suppressCoplanar && !transparent);
+      for (const group of plan.instanced) {
+        const prepared = prepare(group.geometry, group.transparent);
+        const key = `${group.geometry.id}:${Number(group.transparent)}`;
+        let shared = sharedByKey.get(key);
+        if (!shared) {
+          shared = this.createSharedGeometryBuffers(group.geometry, prepared);
+          sharedByKey.set(key, shared);
+          createdShared.push(shared);
+        }
+        created.push(this.createInstancedBatch(group.geometry, prepared, group.records, group.transparent, shared));
+      }
+      for (const group of plan.baked) {
+        const items = group.items.map((item) => ({ ...item, prepared: prepare(item.geometry, group.transparent) }));
+        created.push(this.createBakedBatch(items, group.color, group.vertexCount));
+      }
+    } catch (error) {
+      for (const batch of created) this.releaseBatch(batch);
+      for (const shared of createdShared) for (const buffer of shared.buffers) this.gl.deleteBuffer(buffer);
+      Object.assign(this, previous);
+      this.scheduleWirePreparation();
+      throw error;
+    }
+    // Publish only once all new batches exist. Retired batches are bounded
+    // by the existing batching limits; no inactive triangles remain allocated.
+    const uploadedBytes = created.reduce((bytes, batch) => bytes + batch.gpuBytes, 0) +
+      createdShared.reduce((bytes, shared) => bytes + shared.gpuBytes, 0);
+    for (const batch of replacing) this.releaseBatch(batch);
+    this.batches = [...retained, ...created].sort((left, right) => Number(left.transparent) - Number(right.transparent) || left.sourceRecord - right.sourceRecord);
+    for (let i = 0; i < this.batches.length; i++) this.batches[i].sortOrder = i;
+    const liveShared = new Set(this.batches.map((batch) => batch.sharedGeometry).filter(Boolean));
+    for (const shared of this.sharedGeometryBuffers) if (!liveShared.has(shared)) {
+      for (const buffer of shared.buffers) this.gl.deleteBuffer(buffer);
+    }
+    this.sharedGeometryBuffers = [...liveShared];
+    this.opaqueBatches = this.batches.filter((batch) => !batch.transparent);
+    this.transparentBatches = this.batches.filter((batch) => batch.transparent);
+    this.sortedBatches = [];
+    this.pickTree = buildBoundsTree(count, (record) => locations[record]?.bounds);
+    this.pickCandidates.length = 0;
+    this.visibilityPredicate = isVisible;
+    this.rememberDepthPlan(basePlan, count, allActive);
+    this.updateVisibleBounds(isVisible);
+    this.applyDepthPlan(depthPlan);
+    this.dimmedProducts = colors.raisedCount ?? 0;
+    this.darkProducts = colors.brightenedCount ?? 0;
+    this.ensureVisibilityCapacity(count);
+    this.visibility.fill(0);
+    this.baseVisible.fill(0);
+    this.selected = [];
+    this.flashState = null;
+    for (let record = 0; record < count; record++) {
+      this.baseVisible[record] = isVisible(record) ? 255 : 0;
+      this.visibility[record * 2] = this.baseVisible[record];
+      if (isActiveRecord(pack, record) && selectedIds.has(pack.instances.expressIds[record])) {
+        this.selected.push(record);
+        this.visibility[record * 2 + 1] = 255;
+      }
+    }
+    this.selectionVersion += 1;
+    this.lodState = null;
+    this.lodHidden.fill(0);
+    this.lodHiddenCount = 0;
+    this.uploadVisibility();
+    this.gpuBufferBytes = this.visibility.byteLength +
+      this.batches.reduce((bytes, batch) => bytes + batch.gpuBytes, 0) +
+      this.sharedGeometryBuffers.reduce((bytes, shared) => bytes + shared.gpuBytes, 0);
+    this.scheduleWirePreparation();
+    this.dirty = true;
+    return { ...this.deltaSummary(), patchStats: { reusedBatches: retained.length, rebuiltBatches: replacing.size, createdBatches: created.length, uploadedBytes } };
+  }
+
+  releaseBatch(batch) {
+    this.gl.deleteVertexArray(batch.vao);
+    for (const buffer of batch.buffers) this.gl.deleteBuffer(buffer);
+  }
+
+  deltaSummary() {
+    const baseDrawCalls = this.batches.length;
+    const overlayDrawCalls = this.depthTieBreak && this.depthOverlayPrecisionSafe ? this.contestedOpaqueBatches.length : 0;
+    const sources = new Set(), suppressed = new Map();
+    let eagerWireBytesAvoided = 0;
+    for (const batch of this.batches) for (const source of batch.wireSources ?? []) {
+      sources.add(`${source.geometry.id}:${Number(batch.transparent)}`);
+      const prepared = this.prepareGeometry(source.geometry, this.suppressCoplanar && !batch.transparent);
+      suppressed.set(source.geometry.id, Math.max(suppressed.get(source.geometry.id) ?? 0, prepared.suppressedTriangles));
+    }
+    for (const owner of [...this.sharedGeometryBuffers, ...this.batches.filter((batch) => batch.baked)]) {
+      if (!owner.wireBuffer) eagerWireBytesAvoided += owner.indexCount * indexByteWidth(owner.indexType, this.gl) * 2;
+    }
+    return {
+      bounds: this.bounds, drawCalls: baseDrawCalls + overlayDrawCalls, baseDrawCalls, overlayDrawCalls,
+      gpuBytes: this.currentGpuBytes(), instancedDrawCalls: this.batches.filter((batch) => !batch.baked).length,
+      bakedDrawCalls: this.batches.filter((batch) => batch.baked).length,
+      sourceDrawCalls: sources.size, suppressedTriangles: [...suppressed.values()].reduce((sum, count) => sum + count, 0),
+      eagerWireBytesAvoided,
+      depthConflictPairs: this.depthConflictPairs, contestedMaterials: this.contestedMaterials,
+      depthOverlayPrecisionSafe: this.depthOverlayPrecisionSafe,
+    };
   }
 
   /** Room in the visibility texture for at least `count` records. */
@@ -1395,7 +1574,7 @@ export class IfcRenderer {
     if (this.resizeDirty || this.resizeSettleTimer && force || this.devicePixelRatio !== (window.devicePixelRatio || 1)) {
       this.resize(force);
     }
-    if (!force && !this.dirty) return;
+    if (!force && !this.dirty && !this.flashState) return;
     const replacedBacking = this.canvas.width !== this.gpuPacingWidth || this.canvas.height !== this.gpuPacingHeight;
     const moving = this.interacting && (!this.drag || this.drag.moved || this.pointers.size > 1 || this.wheelQualityTimer);
     if (!this.gpuPacing.allow(force || replacedBacking, moving || this.streaming ? 2 : this.idleGpuLimit)) return;
@@ -1418,6 +1597,7 @@ export class IfcRenderer {
     // The projection is built only after target creation settles the depth convention.
     this.updateCameraMatrices();
     this.applyLod();
+    if (this.flashState) this.advanceFlash(performance.now());
     gl.bindFramebuffer(gl.FRAMEBUFFER, offscreen ? this.target.framebuffer : null);
     gl.viewport(0, 0, width, height);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
@@ -1645,13 +1825,13 @@ export class IfcRenderer {
     for (const batch of this.batches) {
       if (batch.visibilityVersion !== this.visibilityVersion) {
         let visible = 0;
-        for (const record of batch.records) if (this.visibility[record * 2] >= 128) visible += 1;
+        for (const record of batch.records) if (isActiveRecord(this.pack, record) && this.visibility[record * 2] >= 128) visible += 1;
         batch.hasVisibleRecords = visible > 0;
         batch.allRecordsVisible = visible === batch.records.length;
         batch.visibilityVersion = this.visibilityVersion;
       }
       if (batch.selectionVersion !== this.selectionVersion) {
-        batch.anyRecordSelected = this.selected.length > 0 &&
+        batch.anyRecordSelected = (this.selected.length > 0 || this.flashState !== null) &&
           batch.records.some((record) => this.visibility[record * 2 + 1] !== 0);
         batch.selectionVersion = this.selectionVersion;
       }
@@ -1996,6 +2176,7 @@ export class IfcRenderer {
   }
 
   setVisibility(predicate) {
+    predicate = activePredicate(this.pack, predicate);
     this.visibilityPredicate = predicate;
     if (!this.pack || !this.visibilityTexture) return;
     for (let record = 0; record < this.pack.instances.count; record += 1) {
@@ -2132,8 +2313,36 @@ export class IfcRenderer {
   select(records) {
     if (!this.visibilityTexture) return;
     for (const record of this.selected) this.visibility[record * 2 + 1] = 0;
-    this.selected = recordList(records).filter((record) => record * 2 + 1 < this.visibility.length);
+    this.selected = recordList(records).filter((record) => isActiveRecord(this.pack, record) && record * 2 + 1 < this.visibility.length);
     for (const record of this.selected) this.visibility[record * 2 + 1] = 255;
+    this.selectionVersion += 1;
+    if (this.flashState) this.advanceFlash(performance.now());
+    else this.uploadVisibility();
+  }
+
+  /** Light these records up and fade them back over `duration` ms; frames follow while it runs. */
+  flash(records, duration = 900) {
+    if (!this.visibilityTexture) return;
+    const list = recordList(records).filter((record) => isActiveRecord(this.pack, record) && record * 2 + 1 < this.visibility.length);
+    if (!list.length) return;
+    if (this.flashState) for (const record of this.flashState.records) if (this.visibility[record * 2 + 1] !== 255) this.visibility[record * 2 + 1] = 0;
+    this.flashState = { records: list, started: performance.now(), duration: Math.max(1, duration) };
+    this.advanceFlash(this.flashState.started);
+  }
+
+  /** Whether a highlight fade still needs frames. */
+  get animating() {
+    return this.flashState !== null;
+  }
+
+  advanceFlash(now) {
+    const flash = this.flashState;
+    if (!flash) return;
+    const progress = Math.min(1, (now - flash.started) / flash.duration);
+    // Selection uses the full byte; the fade lives in the lower half so the shader can tell them apart.
+    const level = progress >= 1 ? 0 : Math.max(1, Math.round(127 * (1 - progress) ** 2));
+    for (const record of flash.records) if (this.visibility[record * 2 + 1] !== 255) this.visibility[record * 2 + 1] = level;
+    if (progress >= 1) this.flashState = null;
     this.selectionVersion += 1;
     this.uploadVisibility();
   }
@@ -2177,6 +2386,7 @@ export class IfcRenderer {
   focus(records) {
     const bbox = emptyBounds();
     for (const record of recordList(records)) {
+      if (!isActiveRecord(this.pack, record)) continue;
       const location = this.recordLocations[record];
       if (location) includeBounds(bbox, location.bounds);
     }
@@ -2209,6 +2419,7 @@ export class IfcRenderer {
   recordBounds(records) {
     const bbox = emptyBounds();
     for (const record of recordList(records)) {
+      if (!isActiveRecord(this.pack, record)) continue;
       const location = this.recordLocations[record];
       if (location) includeBounds(bbox, location.bounds);
     }
@@ -2273,7 +2484,7 @@ export class IfcRenderer {
     for (let at = 0; at < count; at += 1) {
       const record = records ? records[at] : at;
       const location = this.recordLocations[record];
-      if (!location || this.visibility[record * 2] < 128) continue;
+      if (!isActiveRecord(this.pack, record) || !location || this.visibility[record * 2] < 128) continue;
       const distance = rayBounds(ray.origin, ray.direction, location.bounds);
       if (distance !== null) candidates.push({ record, distance });
     }
@@ -2315,12 +2526,14 @@ export class IfcRenderer {
   }
 
   intersectRecord(record, clientX, clientY, knownPoint = null) {
+    if (!isActiveRecord(this.pack, record)) return null;
     if (knownPoint) return knownPoint;
     const hit = this.intersectRecordRay(record, this.pointerRay(clientX, clientY));
     return hit ? add(hit.point, this.renderOrigin) : null;
   }
 
   intersectRecordRay(record, ray) {
+    if (!isActiveRecord(this.pack, record)) return null;
     const location = this.recordLocations[record];
     if (!location) return null;
     const geometry = location.geometry;
@@ -2692,6 +2905,7 @@ void main() {
   // still retain readable contrast.
   vec3 color = vColor.rgb * pow(max(diffuse, 0.0), 1.0 / 2.2);
   if (vSelected > 0.5) color = mix(color, vec3(1.0, 0.28, 0.12), 0.72);
+  else if (vSelected > 0.0) color = mix(color, vec3(0.36, 0.74, 1.0), min(vSelected * 1.5, 0.75));
   float alpha = vColor.a;
   if (uStyle == 1) alpha = min(alpha, 0.30);
   if (uStyle == 2) { color = mix(color, vec3(0.08, 0.14, 0.15), 0.45); alpha = min(alpha, 0.78); }
@@ -2772,6 +2986,7 @@ export function planDepthRanks(colors, recordCount = Math.floor(colors.length / 
   const keys = new Uint32Array(count);
   const distinct = new Set();
   for (let record = 0; record < count; record += 1) {
+    if (colors.active?.[record] === 0) continue;
     const at = record * 4;
     const key = (
       colors[at] * 0x1000000 +
@@ -2785,7 +3000,7 @@ export function planDepthRanks(colors, recordCount = Math.floor(colors.length / 
   const ordered = [...distinct].sort((left, right) => left - right);
   const byColor = new Map(ordered.map((key, rank) => [key, rank]));
   const ranks = new Uint32Array(count);
-  for (let record = 0; record < count; record += 1) ranks[record] = byColor.get(keys[record]);
+  for (let record = 0; record < count; record += 1) if (colors.active?.[record] !== 0) ranks[record] = byColor.get(keys[record]);
   return { ranks, colors: ordered.length };
 }
 
@@ -3018,17 +3233,19 @@ export function displayColors(
   minimumLuminance = MINIMUM_VISIBLE_LUMINANCE,
 ) {
   const colors = Uint8Array.from(pack.instances.colors);
-  const floors = applyDisplayFloors(colors, 0, pack.instances.count, minimumAlpha, minimumLuminance);
+  if (pack.instances.active) colors.active = pack.instances.active;
+  const floors = applyDisplayFloors(colors, 0, pack.instances.count, minimumAlpha, minimumLuminance, pack.instances.active);
   colors.raisedCount = floors.raised;
   colors.brightenedCount = floors.brightened;
   return colors;
 }
 
 /** Apply both floors in place to records `from..to`, returning how many moved. */
-function applyDisplayFloors(colors, from, to, minimumAlpha, minimumLuminance) {
+function applyDisplayFloors(colors, from, to, minimumAlpha, minimumLuminance, active = null) {
   let raised = 0;
   let brightened = 0;
   for (let record = from; record < to; record += 1) {
+    if (active?.[record] === 0) continue;
     const at = record * 4;
     if (colors[at + 3] < minimumAlpha) {
       colors[at + 3] = minimumAlpha;
@@ -3151,6 +3368,7 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
   const first = range ? Math.max(0, range.from) : 0;
   const last = range ? Math.min(pack.instances.count, range.to) : pack.instances.count;
   for (let record = first; record < last; record += 1) {
+    if (!isActiveRecord(pack, record) || options.records && !options.records.has(record)) continue;
     const geometryId = pack.instances.geometryIds[record];
     if (!geometryById.has(geometryId)) continue;
     const transparent = shade[record * 4 + 3] < 255;
@@ -3658,11 +3876,19 @@ function geometryIndex(pack) {
   return new Map(pack.geometry.map((item) => [item.id, item]));
 }
 
+function isActiveRecord(pack, record) {
+  return Boolean(pack && Number.isInteger(record) && record >= 0 && record < pack.instances.count && pack.instances.active?.[record] !== 0);
+}
+
+function activePredicate(pack, predicate) {
+  return (record) => isActiveRecord(pack, record) && predicate(record);
+}
+
 function computeModelBounds(pack, isVisible = () => true) {
   const bounds = emptyBounds();
   const geometry = geometryIndex(pack);
   for (let record = 0; record < pack.instances.count; record += 1) {
-    if (!isVisible(record)) continue;
+    if (!isActiveRecord(pack, record) || !isVisible(record)) continue;
     const item = geometry.get(pack.instances.geometryIds[record]);
     if (!item) continue;
     const record_bounds = transformedBounds(item.bbox, pack.instances.transforms, record * 16);

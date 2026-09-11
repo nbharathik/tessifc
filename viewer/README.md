@@ -16,6 +16,11 @@ npm or CDN dependencies.
 - Inspect attributes, hide or isolate elements, and switch display styles.
 - Cut live sections and measure between corners, edges and surfaces.
 - Edit text attributes and export the IFC while preserving unrelated source.
+- Apply externally edited IFC snapshots with **Update IFC**, rebuilding affected
+  geometry and retaining unrelated GPU resources.
+- Run scripts against the model from the **Session** panel: JavaScript in the
+  browser, or Python with IfcOpenShell through a local session. Ask an
+  assistant to explain the model or propose edits.
 
 Reads IFC2X3, IFC4 and IFC4X3. Geometry support varies by representation; see
 [geometry coverage](../docs/coverage.md) and the [preview contract](../docs/preview.md).
@@ -37,6 +42,14 @@ installation command. See [getting started](../docs/getting-started.md) for deta
 Open <http://127.0.0.1:8000/viewer/> and drop an `.ifc` file onto the page.
 Serve the repository root so the viewer can load `bindings/wasm/pkg/`.
 
+For scripted or assisted editing, follow the
+[incremental editing example](../examples/incremental-edit/README.md): the
+Session panel's examples add a door, raise or move the selection and more,
+straight in the browser. A local Python session runs IfcOpenShell scripts and
+picks up saved revisions from any process. Geometry updates preserve the
+camera and valid selection; changes with global effects use a full rebuild.
+See [editing](../docs/editing.md) for the revision and recovery boundaries.
+
 ## Controls
 
 Left-drag to orbit, right-drag or Shift-drag to pan, and scroll to zoom.
@@ -50,6 +63,7 @@ orbit and two fingers to pan or pinch to zoom.
 | `M` / `X` / `P` | Measure / section plane / plan view |
 | `I` / `H` / `A` | Isolate / hide / show all |
 | `E` | Toggle the attribute editor |
+| `Ctrl Enter` | Run the session script |
 | `Ctrl O` / `Ctrl S` | Open IFC / export IFC |
 | `Ctrl K` / `?` | Command palette / all shortcuts |
 

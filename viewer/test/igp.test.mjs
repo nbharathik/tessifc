@@ -132,9 +132,13 @@ assert.match(app, /function filterProperties\(/, "property filtering must be imp
 console.log("ok    task ribbon, model navigator, and inspector views are wired");
 
 // A URL to a real host is a network dependency; the XML namespace in an inline
-// SVG is an identifier, not a fetch.
+// SVG is an identifier, not a fetch. The policy's connect-src names the
+// assistant providers a user may choose, which is data, not code.
 const remoteUrl = /https?:\/\/(?!www\.w3\.org\/)/;
-for (const [name, source] of Object.entries({ html, app, renderer, worker })) {
+const htmlWithoutPolicy = html.replace(/<meta\s+http-equiv="Content-Security-Policy"[\s\S]*?\/>/, "");
+assert.match(html, /connect-src 'self' https:\/\/openrouter\.ai https:\/\/api\.anthropic\.com http:\/\/127\.0\.0\.1:\* http:\/\/localhost:\*;/,
+  "connect-src allows only the assistant providers and loopback ports");
+for (const [name, source] of Object.entries({ html: htmlWithoutPolicy, app, renderer, worker })) {
   assert.doesNotMatch(source, remoteUrl, `${name} must not fetch runtime code`);
   assert.doesNotMatch(source, /(?:from\s+["']three|THREE\.)/, `${name} must use the first-party renderer`);
 }
@@ -967,8 +971,10 @@ console.log("ok    a streaming load has one owner and one failure path");
   );
   assert.equal(moved.changed, true, "a different mesh is a change");
   const patched = assembler.pack();
-  assert.equal(patched.instances.count, 4);
-  assert.deepEqual(Array.from(patched.instances.expressIds), [10, 11, 13, 12], "the patched product moves to the end");
+  assert.equal(patched.instances.count, 5);
+  assert.equal(patched.instances.activeCount, 4);
+  assert.deepEqual(Array.from(patched.instances.expressIds), [10, 11, 12, 13, 12], "replacements append without moving unrelated slots");
+  assert.deepEqual(Array.from(patched.instances.active), [1, 1, 0, 1, 1]);
 
   // Re-editing the same product must not pile up the meshes it superseded.
   const afterOnePatch = assembler.geometryCount;
@@ -983,7 +989,8 @@ console.log("ok    a streaming load has one owner and one failure path");
   );
   assert.equal(again.changed, true);
   assert.equal(assembler.geometryCount, afterOnePatch, "a superseded patch mesh must be pruned");
-  assert.equal(assembler.pack().instances.count, 4, "pruning must not disturb the instance columns");
+  assert.equal(assembler.pack().instances.count, 6, "retired slots keep their identities");
+  assert.equal(assembler.pack().instances.activeCount, 4, "pruning keeps the active instance count");
   assert.ok(assembler.nextGeometryId() > 11, "a pruned id must never be handed out again");
 
   // The next geometry id must be bounded work, whatever the file holds.

@@ -46,6 +46,7 @@ PAGES = [
     ("igp-format.md", "IGP format", "The mesh container the kernel writes and how to read it."),
     ("coverage.md", "IFC coverage", "Which classes and representations are supported today."),
     ("editing.md", "Editing", "Changing attributes without rewriting the rest of the file."),
+    ("agents.md", "Agents and pipelines", "Scripts, sessions, deltas and the tools an agent needs."),
 ]
 
 SITE_MARKER = ".tessifc-site"
@@ -300,6 +301,8 @@ def build_contents(out: Path, base: str) -> int:
     copy_tree(REPO / "viewer" / "src", out / "viewer" / "src")
     shutil.copy2(REPO / "viewer" / "index.html", out / "viewer" / "index.html")
     copy_tree(pkg, out / "bindings" / "wasm" / "pkg")
+    # The viewer imports the shared editing modules from the edit package.
+    copy_tree(REPO / "bindings" / "edit" / "src", out / "bindings" / "edit" / "src")
     (out / ".nojekyll").write_text("", encoding="utf-8")
     return 0
 

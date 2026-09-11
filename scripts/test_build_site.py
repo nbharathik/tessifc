@@ -160,7 +160,7 @@ class GeneratedSite(unittest.TestCase):
     def test_viewer_package_and_public_assets_are_included(self):
         for relative in (
             "viewer/index.html", "viewer/src/main.js", "bindings/wasm/pkg/tessifc_wasm.js",
-            "bindings/wasm/pkg/tessifc_wasm_bg.wasm", "assets/viewer.png", ".nojekyll",
+            "bindings/wasm/pkg/tessifc_wasm_bg.wasm", "bindings/edit/src/igp.js", "assets/viewer.png", ".nojekyll",
         ):
             with self.subTest(path=relative):
                 self.assertTrue((self.out / relative).is_file())

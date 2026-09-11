@@ -88,6 +88,11 @@ jobs:
       - name: install the website dependencies
         run: python -m pip install -r requirements-site.txt
 
+      # IfcOpenShell is an optional authoring runtime, installed here only so
+      # the editing session tests can run scripts against a model.
+      - name: install the optional authoring runtime
+        run: python -m pip install ifcopenshell
+
       - name: add the wasm target
         run: rustup target add wasm32-unknown-unknown
 
@@ -118,6 +123,9 @@ jobs:
       - name: run the viewer and edit round-trip tests
         run: node viewer/test/igp.test.mjs
 
+      - name: run the editing SDK tests
+        run: npm --prefix bindings/edit test
+
       # The three.js adapter runs against the same package. Its batching is
       # what a viewer actually draws, so a break there is a break in the
       # product even though no Rust changed.
@@ -138,7 +146,11 @@ jobs:
           python -m unittest discover -s scripts -p 'test_*.py'
           python scripts/build-site.py
 
+      - name: test the editing session package
+        run: python -m unittest discover -s adapters/ifcopenshell/tests -p 'test_*.py'
+
       - name: inspect the npm packages
         run: |
           npm pack ./bindings/wasm --dry-run
+          npm pack ./bindings/edit --dry-run
           npm pack ./adapters/three --dry-run

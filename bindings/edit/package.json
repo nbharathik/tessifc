@@ -1,0 +1,57 @@
+{
+  "name": "@tessifc/edit",
+  "version": "0.1.0",
+  "description": "Editing sessions, browser scripts, IGP reading and agent tools over the TessIFC kernel",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./session": "./src/session.js",
+    "./script-engine": "./src/script-engine.js",
+    "./igp": "./src/igp.js",
+    "./agent-tools": "./src/agent-tools.js"
+  },
+  "sideEffects": false,
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "ifc",
+    "bim",
+    "editing",
+    "agent",
+    "tessifc"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/edit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/script-engine.test.mjs && node test/session.test.mjs"
+  },
+  "peerDependencies": {
+    "@tessifc/core": "0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@tessifc/core": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

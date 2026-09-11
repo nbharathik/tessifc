@@ -147,7 +147,8 @@ cd viewer && npx playwright install chromium && npm test
 | [Geometry coverage](docs/coverage.md) | Supported representations and conditions |
 | [Architecture](docs/architecture.md) | Pipeline and extension points |
 | [IGP format](docs/igp-format.md) | Mesh container and readers |
-| [Editing](docs/editing.md) | Source-preserving attribute changes |
+| [Editing](docs/editing.md) | Source-preserving attribute changes, revisions and the scripted editing session |
+| [Agents and pipelines](docs/agents.md) | Scripts, sessions and deltas for your own tools and agents |
 
 ## Licence
 

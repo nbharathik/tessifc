@@ -18,7 +18,8 @@
 use glam::DVec3;
 use std::collections::{BTreeMap, BTreeSet};
 use tessifc_engine::pack::{PackState, Packer};
-use tessifc_engine::{Engine, EvaluationResult, Session};
+use tessifc_engine::revision::{ChangeImpact, compare_revisions};
+use tessifc_engine::{Engine, EvaluationResult, ProductOutcome, ProductState, Session};
 use tessifc_geom::{Settings as Settings3d, product_category};
 use tessifc_model::Model;
 use tessifc_pack::StreamPosition;
@@ -200,6 +201,63 @@ struct Stream {
     chunk: u32,
 }
 
+/// An unpublished model and the result of checking its replacement geometry.
+struct PreparedRevision {
+    source: Vec<u8>,
+    model: Model,
+    impact: ChangeImpact,
+    base_revision: u64,
+    revision: u64,
+    token: u64,
+    evaluated: bool,
+    accepted: bool,
+    outcomes: Vec<ProductOutcome>,
+    diagnostics: Vec<tessifc_step::Diagnostic>,
+    evaluation_settings: Option<serde_json::Value>,
+    model_offset: Option<[f64; 3]>,
+    refused_boolean_products: Vec<u32>,
+}
+
+struct GeometryBasis {
+    settings: serde_json::Value,
+    offset: DVec3,
+}
+
+impl PreparedRevision {
+    fn report(&self) -> String {
+        let mut report =
+            serde_json::to_value(&self.impact).expect("revision impact is serialisable");
+        report["baseRevision"] = self.base_revision.to_string().into();
+        report["revision"] = self.revision.to_string().into();
+        report["candidateToken"] = self.token.to_string().into();
+        report["evaluated"] = self.evaluated.into();
+        report["evaluationAccepted"] = self.accepted.into();
+        report["productOutcomes"] = serde_json::to_value(&self.outcomes).unwrap();
+        report["diagnostics"] = diagnostics_json(&self.diagnostics);
+        report["effectiveSettings"] = self
+            .evaluation_settings
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        report["modelOffset"] = serde_json::json!(self.model_offset);
+        report["refusedBooleanProducts"] = serde_json::json!(self.refused_boolean_products);
+        report.to_string()
+    }
+}
+
+fn diagnostics_json(diagnostics: &[tessifc_step::Diagnostic]) -> serde_json::Value {
+    serde_json::Value::Array(
+        diagnostics
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "code": d.code.as_str(), "severity": d.severity.as_str(),
+                    "line": d.line, "expressId": d.express_id, "message": d.message,
+                })
+            })
+            .collect(),
+    )
+}
+
 /// A TessIFC instance holding open models.
 #[wasm_bindgen]
 pub struct Kernel {
@@ -208,6 +266,11 @@ pub struct Kernel {
     sources: BTreeMap<u32, Vec<u8>>,
     /// What each model was opened with.
     options: BTreeMap<u32, OpenOptions>,
+    revisions: BTreeMap<u32, u64>,
+    prepared: BTreeMap<u32, PreparedRevision>,
+    next_candidate: u64,
+    geometry_basis: BTreeMap<u32, GeometryBasis>,
+    published_outcomes: BTreeMap<u32, Vec<ProductOutcome>>,
     next_id: u32,
     /// The last evaluation per model, so geometry can be read in pieces.
     geometry: BTreeMap<u32, EvaluationResult>,
@@ -231,6 +294,11 @@ impl Kernel {
             models: BTreeMap::new(),
             options: BTreeMap::new(),
             sources: BTreeMap::new(),
+            revisions: BTreeMap::new(),
+            prepared: BTreeMap::new(),
+            next_candidate: 1,
+            geometry_basis: BTreeMap::new(),
+            published_outcomes: BTreeMap::new(),
             next_id: 1,
             geometry: BTreeMap::new(),
             streams: BTreeMap::new(),
@@ -264,6 +332,7 @@ impl Kernel {
         self.models.insert(id, model);
         self.sources.insert(id, source);
         self.options.insert(id, options);
+        self.revisions.insert(id, 0);
         Ok(id)
     }
 
@@ -374,6 +443,39 @@ impl Kernel {
         model.image().ids_of_type(class).collect()
     }
 
+    /// The schema definition of a class as JSON: `abstract` and `attributes` in
+    /// STEP argument order with `name`, `type`, `base`, `aggDepth`, `optional`
+    /// and `derived`; `null` for a class the model's schema does not define.
+    #[wasm_bindgen(js_name = getClassAttributes)]
+    pub fn get_class_attributes(&self, model_id: u32, class_name: &str) -> Option<String> {
+        let model = self.models.get(&model_id)?;
+        let schema = model.schema();
+        let class = schema.class_by_name(class_name)?;
+        let definition = schema.class(class);
+        let attributes: Vec<_> = definition
+            .attrs
+            .iter()
+            .map(|attribute| {
+                serde_json::json!({
+                    "name": attribute.name,
+                    "type": attribute.type_name,
+                    "base": format!("{:?}", attribute.base).to_ascii_lowercase(),
+                    "aggDepth": attribute.agg_depth,
+                    "optional": attribute.optional,
+                    "derived": attribute.kind == tessifc_schema::AttrKind::DerivedOverride,
+                })
+            })
+            .collect();
+        Some(
+            serde_json::json!({
+                "class": definition.name,
+                "abstract": definition.is_abstract,
+                "attributes": attributes,
+            })
+            .to_string(),
+        )
+    }
+
     /// The rendered building hierarchy as a flat JSON node list of products and
     /// their spatial or aggregate ancestors; before evaluation every product counts.
     #[wasm_bindgen(js_name = getSpatialHierarchy)]
@@ -385,7 +487,13 @@ impl Kernel {
                     Some(result.shapes.iter().map(|shape| shape.express_id).collect())
                 }
                 (None, Some(stream)) => Some(stream.session.emitted().iter().copied().collect()),
-                (None, None) => None,
+                (None, None) => self.published_outcomes.get(&model_id).map(|outcomes| {
+                    outcomes
+                        .iter()
+                        .filter(|outcome| outcome.state == ProductState::Emitted)
+                        .map(|outcome| outcome.express_id)
+                        .collect()
+                }),
             };
 
         let mut included = match &rendered {
@@ -426,6 +534,7 @@ impl Kernel {
                     "expressId": express_id,
                     "class": entity.class_name(),
                     "name": name,
+                    "globalId": entity.attr("GlobalId").as_string(),
                     "parentExpressId": parent,
                     "rendered": rendered.as_ref().is_none_or(|set| set.contains(&express_id)),
                 }))
@@ -644,6 +753,88 @@ impl Kernel {
         self.sources.get(&model_id).cloned()
     }
 
+    /// The committed source revision, as a decimal string; `null` if not open.
+    #[wasm_bindgen(js_name = getModelRevision)]
+    pub fn get_model_revision(&self, model_id: u32) -> Option<String> {
+        self.revisions.get(&model_id).map(u64::to_string)
+    }
+
+    /// Validate and compare a complete replacement IFC without publishing it.
+    /// The base revision must match and no other candidate may be pending.
+    #[wasm_bindgen(js_name = prepareRevision)]
+    pub fn prepare_revision(
+        &mut self,
+        model_id: u32,
+        bytes: Vec<u8>,
+        base_revision: &str,
+    ) -> Result<String, JsValue> {
+        self.prepare_revision_inner(model_id, bytes, base_revision)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Stage source-preserving named edits across multiple entities. Every edit
+    /// is `{expressId, attribute, value, raw?}`; values are strings.
+    #[wasm_bindgen(js_name = prepareAttributeEdits)]
+    pub fn prepare_attribute_edits(
+        &mut self,
+        model_id: u32,
+        edits: &str,
+        base_revision: &str,
+    ) -> Result<String, JsValue> {
+        self.prepare_attribute_edits_inner(model_id, edits, base_revision)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Candidate impact and explicit per-product outcomes. Nothing is committed.
+    #[wasm_bindgen(js_name = getPreparedRevisionInfo)]
+    pub fn get_prepared_revision_info(&self, model_id: u32) -> Option<String> {
+        self.prepared.get(&model_id).map(PreparedRevision::report)
+    }
+
+    /// Evaluate every affected candidate product into a self-contained patch.
+    /// Pass the displayed pack's `modelOffset` and its next `firstGeometryId`.
+    /// Inspect `getPreparedRevisionInfo().evaluationAccepted` before publication.
+    #[wasm_bindgen(js_name = evaluatePreparedRevision)]
+    pub fn evaluate_prepared_revision(
+        &mut self,
+        model_id: u32,
+        candidate_token: &str,
+        options: Option<String>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.check_candidate_token(model_id, candidate_token)
+            .map_err(|error| JsValue::from_str(&error))?;
+        let options = GeometrySettings::parse(options)?;
+        self.evaluate_prepared_revision_inner(model_id, options)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Publish an accepted candidate and return the new decimal revision string.
+    /// Geometry changes must have an accepted staged evaluation first.
+    #[wasm_bindgen(js_name = commitRevision)]
+    pub fn commit_revision(
+        &mut self,
+        model_id: u32,
+        base_revision: &str,
+        candidate_token: &str,
+    ) -> Result<String, JsValue> {
+        self.check_candidate_token(model_id, candidate_token)
+            .map_err(|error| JsValue::from_str(&error))?;
+        self.commit_revision_inner(model_id, base_revision)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Discard the named unpublished candidate, leaving the source untouched.
+    /// A stale token cannot discard a newer candidate; no candidate returns false.
+    #[wasm_bindgen(js_name = discardRevision)]
+    pub fn discard_revision(
+        &mut self,
+        model_id: u32,
+        candidate_token: &str,
+    ) -> Result<bool, JsValue> {
+        self.discard_revision_inner(model_id, candidate_token)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Every schema entity and its direct or inherited evaluator routes, as JSON.
     #[wasm_bindgen(js_name = getGeometryCapabilities)]
     pub fn get_geometry_capabilities(&self, model_id: u32) -> Option<String> {
@@ -655,19 +846,16 @@ impl Kernel {
     /// Per-product evaluation outcomes; emitted products may still have diagnostics.
     #[wasm_bindgen(js_name = getProductOutcomes)]
     pub fn get_product_outcomes(&self, model_id: u32) -> Option<String> {
-        let model = self.models.get(&model_id)?;
-        let outcomes = if let Some(stream) = self.streams.get(&model_id) {
-            stream.session.outcomes(model)
-        } else {
-            let result = self.geometry.get(&model_id)?;
-            Engine::with_settings(result.settings.clone()).outcomes(model, result)
-        };
+        let outcomes = self.current_product_outcomes(model_id)?;
         serde_json::to_string(&outcomes).ok()
     }
 
     /// Stop and release a geometry stream while keeping the parsed model open.
     #[wasm_bindgen(js_name = cancelGeometryStream)]
     pub fn cancel_geometry_stream(&mut self, model_id: u32) -> bool {
+        if let Some(outcomes) = self.current_product_outcomes(model_id) {
+            self.published_outcomes.insert(model_id, outcomes);
+        }
         self.streams.remove(&model_id).is_some()
     }
 
@@ -726,6 +914,18 @@ impl Kernel {
         summary.push('}');
 
         self.streams.remove(&model_id);
+        self.prepared.remove(&model_id);
+        self.geometry_basis.insert(
+            model_id,
+            GeometryBasis {
+                settings: effective_settings(&result.settings),
+                offset: result.model_offset,
+            },
+        );
+        self.published_outcomes.insert(
+            model_id,
+            Engine::with_settings(result.settings.clone()).outcomes(model, &result),
+        );
         self.geometry.insert(model_id, result);
         Ok(Some(summary))
     }
@@ -755,6 +955,14 @@ impl Kernel {
         );
         let mut summary: serde_json::Value =
             serde_json::from_str(&summary).expect("finite geometry summary");
+        self.geometry_basis.insert(
+            model_id,
+            GeometryBasis {
+                settings: effective.clone(),
+                offset: session.model_offset(),
+            },
+        );
+        self.prepared.remove(&model_id);
         summary["effectiveSettings"] = effective;
         let summary = summary.to_string();
         self.geometry.remove(&model_id);
@@ -853,64 +1061,7 @@ impl Kernel {
             return Ok(None);
         };
         let options = GeometrySettings::parse(options)?;
-        let settings = options.geometry.clone();
-        let mut session = Engine::with_settings(settings).session(model);
-        session.restrict(express_ids);
-        if let Some(offset) = options.model_offset {
-            session.set_model_offset(DVec3::from_array(offset));
-        }
-        let total = session.total();
-        let batch = if total > 0 {
-            session.next(model, |_| false)
-        } else {
-            tessifc_engine::Batch {
-                shapes: Vec::new(),
-                diagnostics: Vec::new(),
-                is_final: true,
-                timings: Default::default(),
-            }
-        };
-        let state = PackState {
-            stream: tessifc_pack::StreamState {
-                known: Default::default(),
-                next_geometry_id: options.first_geometry_id.unwrap_or(0),
-            },
-            shared: Default::default(),
-        };
-        let mut packer = Packer::continue_stream(
-            model.image().schema.as_str(),
-            session.units().length_to_m,
-            session.model_offset(),
-            state,
-        );
-        packer.set_georef(session.georef().map(str::to_string));
-        packer.set_stream(StreamPosition {
-            chunk: 0,
-            is_final: true,
-            products_done: total,
-            products_total: total,
-        });
-        for shape in batch.shapes {
-            // Baked, so the patch never refers to family meshes the pack may lack.
-            let baked: Vec<_> = shape
-                .parts
-                .into_iter()
-                .map(|part| tessifc_engine::ShapePart {
-                    geometry: tessifc_engine::PartGeometry::Unique(part.mesh()),
-                    color: part.color,
-                    provenance: part.provenance.clone(),
-                })
-                .collect();
-            packer.add_shape(tessifc_engine::Shape {
-                express_id: shape.express_id,
-                class: shape.class,
-                category: shape.category,
-                color: shape.color,
-                parts: baked,
-            });
-        }
-        packer.add_diagnostics(&batch.diagnostics);
-        Ok(Some(packer.finish()))
+        Ok(Some(evaluate_subset(model, express_ids, &options).bytes))
     }
 
     /// How many shapes the last evaluation produced. `0` if there was none.
@@ -1025,6 +1176,9 @@ impl Kernel {
     /// Drop the geometry for a model, keeping the model itself open.
     #[wasm_bindgen(js_name = releaseGeometry)]
     pub fn release_geometry(&mut self, model_id: u32) -> bool {
+        if let Some(outcomes) = self.current_product_outcomes(model_id) {
+            self.published_outcomes.insert(model_id, outcomes);
+        }
         self.streams.remove(&model_id);
         self.geometry.remove(&model_id).is_some()
     }
@@ -1032,6 +1186,10 @@ impl Kernel {
     /// Close a model and free it. `false` if the id was not open.
     #[wasm_bindgen(js_name = closeModel)]
     pub fn close_model(&mut self, model_id: u32) -> bool {
+        self.geometry_basis.remove(&model_id);
+        self.published_outcomes.remove(&model_id);
+        self.prepared.remove(&model_id);
+        self.revisions.remove(&model_id);
         self.geometry.remove(&model_id);
         self.streams.remove(&model_id);
         self.sources.remove(&model_id);
@@ -1048,6 +1206,10 @@ impl Kernel {
     /// Close every open model.
     #[wasm_bindgen(js_name = closeAll)]
     pub fn close_all(&mut self) {
+        self.geometry_basis.clear();
+        self.published_outcomes.clear();
+        self.prepared.clear();
+        self.revisions.clear();
         self.geometry.clear();
         self.streams.clear();
         self.sources.clear();
@@ -1057,6 +1219,289 @@ impl Kernel {
 }
 
 impl Kernel {
+    fn current_product_outcomes(&self, model_id: u32) -> Option<Vec<ProductOutcome>> {
+        let model = self.models.get(&model_id)?;
+        if let Some(stream) = self.streams.get(&model_id) {
+            Some(stream.session.outcomes(model))
+        } else if let Some(result) = self.geometry.get(&model_id) {
+            Some(Engine::with_settings(result.settings.clone()).outcomes(model, result))
+        } else {
+            self.published_outcomes.get(&model_id).cloned()
+        }
+    }
+
+    fn check_candidate_token(&self, model_id: u32, token: &str) -> Result<(), String> {
+        let candidate = self.prepared.get(&model_id).ok_or("no prepared revision")?;
+        if token != candidate.token.to_string() {
+            return Err("stale candidate token".into());
+        }
+        Ok(())
+    }
+
+    fn discard_revision_inner(
+        &mut self,
+        model_id: u32,
+        candidate_token: &str,
+    ) -> Result<bool, String> {
+        if !self.prepared.contains_key(&model_id) {
+            return Ok(false);
+        }
+        self.check_candidate_token(model_id, candidate_token)?;
+        Ok(self.prepared.remove(&model_id).is_some())
+    }
+    fn check_base_revision(&self, model_id: u32, base_revision: &str) -> Result<u64, String> {
+        let revision = *self.revisions.get(&model_id).ok_or("model is not open")?;
+        if base_revision != revision.to_string() {
+            return Err(format!("stale base revision: expected {revision}"));
+        }
+        Ok(revision)
+    }
+
+    fn prepare_revision_inner(
+        &mut self,
+        model_id: u32,
+        source: Vec<u8>,
+        base_revision: &str,
+    ) -> Result<String, String> {
+        let base = self.check_base_revision(model_id, base_revision)?;
+        if self.prepared.contains_key(&model_id) {
+            return Err("discard the existing prepared revision first".into());
+        }
+        validate_complete_source(&source)?;
+        let old = self.models.get(&model_id).ok_or("model is not open")?;
+        let options = self.options.get(&model_id).cloned().unwrap_or_default();
+        let model = Model::new(parse(&source, &options.parse_options()));
+        validate_revision_model(old, &model)?;
+        let impact = compare_revisions(old, &model);
+        let revision = base.checked_add(1).ok_or("revision counter exhausted")?;
+        let token = self.next_candidate;
+        self.next_candidate = token.checked_add(1).ok_or("candidate counter exhausted")?;
+        let prepared = PreparedRevision {
+            source,
+            model,
+            impact,
+            base_revision: base,
+            revision,
+            token,
+            evaluated: false,
+            accepted: false,
+            outcomes: Vec::new(),
+            diagnostics: Vec::new(),
+            evaluation_settings: None,
+            model_offset: None,
+            refused_boolean_products: Vec::new(),
+        };
+        let report = prepared.report();
+        self.prepared.insert(model_id, prepared);
+        Ok(report)
+    }
+
+    fn prepare_attribute_edits_inner(
+        &mut self,
+        model_id: u32,
+        edits: &str,
+        base_revision: &str,
+    ) -> Result<String, String> {
+        self.check_base_revision(model_id, base_revision)?;
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Request {
+            express_id: u32,
+            attribute: String,
+            value: String,
+            #[serde(default)]
+            raw: bool,
+        }
+        let requests: Vec<Request> = serde_json::from_str(edits)
+            .map_err(|error| format!("invalid attribute edits: {error}"))?;
+        let model = self.models.get(&model_id).ok_or("model is not open")?;
+        let source = self
+            .sources
+            .get(&model_id)
+            .ok_or("model source is not retained")?;
+        let mut replacements = Vec::with_capacity(requests.len());
+        for request in requests {
+            let entity = model
+                .entity(request.express_id)
+                .ok_or("IFC entity does not exist")?;
+            let location = entity
+                .attribute_location(&request.attribute)
+                .ok_or("the entity has no requested attribute")?;
+            replacements.push(AttributeEdit {
+                express_id: request.express_id,
+                argument_index: location.argument_index,
+                leaf_class: location.leaf_class.map(str::to_owned),
+                value: if request.raw {
+                    EditValue::Raw(request.value)
+                } else {
+                    EditValue::String(request.value)
+                },
+            });
+        }
+        let edited =
+            apply_edits(source, model.image(), &replacements).map_err(|error| error.to_string())?;
+        self.prepare_revision_inner(model_id, edited, base_revision)
+    }
+
+    fn evaluate_prepared_revision_inner(
+        &mut self,
+        model_id: u32,
+        mut options: GeometrySettings,
+    ) -> Result<Vec<u8>, String> {
+        if let Some(basis) = self.geometry_basis.get(&model_id) {
+            if effective_settings(&options.geometry) != basis.settings {
+                return Err("geometry settings differ from the displayed model; start a new full geometry evaluation first".into());
+            }
+            if options
+                .model_offset
+                .is_some_and(|offset| DVec3::from_array(offset) != basis.offset)
+            {
+                return Err("modelOffset differs from the displayed model frame".into());
+            }
+            options.model_offset = Some(basis.offset.to_array());
+        }
+        let prepared = self
+            .prepared
+            .get_mut(&model_id)
+            .ok_or("no prepared revision")?;
+        if self.revisions.get(&model_id) != Some(&prepared.base_revision) {
+            return Err("stale prepared revision".into());
+        }
+        let result = evaluate_subset(
+            &prepared.model,
+            &prepared.impact.affected_products,
+            &options,
+        );
+        // A broad invalidation must not fail merely because an unchanged object
+        // was already unsupported. Verify those exceptions against the old model.
+        let old = self.models.get(&model_id).ok_or("model is not open")?;
+        let unchanged_failures: Vec<u32> = result
+            .outcomes
+            .iter()
+            .filter(|_| prepared.impact.full_rebuild)
+            .filter(|outcome| {
+                failed_outcome(outcome.state)
+                    || result
+                        .refused_boolean_products
+                        .contains(&outcome.express_id)
+            })
+            .filter(|outcome| unchanged_forward_graph(old, &prepared.model, outcome.express_id))
+            .map(|outcome| outcome.express_id)
+            .collect();
+        let mut preserved = BTreeSet::new();
+        let mut baseline_errors = BTreeSet::new();
+        if !unchanged_failures.is_empty() {
+            let baseline = evaluate_subset(old, &unchanged_failures, &options);
+            baseline_errors.extend(
+                baseline
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == tessifc_step::Severity::Error)
+                    .map(|d| (d.code.as_str(), d.express_id, d.message.clone())),
+            );
+            for before in baseline.outcomes {
+                if (failed_outcome(before.state)
+                    || baseline
+                        .refused_boolean_products
+                        .contains(&before.express_id))
+                    && result.outcomes.iter().any(|after| {
+                        after.express_id == before.express_id
+                            && after.state == before.state
+                            && (!result.refused_boolean_products.contains(&after.express_id)
+                                || baseline
+                                    .refused_boolean_products
+                                    .contains(&after.express_id))
+                    })
+                {
+                    preserved.insert(before.express_id);
+                }
+            }
+        }
+        prepared.accepted = result.outcomes.iter().all(|outcome| {
+            (!failed_outcome(outcome.state)
+                && !result
+                    .refused_boolean_products
+                    .contains(&outcome.express_id))
+                || preserved.contains(&outcome.express_id)
+        }) && !result.diagnostics.iter().any(|d| {
+            d.severity == tessifc_step::Severity::Error
+                && (d.code.as_str() == "E_REVISION_PACK_FAILED"
+                    || preserved.is_empty()
+                    || !baseline_errors.contains(&(
+                        d.code.as_str(),
+                        d.express_id,
+                        d.message.clone(),
+                    )))
+        });
+        prepared.evaluated = true;
+        prepared.outcomes = result.outcomes;
+        prepared.diagnostics = result.diagnostics;
+        prepared.refused_boolean_products = result.refused_boolean_products;
+        prepared.evaluation_settings = Some(effective_settings(&options.geometry));
+        prepared.model_offset = Some(result.model_offset);
+        Ok(result.bytes)
+    }
+
+    fn commit_revision_inner(
+        &mut self,
+        model_id: u32,
+        base_revision: &str,
+    ) -> Result<String, String> {
+        let base = self.check_base_revision(model_id, base_revision)?;
+        let prepared = self.prepared.get(&model_id).ok_or("no prepared revision")?;
+        if prepared.base_revision != base {
+            return Err("stale prepared revision".into());
+        }
+        if (!prepared.impact.affected_products.is_empty() && !prepared.evaluated)
+            || (prepared.evaluated && !prepared.accepted)
+        {
+            return Err(
+                "candidate geometry has not passed evaluation; revision was not committed".into(),
+            );
+        }
+        let mut outcomes: BTreeMap<u32, ProductOutcome> = self
+            .current_product_outcomes(model_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|outcome| (outcome.express_id, outcome))
+            .collect();
+        let prepared = self
+            .prepared
+            .remove(&model_id)
+            .expect("candidate checked above");
+        outcomes.retain(|id, _| {
+            prepared
+                .model
+                .entity(*id)
+                .is_some_and(|entity| entity.is_a("IfcProduct"))
+        });
+        for outcome in prepared.outcomes {
+            outcomes.insert(outcome.express_id, outcome);
+        }
+        for outcome in outcomes.values_mut() {
+            outcome.class = prepared.model.image().class_name_of(outcome.express_id);
+        }
+        self.published_outcomes
+            .insert(model_id, outcomes.into_values().collect());
+        if let (Some(settings), Some(offset)) =
+            (prepared.evaluation_settings, prepared.model_offset)
+        {
+            self.geometry_basis.insert(
+                model_id,
+                GeometryBasis {
+                    settings,
+                    offset: DVec3::from_array(offset),
+                },
+            );
+        }
+        self.geometry.remove(&model_id);
+        self.streams.remove(&model_id);
+        self.sources.insert(model_id, prepared.source);
+        self.models.insert(model_id, prepared.model);
+        self.revisions.insert(model_id, prepared.revision);
+        Ok(prepared.revision.to_string())
+    }
+
     fn replace_argument(
         &mut self,
         model_id: u32,
@@ -1114,6 +1559,15 @@ impl Kernel {
                 "edited IFC failed structural verification; the edit was not applied",
             ));
         }
+        let revision = self
+            .revisions
+            .get(&model_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| JsValue::from_str("revision counter exhausted"))?;
+        self.prepared.remove(&model_id);
+        self.revisions.insert(model_id, revision);
         self.geometry.remove(&model_id);
         // A finished stream still describes the pack the viewer holds; keep it.
         if let Some(stream) = self.streams.get(&model_id)
@@ -1125,6 +1579,318 @@ impl Kernel {
         self.models.insert(model_id, reparsed);
         Ok(())
     }
+}
+
+struct SubsetEvaluation {
+    bytes: Vec<u8>,
+    outcomes: Vec<ProductOutcome>,
+    diagnostics: Vec<tessifc_step::Diagnostic>,
+    model_offset: [f64; 3],
+    refused_boolean_products: Vec<u32>,
+}
+
+fn failed_outcome(state: ProductState) -> bool {
+    matches!(
+        state,
+        ProductState::EmptyOrFailed | ProductState::Pending | ProductState::NoUsableRepresentation
+    )
+}
+
+fn evaluate_subset(
+    model: &Model,
+    express_ids: &[u32],
+    options: &GeometrySettings,
+) -> SubsetEvaluation {
+    let mut session = Engine::with_settings(options.geometry.clone()).session(model);
+    session.restrict(express_ids);
+    if let Some(offset) = options.model_offset {
+        session.set_model_offset(DVec3::from_array(offset));
+    }
+    let total = session.total();
+    let mut batch = session.next(model, |_| false);
+    let ids: BTreeSet<u32> = express_ids.iter().copied().collect();
+    let mut outcomes: Vec<ProductOutcome> = session
+        .outcomes(model)
+        .into_iter()
+        .filter(|outcome| ids.contains(&outcome.express_id))
+        .collect();
+    let state = PackState {
+        stream: tessifc_pack::StreamState {
+            known: Default::default(),
+            next_geometry_id: options.first_geometry_id.unwrap_or(0),
+        },
+        shared: Default::default(),
+    };
+    let mut packer = Packer::continue_stream(
+        model.image().schema.as_str(),
+        session.units().length_to_m,
+        session.model_offset(),
+        state,
+    );
+    packer.set_georef(session.georef().map(str::to_string));
+    packer.set_stream(StreamPosition {
+        chunk: 0,
+        is_final: true,
+        products_done: total,
+        products_total: total,
+    });
+    let mut refused_boolean_products = Vec::new();
+    for shape in batch.shapes {
+        let product_id = shape.express_id;
+        let expected_parts = shape.parts.len();
+        let before_parts = packer.instance_count();
+        if shape
+            .parts
+            .iter()
+            .any(|part| part.provenance.boolean == tessifc_geom::BooleanStatus::Refused)
+        {
+            refused_boolean_products.push(product_id);
+        }
+        // A patch is self-contained; it cannot refer to an absent family mesh.
+        let parts = shape
+            .parts
+            .into_iter()
+            .map(|part| tessifc_engine::ShapePart {
+                geometry: tessifc_engine::PartGeometry::Unique(part.mesh()),
+                color: part.color,
+                provenance: part.provenance.clone(),
+            })
+            .collect();
+        packer.add_shape(tessifc_engine::Shape {
+            express_id: shape.express_id,
+            class: shape.class,
+            category: shape.category,
+            color: shape.color,
+            parts,
+        });
+        if packer.instance_count() - before_parts != expected_parts {
+            batch.diagnostics.push(tessifc_step::Diagnostic::error(
+                tessifc_step::DiagCode("E_REVISION_PACK_FAILED"), 0,
+                "candidate geometry could not be completely encoded in the viewer coordinate frame",
+            ).with_id(product_id));
+            if let Some(outcome) = outcomes.iter_mut().find(|o| o.express_id == product_id) {
+                outcome.state = ProductState::EmptyOrFailed;
+            }
+        }
+    }
+    packer.add_diagnostics(&batch.diagnostics);
+    SubsetEvaluation {
+        bytes: packer.finish(),
+        outcomes,
+        diagnostics: batch.diagnostics,
+        model_offset: session.model_offset().to_array(),
+        refused_boolean_products,
+    }
+}
+
+fn references(model: &Model, id: u32) -> Vec<u32> {
+    let Some(entry) = model.image().entry(id) else {
+        return Vec::new();
+    };
+    let mut cursor = model.image().args_of(entry);
+    let mut refs = Vec::new();
+    while let Some(value) = cursor.read() {
+        if let tessifc_step::RawValue::Ref(id) = value {
+            refs.push(id);
+        }
+    }
+    refs
+}
+
+fn dangling_references(model: &Model) -> BTreeSet<(u32, u32)> {
+    let mut result = BTreeSet::new();
+    for entry in &model.image().index {
+        for target in references(model, entry.express_id) {
+            if model.entity(target).is_none() {
+                result.insert((entry.express_id, target));
+            }
+        }
+    }
+    result
+}
+
+fn unchanged_forward_graph(old: &Model, new: &Model, product: u32) -> bool {
+    let mut pending = vec![product];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match (old.image().entry(id), new.image().entry(id)) {
+            (Some(before), Some(after)) if before.source_hash == after.source_hash => {
+                pending.extend(references(new, id));
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn validate_revision_model(old: &Model, new: &Model) -> Result<(), String> {
+    use tessifc_step::{DiagCode, Severity};
+    let diagnostics = &new.image().diagnostics;
+    if diagnostics.dropped() != 0 {
+        return Err("candidate diagnostics exceeded the validation limit".into());
+    }
+    if let Some(diagnostic) = diagnostics.items().iter().find(|d| {
+        d.severity == Severity::Error
+            || matches!(
+                d.code,
+                DiagCode::DUPLICATE_ID
+                    | DiagCode::MISSING_SEMICOLON
+                    | DiagCode::BAD_HEADER
+                    | DiagCode::NUMBER_OUT_OF_RANGE
+            )
+    }) {
+        return Err(format!("candidate IFC failed validation: {diagnostic}"));
+    }
+    // Existing vendor arity mismatches remain readable, but edits cannot add new ones.
+    for d in diagnostics
+        .items()
+        .iter()
+        .filter(|d| d.code == DiagCode::ARITY_MISMATCH)
+    {
+        if !old.image().diagnostics.items().iter().any(|prior| {
+            prior.code == d.code && prior.express_id == d.express_id && prior.message == d.message
+        }) {
+            return Err(format!("candidate IFC introduced an arity mismatch: {d}"));
+        }
+    }
+    let old_dangling = dangling_references(old);
+    if let Some((owner, target)) = dangling_references(new).difference(&old_dangling).next() {
+        return Err(format!(
+            "candidate IFC introduced dangling reference #{owner} -> #{target}"
+        ));
+    }
+    Ok(())
+}
+
+/// The permissive parser accepts partial input for viewing. Revision publication
+/// additionally requires complete sections and an actual end marker outside literals.
+fn validate_complete_source(source: &[u8]) -> Result<(), String> {
+    let mut pos = if source.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
+    let mut depth = 0usize;
+    let mut first = String::new();
+    let mut started = false;
+    let mut section = false;
+    let mut header = false;
+    let mut data = false;
+    let mut ended = false;
+    while pos < source.len() {
+        let byte = source[pos];
+        if byte.is_ascii_whitespace() {
+            pos += 1;
+            continue;
+        }
+        if source[pos..].starts_with(b"/*") {
+            pos += 2;
+            let Some(end) = source[pos..].windows(2).position(|w| w == b"*/") else {
+                return Err("candidate IFC contains an unclosed comment".into());
+            };
+            pos += end + 2;
+            continue;
+        }
+        if ended {
+            return Err("candidate IFC has content after its end marker".into());
+        }
+        if byte == b'\'' || byte == b'"' {
+            if first.is_empty() {
+                first.push('?');
+            }
+            let quote = byte;
+            pos += 1;
+            loop {
+                if pos >= source.len() {
+                    return Err("candidate IFC contains an unclosed literal".into());
+                }
+                if source[pos] == quote {
+                    pos += 1;
+                    if quote == b'\'' && source.get(pos) == Some(&quote) {
+                        pos += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+            continue;
+        }
+        if byte.is_ascii_alphabetic() {
+            let begin = pos;
+            while pos < source.len()
+                && (source[pos].is_ascii_alphanumeric() || matches!(source[pos], b'_' | b'-'))
+            {
+                pos += 1;
+            }
+            if first.is_empty() {
+                first = String::from_utf8_lossy(&source[begin..pos]).to_ascii_uppercase();
+            }
+            continue;
+        }
+        match byte {
+            b'(' => {
+                depth += 1;
+            }
+            b')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or("candidate IFC has unmatched parentheses")?;
+            }
+            b';' if depth == 0 => {
+                if !started {
+                    if first != "ISO-10303-21" {
+                        return Err("candidate IFC has no STEP signature".into());
+                    }
+                    started = true;
+                } else {
+                    match first.as_str() {
+                        "HEADER" | "DATA" | "ANCHOR" | "REFERENCE" | "SIGNATURE" => {
+                            if section {
+                                return Err("candidate IFC has an unclosed section".into());
+                            }
+                            header |= first == "HEADER";
+                            data |= first == "DATA";
+                            section = true;
+                        }
+                        "ENDSEC" => {
+                            if !section {
+                                return Err("candidate IFC has an unexpected ENDSEC".into());
+                            }
+                            section = false;
+                        }
+                        "END-ISO-10303-21" => {
+                            if section || !header || !data {
+                                return Err("candidate IFC has incomplete sections".into());
+                            }
+                            ended = true;
+                        }
+                        _ if !section => {
+                            return Err("candidate IFC has a record outside a section".into());
+                        }
+                        _ => {}
+                    }
+                }
+                first.clear();
+                pos += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if first.is_empty() {
+            first.push('?');
+        }
+        pos += 1;
+    }
+    if !ended {
+        return Err("candidate IFC is incomplete: missing final END-ISO-10303-21;".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1529,5 +2295,337 @@ ENDSEC;\nEND-ISO-10303-21;\n";
     fn a_patch_id_without_headroom_is_refused() {
         assert!(GeometrySettings::from_json(r#"{"firstGeometryId":4294967295}"#).is_err());
         assert!(GeometrySettings::from_json(r#"{"firstGeometryId":1000}"#).is_ok());
+    }
+
+    #[test]
+    fn revisions_stage_geometry_before_publishing_and_enforce_the_base() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let edited = String::from_utf8_lossy(BOX)
+            .replace("#2,3.)", "#2,5.)")
+            .into_bytes();
+        let report: serde_json::Value = serde_json::from_str(
+            &kernel
+                .prepare_revision_inner(id, edited.clone(), "0")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["affectedProducts"], serde_json::json!([9]));
+        assert_eq!(report["revision"], "1");
+        assert_eq!(kernel.export_model(id).unwrap(), BOX);
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+        assert!(
+            kernel
+                .prepare_revision_inner(id, edited.clone(), "0")
+                .is_err()
+        );
+        let options =
+            GeometrySettings::from_json(r#"{"modelOffset":[100,200,300],"firstGeometryId":400}"#)
+                .unwrap();
+        let pack = json_of(
+            &kernel
+                .evaluate_prepared_revision_inner(id, options)
+                .unwrap(),
+        );
+        assert_eq!(pack["model_offset"], serde_json::json!([100, 200, 300]));
+        assert_eq!(pack["geometries"][0]["id"], 400);
+        let report: serde_json::Value =
+            serde_json::from_str(&kernel.get_prepared_revision_info(id).unwrap()).unwrap();
+        assert_eq!(report["evaluationAccepted"], true);
+        assert_eq!(report["productOutcomes"][0]["state"], "emitted");
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+        assert_eq!(kernel.export_model(id).unwrap(), edited);
+        assert_eq!(kernel.get_model_revision(id).as_deref(), Some("1"));
+        assert!(
+            kernel
+                .prepare_revision_inner(id, BOX.to_vec(), "0")
+                .is_err()
+        );
+        assert!(kernel.get_prepared_revision_info(id).is_none());
+    }
+
+    #[test]
+    fn revision_attribute_batches_are_source_preserving_and_legacy_edits_invalidate_them() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[
+            {"expressId":9,"attribute":"Name","value":"O'Brien"},
+            {"expressId":3,"attribute":"Depth","value":"4.","raw":true}
+        ]"#,
+                "0",
+            )
+            .unwrap();
+        let staged = &kernel.prepared[&id].source;
+        assert_eq!(
+            String::from_utf8_lossy(staged),
+            String::from_utf8_lossy(BOX)
+                .replace("'W1'", "'O''Brien'")
+                .replace("#2,3.)", "#2,4.)")
+        );
+        assert_eq!(kernel.export_model(id).unwrap(), BOX);
+        kernel
+            .set_attribute(id, 9, "Name", "legacy", false)
+            .unwrap();
+        assert_eq!(kernel.get_model_revision(id).as_deref(), Some("1"));
+        assert!(kernel.get_prepared_revision_info(id).is_none());
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+    }
+
+    #[test]
+    fn candidate_source_validation_rejects_truncation_hidden_markers_and_duplicate_ids() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let text = String::from_utf8_lossy(BOX);
+        let malformed = [
+            text.replace("END-ISO-10303-21;", ""),
+            text.replace("ENDSEC;\nEND-ISO", "END-ISO"),
+            text.replace("END-ISO-10303-21;", "/* END-ISO-10303-21; */"),
+            text.replace("END-ISO-10303-21;", "'END-ISO-10303-21;'"),
+            text.replace("END-ISO-10303-21;", "END-ISO-10303-21"),
+            text.replace("#2,3.)", "#999,3.)"),
+            text.replace("#2,3.)", "#2,3.,4.)"),
+            text.replace("#2,3.)", "#2,1.e999)"),
+            text.replace("#1=IFCRECTANGLE", "#2=IFCRECTANGLE"),
+            format!("{text}#99=IFCWALL($);"),
+        ];
+        for candidate in malformed {
+            assert!(
+                kernel
+                    .prepare_revision_inner(id, candidate.into_bytes(), "0")
+                    .is_err()
+            );
+            assert_eq!(kernel.export_model(id).unwrap(), BOX);
+            assert!(kernel.get_prepared_revision_info(id).is_none());
+        }
+        let commented = format!("/* leading */ {text} /* final */");
+        kernel
+            .prepare_revision_inner(id, commented.into_bytes(), "0")
+            .unwrap();
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+    }
+
+    #[test]
+    fn revisions_accept_creation_and_deletion_and_keep_open_options() {
+        let mut kernel = Kernel::new();
+        let id = kernel
+            .open_model(
+                TINY.to_vec(),
+                Some(r#"{"schemaOverride":"IFC2X3","maxEntities":2}"#.into()),
+            )
+            .unwrap();
+        let effective_schema = kernel.models[&id].image().schema;
+        let schema = kernel.models[&id].schema();
+        let wall_arity = schema.arity(schema.class_by_name("IfcWall").unwrap());
+        let wall_record = |id, guid: &str, name: &str| {
+            let mut arguments = vec![format!("'{guid}'"), "$".into(), format!("'{name}'")];
+            arguments.resize(wall_arity, "$".into());
+            format!("#{id}=IFCWALL({});\nENDSEC;\nEND-ISO", arguments.join(","))
+        };
+        let added =
+            String::from_utf8_lossy(TINY).replace("ENDSEC;\nEND-ISO", &wall_record(2, "h", "New"));
+        // Single-schema builds may approximate the override. New records must
+        // match the effective schema; the original record remains unchanged.
+        kernel
+            .prepare_revision_inner(id, added.clone().into_bytes(), "0")
+            .unwrap();
+        assert_eq!(kernel.prepared[&id].model.image().schema, effective_schema);
+        assert_eq!(kernel.options[&id].schema_override, Some(SchemaId::Ifc2x3));
+        assert_eq!(kernel.prepared[&id].impact.created_entities, vec![2]);
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        kernel.commit_revision_inner(id, "0").unwrap();
+        let too_many = added.replace("ENDSEC;\nEND-ISO", &wall_record(3, "i", "Extra"));
+        assert!(
+            kernel
+                .prepare_revision_inner(id, too_many.into_bytes(), "1")
+                .is_err()
+        );
+        kernel
+            .prepare_revision_inner(id, TINY.to_vec(), "1")
+            .unwrap();
+        assert_eq!(kernel.prepared[&id].impact.deleted_entities, vec![2]);
+        kernel.commit_revision_inner(id, "1").unwrap();
+    }
+
+    #[test]
+    fn failed_candidate_geometry_cannot_replace_a_renderable_product() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let broken = String::from_utf8_lossy(BOX).replace("#1,$,#2,3.", "$,$,#2,3.");
+        kernel
+            .prepare_revision_inner(id, broken.into_bytes(), "0")
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(!kernel.prepared[&id].accepted);
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+        assert_eq!(kernel.export_model(id).unwrap(), BOX);
+        let token = kernel.prepared[&id].token.to_string();
+        assert!(kernel.discard_revision_inner(id, &token).unwrap());
+        let unusable = String::from_utf8_lossy(BOX).replace("'Body'", "'Axis'");
+        kernel
+            .prepare_revision_inner(id, unusable.into_bytes(), "0")
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(!kernel.prepared[&id].accepted);
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+        kernel.close_model(id);
+        assert!(kernel.get_model_revision(id).is_none());
+        assert!(kernel.get_prepared_revision_info(id).is_none());
+    }
+
+    #[test]
+    fn broad_revisions_preserve_unchanged_failed_products_and_allow_representation_removal() {
+        let mut kernel = Kernel::new();
+        let context = "#100=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,0.00001,#7,$);\n";
+        let broken = String::from_utf8_lossy(BOX)
+            .replace("#1,$,#2,3.", "$,$,#2,3.")
+            .replace("ENDSEC;\nEND-ISO", &format!("{context}ENDSEC;\nEND-ISO"));
+        let id = kernel.open_model(broken.as_bytes().to_vec(), None).unwrap();
+        let revised = broken.replace("0.00001", "0.00002");
+        kernel
+            .prepare_revision_inner(id, revised.into_bytes(), "0")
+            .unwrap();
+        assert!(kernel.prepared[&id].impact.full_rebuild);
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(
+            kernel.prepared[&id].accepted,
+            "{:?}",
+            kernel.prepared[&id].diagnostics
+        );
+        kernel.commit_revision_inner(id, "0").unwrap();
+
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":9,"attribute":"Representation","value":"$","raw":true}]"#,
+                "0",
+            )
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(kernel.prepared[&id].accepted);
+        assert_eq!(
+            kernel.prepared[&id].outcomes[0].state,
+            ProductState::NoRepresentation
+        );
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+    }
+
+    #[test]
+    fn candidate_handles_settings_frames_and_postcommit_outcomes_remain_consistent() {
+        let mut kernel = Kernel::new();
+        let with_empty = String::from_utf8_lossy(BOX).replace(
+            "ENDSEC;\nEND-ISO",
+            "#20=IFCWALL('empty',$,'Empty',$,$,$,$,$,$);\nENDSEC;\nEND-ISO",
+        );
+        let id = kernel.open_model(with_empty.into_bytes(), None).unwrap();
+        kernel
+            .evaluate_geometry(id, Some(r#"{"circleSegments":40}"#.into()))
+            .unwrap();
+        kernel.take_pack(id);
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":9,"attribute":"Name","value":"New name"}]"#,
+                "0",
+            )
+            .unwrap();
+        let token = kernel.prepared[&id].token.to_string();
+        assert!(
+            kernel
+                .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+                .is_err()
+        );
+        assert!(
+            kernel
+                .evaluate_prepared_revision_inner(
+                    id,
+                    GeometrySettings::from_json(
+                        r#"{"circleSegments":40,"modelOffset":[1e300,0,0]}"#
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+        assert!(kernel.discard_revision_inner(id, &token).unwrap());
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":9,"attribute":"Name","value":"New name"}]"#,
+                "0",
+            )
+            .unwrap();
+        assert!(kernel.check_candidate_token(id, &token).is_err());
+        assert!(kernel.discard_revision_inner(id, &token).is_err());
+        assert!(kernel.get_prepared_revision_info(id).is_some());
+        kernel
+            .evaluate_prepared_revision_inner(
+                id,
+                GeometrySettings::from_json(r#"{"circleSegments":40}"#).unwrap(),
+            )
+            .unwrap();
+        kernel.commit_revision_inner(id, "0").unwrap();
+        assert!(!kernel.discard_revision_inner(id, &token).unwrap());
+        let hierarchy: serde_json::Value =
+            serde_json::from_str(&kernel.get_spatial_hierarchy(id).unwrap()).unwrap();
+        assert!(
+            hierarchy["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["expressId"] == 9 && n["rendered"] == true && n["globalId"] == "a")
+        );
+        assert!(
+            !hierarchy["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["expressId"] == 20 && n["rendered"] == true)
+        );
+        let outcomes = kernel.current_product_outcomes(id).unwrap();
+        assert_eq!(
+            outcomes.iter().find(|o| o.express_id == 9).unwrap().state,
+            ProductState::Emitted
+        );
+        assert_eq!(
+            outcomes.iter().find(|o| o.express_id == 20).unwrap().state,
+            ProductState::NoRepresentation
+        );
+
+        // Without an existing frame, packing must still reject f32 overflow.
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":3,"attribute":"Depth","value":"4.","raw":true}]"#,
+                "0",
+            )
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(
+                id,
+                GeometrySettings::from_json(r#"{"modelOffset":[1e300,0,0]}"#).unwrap(),
+            )
+            .unwrap();
+        assert!(!kernel.prepared[&id].accepted);
+        assert!(
+            kernel.prepared[&id]
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "E_REVISION_PACK_FAILED")
+        );
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
     }
 }

@@ -63,6 +63,7 @@ nav:
           - SDK and API: docs/sdk.md
           - Architecture: docs/architecture.md
           - Editing: docs/editing.md
+          - Agents and pipelines: docs/agents.md
       - Reference:
           - IGP format: docs/igp-format.md
           - IFC coverage: docs/coverage.md

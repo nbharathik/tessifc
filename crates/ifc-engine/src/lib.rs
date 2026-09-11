@@ -28,6 +28,7 @@
 #![warn(missing_docs)]
 
 pub mod pack;
+pub mod revision;
 
 /// Diagnostic codes this crate raises itself.
 pub mod codes {

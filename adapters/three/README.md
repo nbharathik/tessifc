@@ -62,6 +62,31 @@ in metres relative to `summary.modelOffset`. Add that offset in double
 precision for source coordinates. The reference viewer's IGP path also
 supports shared instancing and progressive streaming.
 
+## A scene that follows edits
+
+`createRetainedModel(THREE, pack)` builds a scene from a parsed IGP pack, one
+mesh per placed instance with a `BufferGeometry` shared per IGP geometry, and
+`applyDelta(delta)` replaces only the products a revision touched. The pack
+and the deltas come from `@tessifc/edit`:
+
+```js
+import { createEditingSession, readIgp } from "@tessifc/edit";
+import { createRetainedModel } from "@tessifc/three";
+
+const session = createEditingSession(kernel, modelId, { settings: { includeOpenings: true } });
+const model = createRetainedModel(THREE, session.evaluate().pack);
+scene.add(model.group);
+
+const { delta } = session.runScript('ifc.byType("IfcWall")[0].Name = "Renamed";');
+if (delta) model.applyDelta(delta);   // affected and removed products swap, nothing else moves
+model.setVisible(expressId, false);
+model.dispose();
+```
+
+Meshes carry `userData.expressId`, `class` and `flags`; helper geometry
+(openings, spaces, references) starts invisible. This scene favours
+correctness over draw-call count; `loadModel` stays the merged static path.
+
 Intersecting transparent surfaces still have normal object-sorting limits.
 The adapter does not repair unsupported IFC geometry. See the
 [coverage guide](https://github.com/nbharathik/tessifc/blob/main/docs/coverage.md).

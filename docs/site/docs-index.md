@@ -45,6 +45,12 @@ the command line and Rust.
 
     [Work with attributes](editing.md)
 
+-   **Agents and pipelines**
+
+    Run scripts and agents against a model and refresh only what changed.
+
+    [Build on the editing loop](agents.md)
+
 </div>
 
 ## Reference

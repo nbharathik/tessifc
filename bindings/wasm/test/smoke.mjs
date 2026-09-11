@@ -60,6 +60,14 @@ if (kernel.getProductCategory(tinyId, 1) !== "physical") {
 }
 console.log("ok    a minimal file parses through wasm");
 
+// Schema introspection answers by class name in the model's schema, in argument order.
+const doorDefinition = JSON.parse(kernel.getClassAttributes(tinyId, "IfcDoor"));
+check(doorDefinition.class === "IfcDoor" && !doorDefinition.abstract, "getClassAttributes names the class");
+check(doorDefinition.attributes[0].name === "GlobalId" && !doorDefinition.attributes[0].optional, "GlobalId is the first required attribute");
+check(doorDefinition.attributes.find((a) => a.name === "OverallHeight")?.base === "real", "attribute bases are reported");
+check(JSON.parse(kernel.getClassAttributes(tinyId, "IfcProduct")).abstract === true, "abstract classes are flagged");
+check(kernel.getClassAttributes(tinyId, "IfcSpaceship") === undefined, "an unknown class is undefined");
+
 // Garbage must not throw, and must be reported rather than swallowed.
 const junkId = kernel.openModel(new Uint8Array([0, 1, 2, 3, 255, 254]));
 const junkInfo = JSON.parse(kernel.getModelInfo(junkId));
@@ -159,6 +167,110 @@ const fragment = new TextEncoder().encode(FRAGMENT);
   );
   check(kernel.shapeCount(id) === 0, "taking the pack releases the geometry");
   kernel.closeAll();
+}
+
+// ----------------------------------------------------- staged live revisions
+
+{
+  const kernel = new Kernel();
+  const encode = text => new TextEncoder().encode(text);
+  const id = kernel.openModel(fragment);
+  const candidateToken = () => JSON.parse(kernel.getPreparedRevisionInfo(id)).candidateToken;
+  assert.equal(kernel.getModelRevision(id), '0');
+  kernel.evaluateGeometry(id);
+  const originalPack = readIgp(kernel.takePack(id));
+  const changed = FRAGMENT.replace('#2,2.5)', '#2,4.)');
+  const impact = JSON.parse(kernel.prepareRevision(id, encode(changed), '0'));
+  assert.deepEqual(impact.affectedProducts, [6]);
+  assert.equal(impact.revision, '1');
+  assert.equal(new TextDecoder().decode(kernel.exportModel(id)), FRAGMENT);
+  assert.throws(() => kernel.commitRevision(id, '0', impact.candidateToken), /evaluation/);
+  assert.throws(() => kernel.prepareRevision(id, fragment, '0'), /discard/);
+  assert.throws(() => kernel.evaluatePreparedRevision(id, impact.candidateToken,
+    '{"circleSegments":40}'), /settings differ/);
+  assert.throws(() => kernel.evaluatePreparedRevision(id, impact.candidateToken,
+    '{"modelOffset":[1e300,0,0]}'), /modelOffset differs/);
+  const patch = readIgp(kernel.evaluatePreparedRevision(id, impact.candidateToken, JSON.stringify({
+    modelOffset: originalPack.index.model_offset, firstGeometryId: 100,
+  })));
+  assert.deepEqual([...patch.instances.expressIds], [6]);
+  assert.equal(patch.geometry[0].id, 100);
+  assert.equal(Math.max(...patch.geometry[0].positions.filter((_, i) => i % 3 === 2)), 4);
+  const evaluated = JSON.parse(kernel.getPreparedRevisionInfo(id));
+  assert.equal(evaluated.evaluationAccepted, true);
+  assert.deepEqual(evaluated.productOutcomes.map(o => [o.express_id, o.state]), [[6, 'emitted']]);
+  assert.equal(kernel.commitRevision(id, '0', impact.candidateToken), '1');
+  assert.equal(kernel.getModelRevision(id), '1');
+  assert.equal(new TextDecoder().decode(kernel.exportModel(id)), changed);
+  assert.throws(() => kernel.prepareRevision(id, fragment, '0'), /stale/);
+  assert.throws(() => kernel.commitRevision(id, '0', impact.candidateToken), /prepared|stale/);
+
+  const names = JSON.parse(kernel.prepareAttributeEdits(id, JSON.stringify([
+    { expressId: 6, attribute: 'Name', value: "O'Brien wall" },
+    { expressId: 15, attribute: 'Name', value: 'Renamed slab' },
+  ]), '1'));
+  assert.deepEqual(names.affectedProducts, []);
+  const metadataPack = readIgp(kernel.evaluatePreparedRevision(id, names.candidateToken));
+  assert.equal(metadataPack.instances.count, 0);
+  assert.equal(kernel.commitRevision(id, '1', names.candidateToken), '2');
+  assert.equal(JSON.parse(kernel.getProductOutcomes(id)).filter(o => o.state === 'emitted').length, 2);
+  assert.equal(JSON.parse(kernel.getSpatialHierarchy(id)).nodes.filter(n => n.rendered).length, 2);
+  const namedSource = new TextDecoder().decode(kernel.exportModel(id));
+  assert(namedSource.includes("'O''Brien wall'"));
+  assert(namedSource.includes("'Renamed slab'"));
+
+  // A new product may share an existing representation. Deletion changes count too.
+  const added = namedSource.replace('ENDSEC;\nEND-ISO',
+    "#25=IFCWALL('new-wall',$,'New wall',$,$,$,#5,$,$);\nENDSEC;\nEND-ISO");
+  const creation = JSON.parse(kernel.prepareRevision(id, encode(added), '2'));
+  assert.deepEqual(creation.createdEntities, [25]);
+  assert(creation.affectedProducts.includes(25));
+  kernel.evaluatePreparedRevision(id, creation.candidateToken);
+  assert.equal(kernel.commitRevision(id, '2', creation.candidateToken), '3');
+  const removal = JSON.parse(kernel.prepareRevision(id, encode(namedSource), '3'));
+  assert.deepEqual(removal.deletedEntities, [25]);
+  assert(removal.removedProducts.includes(25));
+  kernel.evaluatePreparedRevision(id, removal.candidateToken);
+  assert.equal(kernel.commitRevision(id, '3', removal.candidateToken), '4');
+
+  for (const malformed of [
+    namedSource.replace('END-ISO-10303-21;', ''),
+    namedSource.replace('ENDSEC;\nEND-ISO', 'END-ISO'),
+    namedSource.replace('END-ISO-10303-21;', '/* END-ISO-10303-21; */'),
+    namedSource.replace('#2,4.)', '#999,4.)'),
+    namedSource.replace('#2,4.)', '#2,4.,5.)'),
+  ]) {
+    assert.throws(() => kernel.prepareRevision(id, encode(malformed), '4'), /candidate/);
+    assert.equal(kernel.getModelRevision(id), '4');
+    assert.equal(new TextDecoder().decode(kernel.exportModel(id)), namedSource);
+  }
+
+  // Valid STEP can still have failed geometry: source and revision remain unchanged.
+  const broken = namedSource.replace('#1,$,#2,4.', '$,$,#2,4.');
+  kernel.prepareRevision(id, encode(broken), '4');
+  kernel.evaluatePreparedRevision(id, candidateToken());
+  const refused = JSON.parse(kernel.getPreparedRevisionInfo(id));
+  assert.equal(refused.evaluationAccepted, false);
+  assert(refused.productOutcomes.some(o => o.state === 'empty_or_failed'));
+  assert.throws(() => kernel.commitRevision(id, '4', candidateToken()), /evaluation/);
+  assert.equal(new TextDecoder().decode(kernel.exportModel(id)), namedSource);
+  assert.equal(kernel.discardRevision(id, candidateToken()), true);
+
+  const abandoned = JSON.parse(kernel.prepareRevision(id, encode(namedSource), '4'));
+  kernel.discardRevision(id, abandoned.candidateToken);
+  kernel.prepareRevision(id, encode(namedSource), '4');
+  assert.throws(() => kernel.evaluatePreparedRevision(id, abandoned.candidateToken), /stale candidate/);
+  assert.throws(() => kernel.commitRevision(id, '4', abandoned.candidateToken), /stale candidate/);
+  assert.throws(() => kernel.discardRevision(id, abandoned.candidateToken), /stale candidate/);
+  assert(kernel.getPreparedRevisionInfo(id), 'stale cleanup preserves the newer candidate');
+  kernel.setAttribute(id, 6, 'Name', 'Legacy edit', false);
+  assert.equal(kernel.getModelRevision(id), '5');
+  assert.equal(kernel.getPreparedRevisionInfo(id), undefined);
+  assert.equal(kernel.discardRevision(id, abandoned.candidateToken), false);
+  kernel.closeAll();
+  assert.equal(kernel.getModelRevision(id), undefined);
+  assert.equal(kernel.getPreparedRevisionInfo(id), undefined);
+  console.log('ok    staged revisions publish only affected geometry, batch metadata, create/delete, and reject stale or failed updates');
 }
 
 // -------------------------------------------------- agreement with the CLI

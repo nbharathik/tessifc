@@ -9,10 +9,11 @@ const $ = (id) => document.getElementById(id);
 // Button id to command; buttons sharing a command share its state.
 const BUTTON_COMMANDS = {
   "cmd-open": "open",
+  "cmd-update": "update-ifc",
   "dz-open": "open",
   "cmd-export": "export",
   "cmd-export-2": "export",
-  "pending-export": "export",
+  "save-revision": "export",
   "cmd-close": "close",
   "cmd-settings": "settings",
   "open-settings": "settings",
@@ -40,6 +41,8 @@ const BUTTON_COMMANDS = {
   "cmd-edit": "edit",
   "dock-edit": "edit",
   "rail-editor": "toggle-editor",
+  "rail-script": "session-script",
+  "rail-assistant": "session-assistant",
   "selection-details": "element",
   "cmd-show-all": "show-all",
   "tree-restore": "show-all",
@@ -74,6 +77,7 @@ const PANEL_TOGGLES = {
   outliner: "toggle-outliner",
   inspector: "toggle-inspector",
   editor: "toggle-editor",
+  session: "toggle-session",
 };
 
 const THEME_MODES = ["system", "light", "dark"];
@@ -90,7 +94,7 @@ const TOAST_ICONS = {
 export function createShell() {
   const commands = new Map();
   const buttons = new Map();
-  const listeners = { theme: [], canvasTheme: [], panel: [], resize: [] };
+  const listeners = { theme: [], canvasTheme: [], panel: [], resize: [], visibility: [] };
   const narrowScreen = matchMedia("(max-width: 860px)");
 
   let ribbonTab = "home";
@@ -116,8 +120,9 @@ export function createShell() {
   for (const element of document.querySelectorAll("[data-view]")) {
     bind(element, `view:${element.dataset.view}`);
   }
-  // The close button reaches the panel directly, whatever the command table says.
+  // The close buttons reach their panel directly, whatever the command table says.
   $("editor-close")?.addEventListener("click", () => setPanel("editor", false));
+  $("session-close")?.addEventListener("click", () => setPanel("session", false));
 
   /** Register a command so buttons, the palette and the keyboard can run it. */
   function register(list) {
@@ -215,6 +220,7 @@ export function createShell() {
     panel.classList.toggle("collapsed", !visible);
     if (name === "inspector") $("rail").classList.toggle("closed", !visible);
     setPressed(PANEL_TOGGLES[name], visible);
+    emit("visibility", { name, visible });
     emit("resize");
   }
 

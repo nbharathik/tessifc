@@ -16,8 +16,9 @@
  */
 
 import { buildBatches, frame } from "./build.js";
+import { createRetainedModel } from "./retained.js";
 
-export { buildBatches, frame };
+export { buildBatches, frame, createRetainedModel };
 
 /**
  * Evaluate a model, unless already evaluated, and build meshes for it.

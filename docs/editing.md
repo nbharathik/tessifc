@@ -9,7 +9,7 @@ authoring application's exact spelling of unchanged values.
 
 ## Invariants
 
-An accepted edit has these properties:
+An accepted attribute edit has these properties:
 
 1. Only the requested top-level argument byte span changes.
 2. Every untouched source byte remains identical.
@@ -49,13 +49,108 @@ replace the original through the user's normal version-control workflow.
 worker, edits scalar text fields, and downloads an `.edited.ifc` revision with
 **Save IFC** or `Ctrl+S`.
 
-Edits that change geometry are supported by the raw API, but the current viewer
-intentionally exposes only text fields.
+The viewer's attribute form exposes text fields. **Update IFC** accepts an
+externally edited snapshot, including geometry changes, additions and deletions.
+Both paths use the staged revision API described in the [SDK](sdk.md).
 
-After a save the viewer asks the kernel to re-evaluate the edited product alone
-(`Kernel.evaluateProducts`), receives it as one self-contained IGP chunk, and
-swaps that product's records in place. When the triangles are byte-identical,
-which the supported metadata edits preserve, nothing on the GPU is touched.
-The v0.1 viewer does not expose geometry edits. A host changing a placement,
-opening, profile or shared representation must re-evaluate every affected
-product, or re-evaluate the whole model; dependency invalidation is not automatic.
+## Incremental geometry revisions
+
+A revision is prepared separately from the committed model. The kernel compares
+decoded entities and follows dependencies in both the old and new models. For
+example, changing an opening also invalidates its host; changing a shared profile
+invalidates its consumers. Physical proximity alone does not imply a dependency.
+Entity IDs address a particular snapshot. Product GlobalIds help preserve viewer
+selection and visibility across a conservative rebuild.
+
+The kernel evaluates the affected products with the established geometry settings
+and coordinate offset before allowing commit. Rejected candidates leave the
+committed source and scene intact. Metadata-only changes skip tessellation.
+Unknown or global effects, including units, context and product identity changes,
+can require a full geometry rebuild. The impact result reports `fullRebuild` and
+per-product reasons.
+
+After commit, the viewer retires replaced instance slots and appends new ones.
+Unchanged slots keep their IDs; identical product geometry keeps its existing
+resources. The renderer rebuilds affected batches and preserves unrelated GPU
+buffers. A shared batch can include more than the edited product, and CPU spatial
+and depth indexes are currently rebuilt. Selection, camera, clipping and
+visibility are retained where their identities remain valid; measurements are
+cleared after a geometry change.
+
+The first implementation reparses the full candidate file and scans dependencies.
+It selectively tessellates and uploads geometry; it is not an incremental text
+parser. External snapshots retain exactly the submitted bytes, so the attribute
+edit byte-preservation guarantees above do not extend to an external tool's
+serialization. Deleted and replaced meshes and GPU resources are reclaimed, but
+retired CPU instance slots accumulate until the model is reopened. Very long edit
+sessions should use an explicit reopen checkpoint.
+
+The worker commits before the main thread applies its prepared scene patch. If
+the renderer then fails, the viewer marks the scene stale and requires reopening
+the exported committed IFC. Durable patch replay and cross-process transactions
+are outside this preview.
+
+## Scripts in the viewer
+
+The **Session** panel (the `</>` icon on the right rail) runs scripts against
+the open model. With nothing else installed, scripts are JavaScript and run in
+the browser: the worker executes them next to the kernel, collects the edits,
+writes a new IFC snapshot and stages it through the revision path above. Only
+the affected products are tessellated and uploaded, and the report under the
+script comes from the kernel's impact analysis, not from the script.
+
+Pick an example from the **Examples** menu, such as *Add a door to a wall*,
+and press Run or Ctrl Enter. Scripts see `ifc`, `selected`, `selection` and
+`print`:
+
+```js
+const wall = selected ?? ifc.byType("IfcWall")[0];
+const solid = wall.Representation.Representations[0].Items[0];
+solid.Depth = solid.Depth + 0.5;                       // an attribute edit
+const column = ifc.addBox("IfcColumn", "New column",   // placed geometry
+  { at: [2, 1, 0], size: [0.3, 0.3, 3] });
+ifc.contain(column, ifc.container(wall));
+print("raised", wall.Name, "and added", column);
+```
+
+Entities expose their IFC attributes by name, references resolve to entities
+and lists to arrays. `ifc.add(className, attributes)` creates a record from
+attributes by name using the model's schema, `ifc.remove(entity)` deletes one
+and detaches every reference, `ifc.addBox`, `ifc.contain`, `ifc.void`,
+`ifc.fill` and `ifc.aggregate` cover the common authoring steps, and
+`ifc.inverses`, `ifc.container` and `ifc.byGuid` answer the common queries.
+The [SDK](sdk.md) lists the whole API and [Agents and pipelines](agents.md)
+shows the same loop outside the viewer. A script that throws publishes
+nothing; a script that changes nothing publishes nothing. `Undo` and `Redo`
+republish the source as it was before or after the last script, as new
+revisions. Browser scripts make the model dirty: the download icon in the top
+bar exports the result.
+
+**Python with IfcOpenShell** is the second engine. Start a local session,
+`python scripts/serve-edit-session.py model.ifc`, and open the address it
+prints. The session process owns the file, parses it once with an installed
+IfcOpenShell, runs scripts with `model`, `ifcopenshell`, `api`, `element`,
+`guid`, `selection` and `selected` defined inside a transaction, and publishes
+each accepted change by writing the file atomically. The viewer follows the
+file, so any other process may save it too. The panel switches its examples
+and its language when the session is connected.
+
+## The assistant
+
+The **Assistant** tab has Ask and Edit modes. Ask reads the model through a
+read-only script tool and answers. Edit proposes one script with a summary;
+by default you review it and run it from the card, and *Run edits
+automatically* runs it at once. The model summary, the selection and its
+attributes are sent as context; model text is treated as data, never as
+instructions. The reply is followed by the kernel's own report of what the
+viewer changed.
+
+In the browser, choose the provider under **Settings > Assistant**:
+OpenRouter, Anthropic, or any OpenAI-compatible chat-completions URL such as
+Ollama or LM Studio on your machine. The key is stored in this browser only
+and sent only to that provider. With a Python session the assistant runs on
+the session process instead (`--assistant anthropic` with `ANTHROPIC_API_KEY`).
+
+Scripts, whether typed or generated, run with your user's permissions and
+without a sandbox: in the page's worker for JavaScript, in the session
+process for Python. Review generated code before running it.

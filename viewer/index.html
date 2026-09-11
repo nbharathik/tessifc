@@ -11,7 +11,7 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%230f1115'/><polygon points='32,6 56,19 32,32 8,19' fill='%2393b9fb'/><polygon points='8,19 32,32 32,58 8,45' fill='%233b82f6'/><polygon points='56,19 56,45 32,58 32,32' fill='%231e5bd0'/></svg>" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://openrouter.ai https://api.anthropic.com http://127.0.0.1:* http://localhost:*; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
     />
     <script src="./src/boot.js"></script>
     <link rel="stylesheet" href="./src/styles.css" />
@@ -49,6 +49,9 @@
             <span class="name" id="model-name">Starting the geometry kernel</span>
             <span class="tag hidden" id="model-schema"></span>
           </span>
+          <button class="icon-btn save-chip hidden" id="save-revision" type="button" title="Unsaved IFC edits: download the IFC (Ctrl S)" aria-label="Download the edited IFC">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5" /><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2" /></svg>
+          </button>
           <span class="bar-sep" aria-hidden="true"></span>
           <span class="local-badge" title="Files are read in this browser and are never uploaded">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></svg>
@@ -80,6 +83,10 @@
               <button class="rib-btn lg" id="cmd-export" type="button" disabled title="Download the IFC source (Ctrl S)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h12l2 2v14H5z" /><path d="M8 4v6h8V4M8 16h8" /></svg>
                 <span class="rib-label">Export IFC</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-update" type="button" disabled title="Apply an edited version of this IFC and refresh affected objects">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1" /></svg>
+                <span class="rib-label">Update IFC</span>
               </button>
               <button class="rib-btn lg" id="cmd-close" type="button" disabled title="Close the model and release its memory">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
@@ -283,13 +290,6 @@
         </div>
       </div>
 
-      <div id="pending-bar" class="hidden">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01" /><path d="M10.3 4.3 2.6 18a1.9 1.9 0 0 0 1.7 2.9h15.4a1.9 1.9 0 0 0 1.7-2.9L13.7 4.3a1.9 1.9 0 0 0-3.4 0z" /></svg>
-        <span class="summary">Unsaved IFC edits</span>
-        <span class="detail grow" id="pending-detail">Download the IFC to keep this revision.</span>
-        <button class="btn sm" id="pending-export" type="button">Export IFC</button>
-      </div>
-
       <main id="workspace">
         <aside id="outliner" aria-label="Model structure">
           <div class="panel-strip">
@@ -474,6 +474,68 @@
           </div>
         </aside>
 
+        <aside id="session" class="collapsed" aria-label="Session">
+          <div class="panel-head">
+            <span class="panel-title">Session</span>
+            <div class="seg" id="session-switch" role="tablist" aria-label="Session view">
+              <button type="button" role="tab" aria-selected="true" aria-controls="session-script" data-session="script">Script</button>
+              <button type="button" role="tab" aria-selected="false" aria-controls="session-assistant" tabindex="-1" data-session="assistant">Assistant</button>
+            </div>
+            <span class="grow"></span>
+            <button class="icon-btn sm" id="session-close" type="button" title="Close the session panel" aria-label="Close the session panel">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+          <div class="session-state"><span class="dot" id="session-dot" aria-hidden="true"></span><span id="session-status">JavaScript · in this browser</span></div>
+          <div class="panel-body scroll">
+            <div class="page">
+              <div id="session-script">
+                <div class="script-head">
+                  <span class="group-title"><span><span id="script-language">JavaScript</span> script</span></span>
+                  <select id="script-example" aria-label="Example scripts"><option value="" selected>Examples</option></select>
+                </div>
+                <textarea id="script-editor" class="script-editor" rows="10" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Script"></textarea>
+                <div class="edit-actions session-toolbar">
+                  <button class="btn accent sm" id="script-run" type="button" disabled title="Run the script against the model (Ctrl Enter)">Run</button>
+                  <button class="btn sm" id="script-undo" type="button" disabled title="Restore the model as it was before the last script">Undo</button>
+                  <button class="btn sm" id="script-redo" type="button" disabled title="Reapply the undone script">Redo</button>
+                  <button class="btn sm" id="script-insert" type="button" disabled title="Insert a line that fetches the selected element">Selection</button>
+                  <span class="grow"></span>
+                  <button class="icon-btn sm" id="script-clear" type="button" title="Clear the output" aria-label="Clear the output"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button>
+                </div>
+                <p class="note" id="script-note"></p>
+                <div class="session-output hidden" id="script-output" aria-live="polite"></div>
+                <details class="session-hint" id="session-python-hint">
+                  <summary>Python with IfcOpenShell instead</summary>
+                  <p class="note">Start a local session on your machine and open the address it prints. Scripts then run there in Python, and every saved revision updates this view.</p>
+                  <pre class="session-command" id="session-command"></pre>
+                </details>
+              </div>
+              <div id="session-assistant" class="hidden">
+                <div class="assistant-head">
+                  <div class="seg" id="assistant-mode" role="tablist" aria-label="Assistant mode">
+                    <button type="button" role="tab" aria-selected="true" data-mode="ask">Ask</button>
+                    <button type="button" role="tab" aria-selected="false" tabindex="-1" data-mode="edit">Edit</button>
+                  </div>
+                  <label class="field check hidden" id="assistant-policy" title="Run proposed scripts without reviewing them first">
+                    <input type="checkbox" id="assistant-auto" />
+                    <span class="field-label">Run edits automatically</span>
+                  </label>
+                  <span class="grow"></span>
+                  <button class="icon-btn sm" id="assistant-settings" type="button" title="Assistant settings" aria-label="Assistant settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg></button>
+                  <button class="icon-btn sm" id="assistant-clear" type="button" title="Clear the conversation" aria-label="Clear the conversation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button>
+                </div>
+                <p class="note" id="assistant-note"></p>
+                <div class="chat" id="assistant-log" aria-live="polite"></div>
+                <div class="assistant-compose">
+                  <textarea id="assistant-prompt" rows="3" placeholder="Ask about the model" aria-label="Message the assistant" disabled></textarea>
+                  <button class="btn accent sm" id="assistant-send" type="button" disabled>Send</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
         <aside id="inspector" aria-label="Inspector">
           <div class="panel-head">
             <span class="panel-title" id="inspector-title">Properties</span>
@@ -627,6 +689,12 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6M4 20h16" /></svg>
             <span class="badge" id="quality-badge" data-count="0"></span>
           </button>
+          <button class="rail-btn" id="rail-script" type="button" aria-pressed="false" title="Python script" aria-label="Python script">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14" /></svg>
+          </button>
+          <button class="rail-btn" id="rail-assistant" type="button" aria-pressed="false" title="Assistant" aria-label="Assistant">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.2 2.2M16.2 16.2l2.2 2.2M5.6 18.4l2.2-2.2M16.2 7.8l2.2-2.2" /><circle cx="12" cy="12" r="3.5" /></svg>
+          </button>
           <button class="rail-btn" id="rail-editor" type="button" aria-pressed="false" title="Edit attributes (E)" aria-label="Edit attributes">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
           </button>
@@ -701,8 +769,31 @@
           </select>
         </div>
 
+        <div class="group-title">Assistant</div>
+        <div class="field">
+          <span class="field-label">Provider<span class="hint">Called from this browser. Keys stay in this browser's storage.</span></span>
+          <select id="set-assistant-provider">
+            <option value="off" selected>Off</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="compatible">OpenAI-compatible URL</option>
+          </select>
+        </div>
+        <div class="field" id="set-assistant-model-row">
+          <span class="field-label">Model<span class="hint">The provider's model id.</span></span>
+          <input type="text" id="set-assistant-model" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field hidden" id="set-assistant-url-row">
+          <span class="field-label">Base URL<span class="hint">A chat-completions endpoint, such as Ollama or LM Studio on this machine.</span></span>
+          <input type="text" id="set-assistant-url" autocomplete="off" spellcheck="false" placeholder="Chat completions base URL" />
+        </div>
+        <div class="field" id="set-assistant-key-row">
+          <span class="field-label">API key<span class="hint">Sent only to the provider above.</span></span>
+          <input type="password" id="set-assistant-key" autocomplete="off" spellcheck="false" />
+        </div>
+
         <div class="group-title">Your data</div>
-        <p class="note">Every file is read in this tab. Nothing is uploaded, and the only thing kept between sessions is the choices on this page.</p>
+        <p class="note">Every file is read in this tab. Nothing is uploaded unless you configure an assistant, and the only things kept between sessions are the choices on this page.</p>
       </div>
       <div class="dlg-foot"><button class="btn primary" id="settings-done" type="button">Done</button></div>
     </dialog>
@@ -753,6 +844,7 @@
 
             <div class="group-title">Workspace</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>K</kbd></span>Command palette</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>Enter</kbd></span>Run the session script</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>O</kbd></span>Open a file</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>S</kbd></span>Export the IFC</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>F</kbd></span>Search the structure</div>
@@ -779,6 +871,7 @@
     </div>
 
     <input id="file-input" type="file" accept=".ifc" hidden />
+    <input id="revision-input" type="file" accept=".ifc" hidden />
 
     <script type="module" src="./src/main.js"></script>
   </body>

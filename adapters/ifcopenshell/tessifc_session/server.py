@@ -19,7 +19,7 @@ STATIC_SUFFIXES = {".html", ".js", ".css", ".wasm", ".svg"}
 
 
 def create_server(session: EditSession, port: int = 8000, *, root: Path, assistant: Assistant | None = None,
-                  static_roots=("viewer", "bindings/wasm/pkg", "bindings/edit/src")):
+                  static_roots=("viewer", "bindings/wasm/pkg", "bindings/edit/src", "bindings/viewer/src")):
     """A loopback-only server; `root` is the checkout that holds the viewer and the WASM package."""
     token = secrets.token_urlsafe(24)
     allowed = tuple((Path(root) / name).resolve() for name in static_roots)

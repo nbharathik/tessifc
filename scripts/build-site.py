@@ -301,8 +301,10 @@ def build_contents(out: Path, base: str) -> int:
     copy_tree(REPO / "viewer" / "src", out / "viewer" / "src")
     shutil.copy2(REPO / "viewer" / "index.html", out / "viewer" / "index.html")
     copy_tree(pkg, out / "bindings" / "wasm" / "pkg")
-    # The viewer imports the shared editing modules from the edit package.
+    # The viewer imports the shared editing modules from the edit package and
+    # its renderer from the viewer package.
     copy_tree(REPO / "bindings" / "edit" / "src", out / "bindings" / "edit" / "src")
+    copy_tree(REPO / "bindings" / "viewer" / "src", out / "bindings" / "viewer" / "src")
     (out / ".nojekyll").write_text("", encoding="utf-8")
     return 0
 

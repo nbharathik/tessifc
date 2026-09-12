@@ -25,6 +25,10 @@ npm or CDN dependencies.
 Reads IFC2X3, IFC4 and IFC4X3. Geometry support varies by representation; see
 [geometry coverage](../docs/coverage.md) and the [preview contract](../docs/preview.md).
 
+The renderer itself is the [`@tessifc/viewer`](../bindings/viewer/README.md)
+package; this application is its ribbon, panels and tree. To embed a viewer
+in your own page, start there.
+
 ## Run locally
 
 Requires Rust via rustup, Python 3.11+ and a browser with WebGL2 support.
@@ -53,8 +57,18 @@ See [editing](../docs/editing.md) for the revision and recovery boundaries.
 ## Controls
 
 Left-drag to orbit, right-drag or Shift-drag to pan, and scroll to zoom.
-Double-click an element to frame it. On touch screens, use one finger to
-orbit and two fingers to pan or pinch to zoom.
+Clicking an element selects it and moves the orbit and zoom centre to the
+surface you clicked, so scrolling afterwards takes you into that element
+however far the model's bounds extend. Double-click an element to frame it.
+On touch screens, use one finger to orbit and two fingers to pan or pinch to
+zoom. The dock on the left of the viewport keeps zoom, fit, the standard
+views, measure, section, display style and **Show all** one click away; a dot
+on Show all means something is hidden or isolated, and pressing it brings
+those elements back while spaces, openings and guides keep their own
+toggles on the View tab.
+
+The right side shows one panel at a time: the edit panel and the Session
+panel take the inspector's place and hand it back when they close.
 
 | Key | Action |
 | --- | --- |

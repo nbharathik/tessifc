@@ -33,7 +33,7 @@ const HELPER_FILTERS = [
 ];
 
 const SETTINGS_KEY = "tessifc.settings";
-const DEFAULT_SETTINGS = { scale: 1.5, hideSemantic: true, adaptive: false, lod: true, coincident: true };
+const DEFAULT_SETTINGS = { scale: 1, hideSemantic: true, adaptive: false, lod: true, coincident: true };
 
 /** Rendering settings from the last visit; a blocked or stale store falls back. */
 function loadSettings() {
@@ -44,6 +44,8 @@ function loadSettings() {
     for (const key of Object.keys(DEFAULT_SETTINGS)) {
       if (typeof stored[key] === typeof DEFAULT_SETTINGS[key]) settings[key] = stored[key];
     }
+    // The scale is a fraction of native resolution now; an older stored limit above it means native.
+    settings.scale = Math.min(1, Math.max(0.25, settings.scale));
     return settings;
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -298,7 +300,7 @@ $("set-theme").addEventListener("change", (event) => shell.applyTheme(event.targ
 $("set-canvas").addEventListener("change", (event) => shell.applyCanvasTheme(event.target.value));
 $("set-scale").addEventListener("change", (event) => {
   state.settings.scale = Number(event.target.value) || 1;
-  renderer.setPixelRatioLimit?.(state.settings.scale);
+  renderer.setRenderScale?.(state.settings.scale);
   renderer.resize();
   saveSettings();
   scheduleRender(true);
@@ -465,9 +467,20 @@ function pickAtRelease(event) {
     if (surface) tools.addMeasurePoint(surface, at);
     return;
   }
-  const hit = renderer.pick(at.x, at.y, false);
+  const hit = renderer.pick(at.x, at.y, true);
   if (!hit) clearSelection();
-  else selectRecord(hit.record);
+  else {
+    // The clicked surface becomes the orbit and zoom centre.
+    if (hit.point) renderer.setPivot(hit.point);
+    selectRecord(hit.record);
+  }
+}
+
+/** Bring the inspector forward for a selection, unless an edit or session panel is in its place. */
+function revealSelectionPanel(panel) {
+  if (shell.panelVisible("editor") || shell.panelVisible("session")) return;
+  if (panel === "element") shell.setPanel("inspector", true);
+  else shell.setInspectorPanel("properties");
 }
 
 function selectExpressId(expressId, refresh = false) {
@@ -481,8 +494,7 @@ function selectRecord(record, refresh = false) {
       (selected.infoState === "pending" || selected.infoState === "ready")) {
     const panel = shell.inspectorPanel();
     if (!shell.panelVisible("inspector") || panel !== "element" && panel !== "properties") {
-      if (panel === "element") shell.setPanel("inspector", true);
-      else shell.setInspectorPanel("properties");
+      revealSelectionPanel(panel === "element" ? "element" : "properties");
     }
     return;
   }
@@ -509,8 +521,7 @@ function selectRecord(record, refresh = false) {
   const offset = pack.index.model_offset ?? [0, 0, 0];
   const toIfc = (point) => point.map((value, axis) => value + offset[axis]);
   // A user reading the element tab keeps it; anyone else lands on the properties.
-  if (shell.inspectorPanel() === "element") shell.setPanel("inspector", true);
-  else shell.setInspectorPanel("properties");
+  revealSelectionPanel(shell.inspectorPanel() === "element" ? "element" : "properties");
   inspector.showSelection({
     className,
     expressId,
@@ -665,11 +676,11 @@ function isIsolated(records) {
   return Boolean(state.isolated) && records.every((record) => state.isolated.has(record));
 }
 
+/** Undo every hide and isolation; the helper categories keep their own toggles. */
 function restoreVisibility() {
   state.hiddenClasses.clear();
   state.hiddenRecords.clear();
   state.shownRecords.clear();
-  state.hiddenInstanceFlags = 0;
   state.isolated = null;
   tree.markAllVisible();
   syncIsolation(false);
@@ -736,6 +747,9 @@ function scheduleVisibilityStats() {
     for (let record = 0; record < (instances?.count ?? 0); record += 1) if (isRecordVisible(record)) visible += 1;
     $("stat-visible").textContent = count(visible);
     $("stat-hidden").textContent = count(total - visible);
+    // The dock's show-all button lights up while a hide or an isolation is in force.
+    const restorable = state.hiddenRecords.size > 0 || state.hiddenClasses.size > 0 || Boolean(state.isolated);
+    $("dock-show-all").classList.toggle("attention", restorable);
   });
 }
 
@@ -781,6 +795,8 @@ function startWorker() {
         return receiveRevision(data);
       case "revision-error":
         return receiveRevisionError(data);
+      case "contested-triangles":
+        return receiveContestedTriangles(data);
       default:
         break;
     }
@@ -940,6 +956,48 @@ function setProgress(progress) {
   }
 }
 
+/**
+ * Ask the worker which triangles share a plane with another product. The renderer keeps
+ * the bounds-based overlay until the answer arrives, then redraws only those triangles.
+ */
+function requestContestedTriangles() {
+  const model = state.model;
+  if (!model || !state.worker || typeof renderer.applyContestedTriangles !== "function") return;
+  const { pack } = model;
+  const requestId = ++state.requestId;
+  model.overlayAnalysis = { requestId, state: "pending" };
+  // Copies, not views: a view would clone the whole chunk buffer behind it.
+  const geometries = pack.geometry.map((geometry) => ({
+    id: geometry.id,
+    positions: Float32Array.from(geometry.positions),
+    indices: geometry.indices.slice(),
+  }));
+  const instances = {
+    count: pack.instances.count,
+    transforms: pack.instances.transforms.slice(),
+    colors: pack.instances.colors.slice(),
+    geometryIds: pack.instances.geometryIds.slice(),
+    active: pack.instances.active ? pack.instances.active.slice() : null,
+  };
+  const transfer = [instances.transforms.buffer, instances.colors.buffer, instances.geometryIds.buffer];
+  if (instances.active) transfer.push(instances.active.buffer);
+  for (const geometry of geometries) transfer.push(geometry.positions.buffer, geometry.indices.buffer);
+  state.worker.postMessage({ type: "contested-triangles", requestId, modelId: model.modelId, instances, geometries }, transfer);
+}
+
+function receiveContestedTriangles(data) {
+  const model = state.model;
+  if (!model || model.overlayAnalysis?.requestId !== data.requestId) return;
+  if (data.error) {
+    model.overlayAnalysis = { requestId: data.requestId, state: "failed", error: data.error };
+    return;
+  }
+  renderer.applyContestedTriangles(data);
+  model.overlayAnalysis = { requestId: data.requestId, state: "ready", triangles: data.triangles.length, pairs: data.pairs, elapsedMs: data.elapsedMs };
+  inspector.setDisplayFacts(renderer);
+  scheduleRender(true);
+}
+
 /** Merge one streamed IGP chunk and draw it; the first chunk clears the previous model. */
 function receiveChunk(data) {
   // A damaged chunk ends this job, so a later one must never start a fresh assembler.
@@ -1055,6 +1113,7 @@ function showResult(data) {
     describeModel(data, pack, totalMs);
     scheduleRender(true);
     finishLoading();
+    requestContestedTriangles();
   } catch (error) {
     finishLoading();
     restoreModelLabel();
@@ -1119,7 +1178,7 @@ function describeModel(data, pack, totalMs) {
 function enableModelCommands(enabled) {
   for (const id of [
     "fit", "zoom-in", "zoom-out", "plan", "style", "measure", "section", "show-all", "export", "close",
-    "quality", "model-stats", "tree-expand", "tree-collapse", "update-ifc",
+    "quality", "model-stats", "properties", "element", "tree-expand", "tree-collapse", "update-ifc",
     "spaces", "openings", "references",
     "view:perspective", "view:top", "view:front", "view:right",
   ]) shell.setEnabled(id, enabled);
@@ -1166,6 +1225,7 @@ function clearModelUi() {
   $("status-offset").textContent = "";
   $("stat-visible").textContent = "0";
   $("stat-hidden").textContent = "0";
+  $("dock-show-all").classList.remove("attention");
   $("stat-classes").textContent = "0";
   $("gizmo-host").classList.add("hidden");
   $("hint-bar").classList.add("hidden");
@@ -1357,6 +1417,7 @@ function receiveProductGeometry(data) {
     state.model = { ...model, pack, index };
     const rebuilt = renderer.applyDelta(pack, result, isRecordVisible);
     state.model = { ...state.model, ...rebuilt };
+    requestContestedTriangles();
     tree.build(pack, model.hierarchy, index);
     tree.syncVisibility(isRecordVisible);
     syncHelperControls(pack);
@@ -1515,6 +1576,7 @@ function receiveRevision(data) {
     }
     state.model = { ...state.model, ...rendered,
       lastUpdate: { ...impact, ...data.timings, revision: data.revision, renderer: rendered.patchStats ?? null } };
+    if (result.changed) requestContestedTriangles();
     tree.build(pack, data.hierarchy, index);
     tree.syncVisibility(isRecordVisible);
     syncHelperControls(pack);
@@ -1645,7 +1707,7 @@ function fatal(message) {
 shell.applyTheme(shell.themeMode());
 // Both themes' canvas tokens are read while the page is still small, so a later switch reads nothing.
 for (const name of ["--canvas-light", "--canvas-dark", "--section-cap-light", "--section-cap-dark"]) cssToken(name);
-renderer.setPixelRatioLimit?.(state.settings.scale);
+renderer.setRenderScale?.(state.settings.scale);
 $("set-scale").value = String(state.settings.scale);
 syncAssistantFields();
 renderer.setAdaptiveResolution?.(state.settings.adaptive);

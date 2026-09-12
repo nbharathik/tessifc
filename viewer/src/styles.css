@@ -64,9 +64,8 @@
   --h-ribbon: calc(74px * var(--ui));
   --h-status: calc(25px * var(--ui));
   --w-outliner: calc(288px * var(--ui));
-  --w-inspector: calc(360px * var(--ui));
-  --w-editor: calc(300px * var(--ui));
-  --w-session: calc(360px * var(--ui));
+  /* one width for every right-side panel, so swapping them never resizes the viewport */
+  --w-side: calc(360px * var(--ui));
 
   --font: "Inter var", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --mono: "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
@@ -670,9 +669,16 @@ body.ribbon-collapsed #ribbon { height: 0; border-bottom: none; visibility: hidd
 }
 #workspace > * { grid-row: 1; }
 #outliner { grid-column: 1; width: var(--w-outliner); border-right: 1px solid var(--line); }
-#session { grid-column: 3; width: var(--w-session); border-left: 1px solid var(--line); animation: panel-in var(--base) var(--ease); }
-#editor { grid-column: 4; width: var(--w-editor); border-left: 1px solid var(--line); animation: panel-in var(--base) var(--ease); }
-#inspector { grid-column: 5; width: var(--w-inspector); border-left: 1px solid var(--line); }
+#session,
+#editor,
+#inspector {
+  width: var(--w-side);
+  border-left: 1px solid var(--line);
+  animation: panel-in var(--base) var(--ease);
+}
+#session { grid-column: 3; }
+#editor { grid-column: 4; }
+#inspector { grid-column: 5; }
 #session.collapsed,
 #editor.collapsed,
 #inspector.collapsed { display: none; }
@@ -1165,6 +1171,18 @@ body.measure-mode #viewport { cursor: crosshair; }
 .dock-sep { height: 1px; width: calc(15px * var(--ui)); margin: 3px 0; background: var(--line); flex: 0 0 auto; }
 #docks .icon-btn { width: calc(30px * var(--ui)); height: calc(30px * var(--ui)); }
 #docks .icon-btn svg { width: 16px; height: 16px; }
+/* a dot on the show-all button while something is hidden */
+#docks .icon-btn.attention { position: relative; color: var(--accent-hi); }
+#docks .icon-btn.attention::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
 #docks .icon-btn .glyph {
   font-family: var(--mono);
   font-size: calc(9.5px * var(--ui));
@@ -1651,7 +1669,7 @@ dialog::backdrop { background: var(--scrim); }
 /* -------------------------------------------------------------- narrow ui */
 
 @media (max-width: 1100px) {
-  :root { --w-inspector: calc(320px * var(--ui)); --w-outliner: calc(250px * var(--ui)); --w-editor: calc(280px * var(--ui)); --w-session: calc(320px * var(--ui)); }
+  :root { --w-side: calc(320px * var(--ui)); --w-outliner: calc(250px * var(--ui)); }
 }
 
 @media (max-width: 860px) {

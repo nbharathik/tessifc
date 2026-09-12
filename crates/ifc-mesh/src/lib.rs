@@ -20,6 +20,7 @@
 
 pub mod bsp;
 pub mod clip;
+pub mod locality;
 pub mod mesh;
 pub mod simplify;
 pub mod triangulate;
@@ -33,6 +34,7 @@ pub use clip::{
     intersection_general, intersection_general_or_reason, is_convex, union_general,
     union_general_or_reason,
 };
+pub use locality::{cache_miss_ratio, optimize_vertex_locality, optimize_vertex_locality_f32};
 pub use mesh::{Mesh64, face_normals, newell_normal};
 pub use simplify::{merge_coplanar, restore_boundary_vertices};
 pub use triangulate::{

@@ -1,0 +1,64 @@
+{
+  "name": "@tessifc/viewer",
+  "version": "0.1.0",
+  "description": "A minimal WebGL2 IFC viewer over the TessIFC kernel: open a file, stream its geometry, select, hide, section and frame; build your own interface on top",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./renderer": "./src/renderer.js",
+    "./stream": "./src/stream.js",
+    "./navigation": "./src/navigation.js",
+    "./measure": "./src/measure.js",
+    "./picking": "./src/picking.js",
+    "./culling": "./src/culling.js",
+    "./scheduler": "./src/scheduler.js",
+    "./depth-planes": "./src/depth-planes.js"
+  },
+  "sideEffects": false,
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "ifc",
+    "bim",
+    "viewer",
+    "webgl",
+    "tessifc"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/viewer"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/embed.test.mjs"
+  },
+  "dependencies": {
+    "@tessifc/edit": "0.1.0"
+  },
+  "peerDependencies": {
+    "@tessifc/core": "0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@tessifc/core": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

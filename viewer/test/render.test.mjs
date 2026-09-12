@@ -91,6 +91,9 @@ try {
   check(await page.evaluate(() => window.__tessifc.loadStatus().finished), 'a model without geometry reaches an explicit terminal state');
   await page.setInputFiles("#file-input", model);
   await page.waitForFunction(() => window.__tessifc.ready(), null, { timeout: 300_000 });
+  // The overlay assertions below measure the refined overlay, so wait for the plane analysis.
+  await page.waitForFunction(() => window.__tessifc.overlayReady(), null, { timeout: 120_000 });
+  check(await page.evaluate(() => Number.isInteger(window.__tessifc.renderer.displayInfo().depthOverlayTriangles)), "the worker's plane analysis refines the tie-break overlay to shared triangles");
   await page.waitForTimeout(800);
   await checkInteraction(page, check);
   await checkRenderWork(page, check);
@@ -127,6 +130,8 @@ try {
     !openingControl.disabled && openingControl.pressed === "false",
     "the opening control is enabled and reflects the hidden state",
   );
+  // The model helpers live on the View tab.
+  await page.click('[data-tab="view"]');
   await page.click("#cmd-openings");
   const shownOpenings = await page.evaluate(() => {
     const r = window.__tessifc.renderer;

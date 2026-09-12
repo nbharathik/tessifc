@@ -38,6 +38,7 @@ export async function instrumentViewer(page) {
       ready: () => Boolean(state.model),
       loadStatus: () => ({ state: state.loadOutcome, finished: !state.converting && state.loadOutcome !== "loading" }),
       streaming: () => Boolean(state.stream?.assembler),
+      overlayReady: () => state.model?.overlayAnalysis?.state === "ready",
     };\n` });
   });
 }

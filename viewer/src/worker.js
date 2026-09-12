@@ -5,6 +5,7 @@
 
 import init, { Kernel, version } from "../../bindings/wasm/pkg/tessifc_wasm.js";
 import { createScriptEngine, runScript as runModelScript } from "../../bindings/edit/src/script-engine.js";
+import { findContestedTriangles } from "../../bindings/viewer/src/depth-planes.js";
 
 let kernel;
 let activeModelId;
@@ -42,6 +43,7 @@ self.addEventListener("message", ({ data }) => {
   else if (data.type === "run-script") runScript(data);
   else if (data.type === "script-history") scriptHistory(data);
   else if (data.type === "export") exportModel(data);
+  else if (data.type === "contested-triangles") contestedTriangles(data);
   else if (data.type === "close") closeActiveModel();
 });
 
@@ -108,6 +110,22 @@ function convert({ jobId, buffer }) {
     if (modelId !== undefined) kernel.closeModel(modelId);
     activeModelId = previousModelId;
     self.postMessage({ type: "conversion-error", jobId, message: readableError(error) });
+  }
+}
+
+/** Which triangles share a plane with another product, for the renderer's tie-break overlay. */
+function contestedTriangles({ requestId, modelId, instances, geometries }) {
+  const started = performance.now();
+  try {
+    const byId = new Map(geometries.map((geometry) => [geometry.id, geometry]));
+    const result = findContestedTriangles({ instances }, byId);
+    self.postMessage(
+      { type: "contested-triangles", requestId, modelId, records: result.records, offsets: result.offsets,
+        triangles: result.triangles, pairs: result.pairs, exhausted: result.exhausted, elapsedMs: performance.now() - started },
+      [result.records.buffer, result.offsets.buffer, result.triangles.buffer],
+    );
+  } catch (error) {
+    self.postMessage({ type: "contested-triangles", requestId, modelId, error: readableError(error) });
   }
 }
 

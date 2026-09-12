@@ -141,6 +141,10 @@ jobs:
       - name: run navigation and browser pixel tests
         run: npm --prefix viewer test
 
+      # The package test needs the browser the viewer suite installed.
+      - name: run the embedded viewer package test
+        run: npm --prefix bindings/viewer test
+
       - name: test and build the static website
         run: |
           python -m unittest discover -s scripts -p 'test_*.py'
@@ -153,4 +157,5 @@ jobs:
         run: |
           npm pack ./bindings/wasm --dry-run
           npm pack ./bindings/edit --dry-run
+          npm pack ./bindings/viewer --dry-run
           npm pack ./adapters/three --dry-run

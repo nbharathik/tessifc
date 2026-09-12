@@ -50,7 +50,7 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           test "$tag" = "$version" || { echo "tag $tag != Cargo.toml $version"; exit 1; }
-          for manifest in bindings/wasm bindings/edit adapters/three; do
+          for manifest in bindings/wasm bindings/edit bindings/viewer adapters/three; do
             found=$(grep -m1 '"version"' "$manifest/package.json" | sed 's/.*"version": *"\([^"]*\)".*/\1/')
             test "$found" = "$tag" || { echo "$manifest/package.json is $found, tag is $tag"; exit 1; }
           done
@@ -159,6 +159,7 @@ jobs:
           mkdir -p dist
           (cd bindings/wasm && npm pack --pack-destination ../../dist)
           (cd bindings/edit && npm pack --pack-destination ../../dist)
+          (cd bindings/viewer && npm pack --pack-destination ../../dist)
           (cd adapters/three && npm pack --pack-destination ../../dist)
       - uses: actions/upload-artifact@v4
         with:
@@ -175,6 +176,7 @@ jobs:
           fi
           (cd bindings/wasm && npm publish --access public --provenance --tag preview)
           (cd bindings/edit && npm publish --access public --provenance --tag preview)
+          (cd bindings/viewer && npm publish --access public --provenance --tag preview)
           (cd adapters/three && npm publish --access public --provenance --tag preview)
 
   crates:

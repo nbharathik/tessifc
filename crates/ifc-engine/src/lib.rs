@@ -604,10 +604,17 @@ fn evaluate_one(ctx: &EvalCtx<'_>, registry: &Registry, model: &Model, id: u32) 
     let parts: Vec<ShapePart> = parts
         .into_iter()
         .filter(|part| !part.geometry.is_empty())
-        .map(|part| ShapePart {
-            geometry: part.geometry,
-            color: part.color.0,
-            provenance: part.provenance,
+        .map(|part| {
+            let mut geometry = part.geometry;
+            // Shared meshes are reordered once each, when they are packed.
+            if let PartGeometry::Unique(mesh) = &mut geometry {
+                tessifc_mesh::optimize_vertex_locality(mesh);
+            }
+            ShapePart {
+                geometry,
+                color: part.color.0,
+                provenance: part.provenance,
+            }
         })
         .collect();
     let first = parts.first()?;

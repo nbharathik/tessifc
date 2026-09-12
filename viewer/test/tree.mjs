@@ -114,6 +114,32 @@ export async function checkTree(page, check) {
   await rowsAgree("after showing everything again");
   await page.evaluate(() => { document.getElementById("tree-spatial").style.maxHeight = ""; });
 
+  // Show all undoes hides and isolations only; a helper category stays as its toggle says.
+  const restored = await page.evaluate(async () => {
+    const T = window.__tessifc, r = T.renderer;
+    const openings = [];
+    for (let record = 0; record < r.pack.instances.count; record += 1) if (r.pack.instances.flags[record] & (1 << 1)) openings.push(record);
+    const selected = T.state.selection?.records ?? [];
+    T.shell.run("hide");
+    await new Promise(requestAnimationFrame);
+    const dotWhileHidden = document.getElementById("dock-show-all").classList.contains("attention");
+    const hiddenSelection = selected.every((record) => r.visibility[record * 2] === 0);
+    document.getElementById("dock-show-all").click();
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    return {
+      dotWhileHidden,
+      hiddenSelection,
+      selectionBack: selected.every((record) => r.visibility[record * 2] === 255),
+      openingsStillHidden: openings.length > 0 && openings.every((record) => r.visibility[record * 2] === 0),
+      togglePressed: document.getElementById("cmd-openings").getAttribute("aria-pressed"),
+      dotAfter: document.getElementById("dock-show-all").classList.contains("attention"),
+    };
+  });
+  check(restored.dotWhileHidden && restored.hiddenSelection, "the dock's show-all button lights up while a hide is in force");
+  check(restored.selectionBack && !restored.dotAfter, "show all brings the hidden element back and the dot goes out");
+  check(restored.openingsStillHidden && restored.togglePressed === "false", "show all leaves openings hidden because their toggle is off");
+
   const keyboard = await page.evaluate(() => {
     const first = document.querySelector("#tree-spatial .tnode");
     first.focus();

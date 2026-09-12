@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TessIFC · embedded viewer example</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; overflow: hidden;
+    font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #1b1d21; color: #e8e8ea;
+  }
+  #host { position: fixed; inset: 0; }
+  #drop {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: #1b1d21; z-index: 10; text-align: center; padding: 2rem;
+  }
+  #drop.hidden { display: none; }
+  #drop h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 .5rem; }
+  #drop p { margin: .25rem 0; color: #9a9ba0; }
+  #drop.over { outline: 2px dashed #6ea8fe; outline-offset: -1rem; }
+  #bar {
+    position: fixed; top: 12px; left: 12px; display: flex; gap: 6px; flex-wrap: wrap;
+    padding: 8px; background: #24262bcc; border: 1px solid #34363d; border-radius: 8px;
+    backdrop-filter: blur(6px);
+  }
+  #bar button {
+    font: inherit; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    background: #2f3238; color: inherit; border: 1px solid #3f434b;
+  }
+  #bar button:hover { background: #3a3e46; }
+  #status {
+    position: fixed; bottom: 12px; left: 12px; padding: 6px 10px; color: #c8c9ce;
+    background: #24262bcc; border: 1px solid #34363d; border-radius: 8px; font-variant-numeric: tabular-nums;
+  }
+</style>
+</head>
+<body>
+
+<div id="host"></div>
+
+<div id="drop">
+  <div>
+    <h1>TessIFC · embedded viewer</h1>
+    <p>Drop an <code>.ifc</code> file here, or click to choose one.</p>
+    <p style="margin-top:1rem"><small>Everything runs in this tab. Nothing is uploaded.</small></p>
+    <input type="file" id="file" accept=".ifc" hidden>
+  </div>
+</div>
+
+<div id="bar" hidden>
+  <button id="fit">Fit</button>
+  <button id="focus">Focus</button>
+  <button id="top">Top</button>
+  <button id="iso">3D</button>
+  <button id="style">Style</button>
+  <button id="hide">Hide</button>
+  <button id="isolate">Isolate</button>
+  <button id="show-all">Show all</button>
+  <button id="section">Section</button>
+</div>
+<div id="status" hidden>-</div>
+
+<!-- With a bundler these are the bare package names; served from a checkout
+     the map points them at the source directories. -->
+<script type="importmap">
+{
+  "imports": {
+    "@tessifc/core/web": "../../bindings/wasm/pkg/tessifc_wasm.js",
+    "@tessifc/edit/igp": "../../bindings/edit/src/igp.js",
+    "@tessifc/viewer": "../../bindings/viewer/src/index.js"
+  }
+}
+</script>
+<script type="module">
+import init, { Kernel } from "@tessifc/core/web";
+import { createViewer, STYLES } from "@tessifc/viewer";
+
+await init();
+const kernel = new Kernel();
+const viewer = createViewer(document.getElementById("host"), { kernel, theme: "dark" });
+window.tessifcViewer = viewer;
+
+const $ = (id) => document.getElementById(id);
+const status = (text) => { $("status").hidden = false; $("status").textContent = text; };
+
+viewer.on("progress", ({ done, total, triangles }) => status(`${done} of ${total} products, ${triangles.toLocaleString()} triangles`));
+viewer.on("load", ({ info, summary }) => {
+  $("bar").hidden = false;
+  status(`${info.schema}: ${summary.products.toLocaleString()} products, ${summary.triangles.toLocaleString()} triangles`);
+});
+viewer.on("select", (selection) => {
+  if (!selection) return;
+  const pack = viewer.pack();
+  const record = selection.records[0];
+  status(`#${selection.expressIds[0]} ${pack.index.classes[pack.instances.classIds[record]]}`);
+});
+
+async function openFile(file) {
+  $("drop").classList.add("hidden");
+  status(`Reading ${file.name}`);
+  try {
+    await viewer.open(file);
+  } catch (error) {
+    status(String(error?.message ?? error));
+    $("drop").classList.remove("hidden");
+  }
+}
+
+$("drop").addEventListener("click", () => $("file").click());
+$("file").addEventListener("change", (event) => { if (event.target.files[0]) openFile(event.target.files[0]); });
+window.addEventListener("dragover", (event) => { event.preventDefault(); $("drop").classList.add("over"); });
+window.addEventListener("dragleave", () => $("drop").classList.remove("over"));
+window.addEventListener("drop", (event) => {
+  event.preventDefault();
+  $("drop").classList.remove("over");
+  if (event.dataTransfer.files[0]) openFile(event.dataTransfer.files[0]);
+});
+
+let style = 0;
+let sectioned = false;
+$("fit").addEventListener("click", () => viewer.fit());
+$("focus").addEventListener("click", () => viewer.focus());
+$("top").addEventListener("click", () => viewer.setView("top"));
+$("iso").addEventListener("click", () => viewer.setView("perspective"));
+$("style").addEventListener("click", () => viewer.setStyle(STYLES[(style = (style + 1) % STYLES.length)]));
+$("hide").addEventListener("click", () => viewer.hide(viewer.selection()?.expressIds ?? []));
+$("isolate").addEventListener("click", () => viewer.isolate(viewer.selection()?.expressIds ?? null));
+$("show-all").addEventListener("click", () => viewer.showAll());
+$("section").addEventListener("click", () => viewer.setSection((sectioned = !sectioned) ? { axis: "z", fraction: 0.6 } : null));
+</script>
+</body>
+</html>

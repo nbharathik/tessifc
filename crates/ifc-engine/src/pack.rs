@@ -216,11 +216,11 @@ impl Packer {
                             return;
                         }
                         let closed = Some(mesh.closed.unwrap_or_else(|| mesh.is_edge_manifold()));
-                        let id = self.writer.add_geometry_owned_closed(
-                            positions,
-                            mesh.indices.clone(),
-                            closed,
-                        );
+                        let (positions, indices) =
+                            tessifc_mesh::optimize_vertex_locality_f32(&positions, &mesh.indices);
+                        let id = self
+                            .writer
+                            .add_geometry_owned_closed(positions, indices, closed);
                         self.shared.insert(key, id);
                         id
                     }

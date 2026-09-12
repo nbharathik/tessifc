@@ -98,9 +98,14 @@ console.log("ok    every published test suite takes its model from the environme
 const html = readFileSync(resolve(repo, "viewer", "index.html"), "utf8");
 // Source guards read the app modules as one blob, wherever a rule's code lives.
 const SEPARATOR = String.fromCharCode(10);
-const appModules = ["main.js", "shell.js", "tree.js", "inspector.js", "tools.js", "format.js", "boot.js", "stream.js", "measure.js"];
-const app = appModules.map((name) => readFileSync(resolve(repo, "viewer", "src", name), "utf8")).join(SEPARATOR);
-const renderer = readFileSync(resolve(repo, "viewer", "src", "renderer.js"), "utf8");
+// The renderer and its helpers live in the viewer package; the application modules stay in viewer/src.
+const appModules = ["main.js", "shell.js", "tree.js", "inspector.js", "tools.js", "boot.js"];
+const packageModules = ["format.js", "stream.js", "measure.js"];
+const app = [
+  ...appModules.map((name) => readFileSync(resolve(repo, "viewer", "src", name), "utf8")),
+  ...packageModules.map((name) => readFileSync(resolve(repo, "bindings", "viewer", "src", name), "utf8")),
+].join(SEPARATOR);
+const renderer = readFileSync(resolve(repo, "bindings", "viewer", "src", "renderer.js"), "utf8");
 const worker = readFileSync(resolve(repo, "viewer", "src", "worker.js"), "utf8");
 const packageJson = JSON.parse(readFileSync(resolve(repo, "viewer", "package.json"), "utf8"));
 
@@ -111,9 +116,12 @@ for (const [, id] of app.matchAll(/\$\("([^"]+)"\)/g)) {
 }
 console.log("ok    viewer controls resolve to unique HTML elements");
 
-for (const tab of ["file", "home", "view", "analyze", "review"]) {
+for (const tab of ["file", "home", "view", "analyze"]) {
   assert.match(html, new RegExp(`data-tab="${tab}"`), `ribbon must expose the ${tab} task`);
 }
+assert.doesNotMatch(html, /data-tab="review"/, "the ribbon has four tasks; review folded into analyze");
+const commandIds = [...html.matchAll(/id="(cmd-[a-z-]+)"/g)].map((match) => match[1]);
+assert.equal(new Set(commandIds).size, commandIds.length, "no command appears twice in the ribbon");
 for (const view of ["spatial", "types"]) {
   assert.match(html, new RegExp(`data-outliner="${view}"`), `outliner must expose the ${view} view`);
 }
@@ -701,10 +709,16 @@ console.log("ok    measurements snap to corners and edges and copy as text");
 
 assert.match(
   app,
-  /addEventListener\("pointerup", pickAtRelease\)[\s\S]*function pickAtRelease\(event\) \{[\s\S]*?const hit = renderer\.pick\(at\.x, at\.y, false\);/,
+  /addEventListener\("pointerup", pickAtRelease\)[\s\S]*function pickAtRelease\(event\) \{[\s\S]*?const hit = renderer\.pick\(at\.x, at\.y, true\);/,
   "a click selects in the release handler itself, so the release frame and the selection share one render",
 );
+assert.match(app, /if \(hit\.point\) renderer\.setPivot\(hit\.point\);/, "a click moves the orbit and zoom centre to the surface it hit");
+assert.match(renderer, /setPivot\(point\) \{[\s\S]*?this\.camera\.target = add\(this\.camera\.position, scale\(forward, depth\)\);/, "the pivot slides along the view axis so the click never turns the camera");
 assert.doesNotMatch(app, /uiTasks\.post\(\(\) => performPick/, "selection must not be queued behind the release frame");
+assert.match(worker, /findContestedTriangles\(\{ instances \}, byId\)/, "the worker runs the coincident-plane analysis off the main thread");
+assert.match(app, /function requestContestedTriangles\(\)[\s\S]*?Float32Array\.from\(geometry\.positions\)/, "the analysis request copies geometry instead of cloning whole chunk buffers");
+assert.match(renderer, /drawBatch\(batch, false, this\.uniforms, Boolean\(batch\.overlay\)\)/, "the overlay draws a batch's contested triangles when it has them");
+assert.match(renderer, /const next = prepass && batch\.depthContested && !batch\.overlayResolved;/, "the depth-only base pass applies only to whole-record overlays");
 assert.doesNotMatch(renderer, /pick\(clientX, clientY, includePoint = true\) \{[\s\S]{0,400}?this\.dirty = true;/, "picking changes no pixel, so it must not ask for a frame");
 assert.match(
   app,

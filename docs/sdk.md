@@ -11,11 +11,12 @@ interfaces. Start with the [local build](getting-started.md) and read the
 |---|---|---|---|
 | `@tessifc/core` | npm | The WebAssembly kernel and its TypeScript declarations. Browser and Node builds. | preview |
 | `@tessifc/edit` | npm | The editing session, browser scripts, the IGP reader and agent tools over the kernel. | preview |
+| `@tessifc/viewer` | npm | The WebGL2 renderer behind the reference viewer as an embeddable component: open, stream, select, hide, section, frame. | preview |
 | `@tessifc/three` | npm | Shape arrays to three.js meshes, a retained scene that applies deltas, camera fitting and cleanup. | preview |
 | `tessifc-session` | source only | The optional Python editing session behind the viewer's Session panel. | preview |
 | `tessifc-cli` | crates.io | The `tessifc` binary: `info`, `convert`, `edit`, `coverage`. | preview |
 | `tessifc-step`, `-schema`, `-model`, `-geom`, `-mesh`, `-pack`, `-engine` | crates.io | The kernel crates, for Rust hosts and for people writing evaluators. | preview |
-| the viewer | GitHub Pages | The reference application over `@tessifc/core`. | preview |
+| the viewer | GitHub Pages | The reference application over `@tessifc/core` and `@tessifc/viewer`. | preview |
 
 All packages are versioned together. A release is one tag and one set of
 artefacts on the GitHub Releases page.
@@ -26,7 +27,7 @@ artefacts on the GitHub Releases page.
 flowchart TB
     app["Your application<br/>viewer, checker, pipeline, agent"]
     edit["@tessifc/edit<br/>sessions, scripts, deltas, agent tools"]
-    adapters["Adapters<br/>@tessifc/three, your renderer"]
+    adapters["Renderers<br/>@tessifc/viewer, @tessifc/three, your own"]
     igp["IGP<br/>the container every layer speaks"]
     core["@tessifc/core / tessifc CLI / Rust crates<br/>parse, evaluate, stream, edit"]
     app --> edit --> core
@@ -386,6 +387,29 @@ drives any `complete` function until the model answers. [Agents and
 pipelines](agents.md) walks through it. The viewer's assistant is one client
 of these; its provider adapters are in `viewer/src/assistant.js`.
 
+### The embeddable viewer
+
+`createViewer(container, { kernel })` from `@tessifc/viewer` puts the
+reference viewer's renderer in any element with a small API and no chrome:
+`open(file)` streams geometry as the kernel produces it, `select`, `hide`,
+`isolate`, `showAll`, `focus`, `setView`, `setStyle` and `setSection` take
+express ids and plain values, `pick` answers a pointer, and `on` reports
+`load`, `progress`, `select`, `visibility` and `camera`. `loadPack` shows an
+IGP pack from any producer, so a host that already runs the kernel in a
+worker feeds the view without a second parse. `viewer.renderer` is the
+`IfcRenderer` underneath for anything the API leaves out. The package README
+lists every call; `examples/embed-viewer/` is a complete page.
+
+```js
+import init, { Kernel } from "@tessifc/core/web";
+import { createViewer } from "@tessifc/viewer";
+
+await init();
+const viewer = createViewer(host, { kernel: new Kernel() });
+viewer.on("select", (selection) => showProperties(selection?.expressIds[0]));
+const { hierarchy } = await viewer.open(file);
+```
+
 ### three.js
 
 `createRetainedModel(THREE, pack)` from `@tessifc/three` builds one mesh per
@@ -544,7 +568,9 @@ interface GeometryBackend {
 ```
 
 Implement it once over your current engine and once over `@tessifc/core`,
-ship a toggle, and diff the two on the same files.
+ship a toggle, and diff the two on the same files. A host that has no
+renderer yet starts from `@tessifc/viewer` instead and builds its interface
+around the events and calls above.
 
 ## Preview feedback
 

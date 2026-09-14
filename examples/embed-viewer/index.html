@@ -84,6 +84,7 @@ await init();
 const kernel = new Kernel();
 const viewer = createViewer(document.getElementById("host"), { kernel, theme: "dark" });
 window.tessifcViewer = viewer;
+window.tessifcKernel = kernel;
 
 const $ = (id) => document.getElementById(id);
 const status = (text) => { $("status").hidden = false; $("status").textContent = text; };

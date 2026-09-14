@@ -23,7 +23,10 @@ const check = (condition, message) => {
 };
 
 const server = await serveViewer();
-const browser = await chromium.launch({ channel: process.env.TESSIFC_BROWSER_CHANNEL || undefined, args: ["--use-angle=d3d11", "--use-gl=angle"] });
+const browser = await chromium.launch({
+  channel: process.env.TESSIFC_BROWSER_CHANNEL || undefined,
+  args: ["--use-angle=swiftshader", "--use-gl=angle", "--enable-unsafe-swiftshader"],
+});
 const errors = [];
 try {
   const page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
@@ -34,9 +37,11 @@ try {
 
   await page.evaluate(() => {
     const v = window.tessifcViewer;
-    window.__events = { load: 0, progress: 0, select: [], visibility: [] };
+    window.__events = { load: 0, progress: 0, close: 0, overlay: [], select: [], visibility: [] };
     v.on("load", () => { window.__events.load += 1; });
     v.on("progress", () => { window.__events.progress += 1; });
+    v.on("close", () => { window.__events.close += 1; });
+    v.on("overlay", (detail) => { window.__events.overlay.push(detail); });
     v.on("select", (selection) => { window.__events.select.push(selection ? selection.expressIds : null); });
     v.on("visibility", (detail) => { window.__events.visibility.push(detail); });
   });
@@ -60,8 +65,19 @@ try {
   check(loaded.progress >= 1, `progress events arrive while streaming (${loaded.progress})`);
   check(loaded.hierarchy > 0 && Number.isInteger(loaded.modelId), "the kernel's hierarchy and model id are exposed");
   await page.waitForFunction(() => window.tessifcViewer.overlayState() !== "pending", null, { timeout: 60_000 });
-  const overlay = await page.evaluate(() => ({ state: window.tessifcViewer.overlayState(), triangles: window.tessifcViewer.renderer.displayInfo().depthOverlayTriangles }));
+  const overlay = await page.evaluate(() => {
+    const v = window.tessifcViewer, r = v.renderer;
+    const state = v.overlayState(), triangles = r.displayInfo().depthOverlayTriangles;
+    const overlaid = r.contestedOpaqueBatches.length;
+    // An analysis that ran out of budget must leave the bounds overlay as it is.
+    const empty = { records: new Uint32Array(0), offsets: new Uint32Array([0]), triangles: new Uint32Array(0), exhausted: true };
+    const refused = r.applyContestedTriangles(empty) === false;
+    const kept = r.displayInfo().depthOverlayTriangles === triangles && r.contestedOpaqueBatches.length === overlaid;
+    return { state, triangles, events: window.__events.overlay, refused, kept };
+  });
   check(overlay.state === "ready" && Number.isInteger(overlay.triangles), `the overlay is refined to shared planes by the package worker (${overlay.state}, ${overlay.triangles} triangles)`);
+  check(overlay.events.length === 1 && overlay.events[0].state === overlay.state && overlay.events[0].triangles === overlay.triangles, "one overlay event reports the settled state");
+  check(overlay.refused && overlay.kept, "an exhausted analysis is refused and the overlay stays as it was");
   check(loaded.barShown && loaded.canvas[0] > 0, "the example page reacts to the load event and the canvas has a size");
 
   const api = await page.evaluate(() => {
@@ -132,15 +148,43 @@ try {
   check(afterClick.selection !== null, `a click selects the product under it (#${afterClick.selection?.expressIds[0]})`);
   check(afterClick.turned < 1e-9 && afterClick.distance !== afterClick.before, "the click moves the pivot to the surface depth without turning the camera");
 
+  // A second open while the first is still streaming wins; the first releases its kernel model.
+  const raced = await page.evaluate(async () => {
+    const v = window.tessifcViewer, kernel = window.tessifcKernel;
+    const bytes = new Uint8Array(await document.getElementById("file").files[0].arrayBuffer());
+    const loads = window.__events.load, closes = window.__events.close;
+    const first = v.open(bytes);
+    await new Promise((resolve) => { const off = v.on("progress", () => { off(); resolve(); }); });
+    const second = v.open(bytes.slice());
+    const [a, b] = await Promise.all([first, second]);
+    return { first: a, second: b !== null && v.modelId() === b.modelId, models: kernel.modelCount(), loads: window.__events.load - loads, closes: window.__events.close - closes };
+  });
+  check(raced.first === null && raced.second, "an open superseded mid-stream resolves null and the later one owns the view");
+  check(raced.models === 1 && raced.loads === 1 && raced.closes === 2, `a superseded open closes its kernel model and emits no load; the model on screen and the abandoned stream each emit close (${raced.models} model, ${raced.loads} load, ${raced.closes} close)`);
+
   const closed = await page.evaluate(() => {
     const v = window.tessifcViewer;
     v.close();
-    const emptied = v.pack() === null && v.renderer.batches.length === 0;
+    const emptied = v.pack() === null && v.renderer.batches.length === 0 && window.tessifcKernel.modelCount() === 0;
     v.dispose();
     return { emptied, canvasGone: !document.getElementById("host").querySelector("canvas") };
   });
   check(closed.emptied, "close drops the model from the view and the kernel");
   check(closed.canvasGone, "dispose removes the canvas");
+
+  // Without the worker the overlay event still settles, so a host waiting on it is not left hanging.
+  const plain = await page.evaluate(async () => {
+    const { createViewer } = await import("../../bindings/viewer/src/index.js");
+    const v = createViewer(document.getElementById("host"), { kernel: window.tessifcKernel, coincidence: false });
+    const events = [];
+    v.on("overlay", (detail) => events.push(detail));
+    await v.open(document.getElementById("file").files[0]);
+    const state = v.overlayState();
+    v.dispose();
+    return { state, events, models: window.tessifcKernel.modelCount() };
+  });
+  check(plain.state === "off" && plain.events.length === 1 && plain.events[0].state === "off", `coincidence: false reports the overlay as off (${plain.state})`);
+  check(plain.models === 0, "dispose closes the kernel model");
   check(errors.length === 0, `no page errors (${errors.join("; ")})`);
 } finally {
   await browser.close();

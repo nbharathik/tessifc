@@ -107,6 +107,7 @@ const app = [
 ].join(SEPARATOR);
 const renderer = readFileSync(resolve(repo, "bindings", "viewer", "src", "renderer.js"), "utf8");
 const worker = readFileSync(resolve(repo, "viewer", "src", "worker.js"), "utf8");
+const embed = readFileSync(resolve(repo, "bindings", "viewer", "src", "contested-worker.js"), "utf8");
 const packageJson = JSON.parse(readFileSync(resolve(repo, "viewer", "package.json"), "utf8"));
 
 const htmlIds = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
@@ -718,6 +719,11 @@ assert.doesNotMatch(app, /uiTasks\.post\(\(\) => performPick/, "selection must n
 assert.match(worker, /findContestedTriangles\(\{ instances \}, byId\)/, "the worker runs the coincident-plane analysis off the main thread");
 assert.match(app, /function requestContestedTriangles\(\)[\s\S]*?Float32Array\.from\(geometry\.positions\)/, "the analysis request copies geometry instead of cloning whole chunk buffers");
 assert.match(renderer, /drawBatch\(batch, false, this\.uniforms, Boolean\(batch\.overlay\)\)/, "the overlay draws a batch's contested triangles when it has them");
+assert.match(renderer, /applyContestedTriangles\(result\) \{[\s\S]*?\|\| result\.exhausted\) return false;/, "an analysis that ran out of budget must not empty the overlay");
+assert.match(app, /if \(data\.exhausted\) \{[\s\S]*?state: "exhausted"[\s\S]*?return;[\s\S]*?renderer\.applyContestedTriangles\(data\);/, "the application keeps the bounds overlay when the analysis gives up");
+assert.match(worker, /exhausted: result\.exhausted/, "the worker reports an exhausted analysis instead of an empty one");
+assert.match(embed, /exhausted: result\.exhausted/, "the package worker reports an exhausted analysis too");
+assert.match(renderer, /batch\.gpuBytes \+= indices\.byteLength;[\s\S]{0,80}this\.gpuBufferBytes \+= indices\.byteLength;\n  \}/, "overlay index bytes are counted on the batch so a delta's recount keeps them");
 assert.match(renderer, /const next = prepass && batch\.depthContested && !batch\.overlayResolved;/, "the depth-only base pass applies only to whole-record overlays");
 assert.doesNotMatch(renderer, /pick\(clientX, clientY, includePoint = true\) \{[\s\S]{0,400}?this\.dirty = true;/, "picking changes no pixel, so it must not ask for a frame");
 assert.match(

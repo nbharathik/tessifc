@@ -1039,10 +1039,11 @@ export class IfcRenderer {
    * Take the plane analysis (`findContestedTriangles`): every opaque batch gets an index
    * buffer holding only its triangles on a plane another product shares, and the overlay
    * redraws those instead of whole records. Batches built later fall back to the whole
-   * record until the next analysis.
+   * record until the next analysis. An analysis that ran out of budget is refused, since
+   * its empty table would switch the overlay off. Returns whether the table was taken.
    */
   applyContestedTriangles(result) {
-    if (!this.pack || !result?.records || !result.offsets || !result.triangles) return;
+    if (!this.pack || !result?.records || !result.offsets || !result.triangles || result.exhausted) return false;
     const byRecord = new Map();
     for (let i = 0; i < result.records.length; i += 1) byRecord.set(result.records[i], [result.offsets[i], result.offsets[i + 1]]);
     this.contestedTriangles = { byRecord, triangles: result.triangles };
@@ -1052,6 +1053,7 @@ export class IfcRenderer {
       .filter((batch) => this.batchNeedsOverlay(batch))
       .sort((left, right) => left.depthRank - right.depthRank || left.sourceRecord - right.sourceRecord);
     this.dirty = true;
+    return true;
   }
 
   /** The overlay index buffer of one batch from the contested triangle table, or none. */
@@ -1060,6 +1062,7 @@ export class IfcRenderer {
     if (batch.overlay) {
       gl.deleteBuffer(batch.overlay.buffer);
       batch.buffers = batch.buffers.filter((buffer) => buffer !== batch.overlay.buffer);
+      batch.gpuBytes -= batch.overlay.bytes;
       this.gpuBufferBytes -= batch.overlay.bytes;
     }
     batch.overlay = null;
@@ -1100,6 +1103,8 @@ export class IfcRenderer {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
     batch.overlay = { buffer, count: indices.length, bytes: indices.byteLength };
     batch.buffers.push(buffer);
+    // On the batch as well, so a delta's recount of batch bytes keeps the overlay.
+    batch.gpuBytes += indices.byteLength;
     this.gpuBufferBytes += indices.byteLength;
   }
 

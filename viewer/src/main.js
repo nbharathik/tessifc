@@ -992,6 +992,11 @@ function receiveContestedTriangles(data) {
     model.overlayAnalysis = { requestId: data.requestId, state: "failed", error: data.error };
     return;
   }
+  // Past its budget the analysis has no answer; the bounds overlay stays.
+  if (data.exhausted) {
+    model.overlayAnalysis = { requestId: data.requestId, state: "exhausted", elapsedMs: data.elapsedMs };
+    return;
+  }
   renderer.applyContestedTriangles(data);
   model.overlayAnalysis = { requestId: data.requestId, state: "ready", triangles: data.triangles.length, pairs: data.pairs, elapsedMs: data.elapsedMs };
   inspector.setDisplayFacts(renderer);

@@ -72,6 +72,14 @@ const glass = [40, 40, 200, 90];
   assert.equal(result.triangles.length, 4);
 }
 
+// Past the pair-test budget the analysis reports that it gave up rather than a half answer.
+{
+  const result = findContestedTriangles(pack([[0, 0, 0], [1, 0, 0], [0, 0, 1]], [red, blue, blue]), geometries, { maxPairTests: 1 });
+  assert.equal(result.exhausted, true);
+  assert.equal(result.records.length, 0, "an exhausted analysis names no records, so a caller cannot mistake it for a refined one");
+  assert.deepEqual([...result.offsets], [0]);
+}
+
 // Both sides of a face share one key; a degenerate triangle has none; a shifted plane differs.
 {
   const key = planeKey(0, 0, 0, 1, 0, 0, 0, 1, 0);

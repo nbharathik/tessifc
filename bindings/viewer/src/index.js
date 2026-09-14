@@ -149,16 +149,21 @@ export function createViewer(container, options = {}) {
   // triangles that really share a plane with another product and the overlay shrinks to those.
   let overlayWorker = null;
   let overlayRequest = 0;
+  function settleOverlay(current, state, triangles = 0) {
+    current.overlay = state;
+    emit("overlay", { state, triangles });
+  }
   function refineOverlay() {
     const current = model;
-    if (!current || options.coincidence === false || typeof Worker === "undefined") {
-      if (current) current.overlay = "off";
+    if (!current) return;
+    if (options.coincidence === false || typeof Worker === "undefined") {
+      settleOverlay(current, "off");
       return;
     }
     try {
       overlayWorker ??= new Worker(new URL("./contested-worker.js", import.meta.url), { type: "module" });
     } catch {
-      current.overlay = "off";
+      settleOverlay(current, "off");
       return;
     }
     const { pack } = current;
@@ -179,34 +184,53 @@ export function createViewer(container, options = {}) {
     const transfer = [instances.transforms.buffer, instances.colors.buffer, instances.geometryIds.buffer];
     if (instances.active) transfer.push(instances.active.buffer);
     for (const geometry of geometries) transfer.push(geometry.positions.buffer, geometry.indices.buffer);
-    overlayWorker.onmessage = ({ data }) => {
+    const worker = overlayWorker;
+    worker.onmessage = ({ data }) => {
       if (disposed || model !== current || data.requestId !== requestId) return;
-      current.overlay = data.error ? "failed" : "ready";
-      if (!data.error) {
+      if (data.error) {
+        settleOverlay(current, "failed");
+      } else if (data.exhausted) {
+        // Past its budget the analysis has no answer; whole products stay in the overlay.
+        settleOverlay(current, "exhausted");
+      } else {
         renderer.applyContestedTriangles(data);
         requestFrame(true);
+        settleOverlay(current, "ready", data.triangles.length);
       }
-      emit("overlay", { state: current.overlay, triangles: data.triangles?.length ?? 0 });
     };
-    overlayWorker.onerror = () => {
-      if (model === current) current.overlay = "failed";
+    worker.onerror = () => {
+      worker.terminate();
+      if (overlayWorker === worker) overlayWorker = null;
+      if (!disposed && model === current && current.overlay === "pending") settleOverlay(current, "failed");
     };
-    overlayWorker.postMessage({ requestId, instances, geometries }, transfer);
+    worker.postMessage({ requestId, instances, geometries }, transfer);
   }
 
   // --------------------------------------------------------------- loading
+
+  // Each open, loadPack, close and dispose starts a generation; an open still
+  // streaming from an older one stops at its next chunk and releases its kernel model.
+  let loadGeneration = 0;
+  let streaming = false;
 
   /**
    * Parse an IFC file (a `File`, `Blob`, `ArrayBuffer` or `Uint8Array`) with
    * the kernel and stream its geometry into the view. Resolves with the model
    * id, the kernel's model info, the geometry summary and the spatial
-   * hierarchy. The kernel keeps the model open for inspection until `close`.
+   * hierarchy, or with `null` when another `open`, `loadPack`, `close` or
+   * `dispose` superseded it before it finished. The kernel keeps the model
+   * open for inspection until `close`.
    */
   async function open(source, openOptions = {}) {
     const kernel = openOptions.kernel ?? options.kernel;
     if (!kernel) throw new Error("open needs a kernel: pass one to createViewer or to open");
+    let generation = ++loadGeneration;
+    const superseded = () => disposed || generation !== loadGeneration;
     const bytes = await toBytes(source);
+    if (superseded()) return null;
     close();
+    generation = loadGeneration;
+    streaming = true;
     let modelId;
     try {
       modelId = kernel.openModel(bytes, openOptions.modelSettings ? JSON.stringify(openOptions.modelSettings) : undefined);
@@ -224,7 +248,7 @@ export function createViewer(container, options = {}) {
         summary = JSON.parse(kernel.beginGeometryStream(modelId, settings));
         let budget = FIRST_CHUNK_MS;
         let chunk;
-        while (!disposed && (chunk = kernel.nextGeometryChunk(modelId, budget, 0, CHUNK_TRIANGLES))) {
+        while (!superseded() && (chunk = kernel.nextGeometryChunk(modelId, budget, 0, CHUNK_TRIANGLES))) {
           const { from, to } = assembler.append(readIgp(chunk));
           const pack = assembler.pack();
           renderer.appendStream(pack, from, to, visibleIn(pack));
@@ -245,10 +269,12 @@ export function createViewer(container, options = {}) {
         const pack = assembler.pack();
         renderer.appendStream(pack, from, to, visibleIn(pack));
       }
-      if (disposed) {
+      if (superseded()) {
+        // The view already belongs to the newer load; only the kernel model is ours.
         kernel.closeModel(modelId);
         return null;
       }
+      streaming = false;
       const pack = assembler.pack();
       if (!pack.instances.count || !pack.geometry.length) {
         renderer.clear();
@@ -260,8 +286,11 @@ export function createViewer(container, options = {}) {
       return { modelId, info, summary, hierarchy };
     } catch (error) {
       if (modelId !== undefined) kernel.closeModel(modelId);
-      renderer.clear();
-      model = null;
+      if (!superseded()) {
+        streaming = false;
+        renderer.clear();
+        model = null;
+      }
       throw error;
     }
   }
@@ -282,11 +311,17 @@ export function createViewer(container, options = {}) {
 
   /** Drop the model from the view and, when the kernel opened it, from the kernel. */
   function close() {
-    if (!model) return;
-    const { kernel, modelId } = model;
+    loadGeneration += 1;
+    if (!model && !streaming) return;
+    const kernel = model?.kernel;
+    const modelId = model?.modelId;
     model = null;
+    streaming = false;
     resetState();
     renderer.clear();
+    // A stale analysis would only delay the next model's; the worker is cheap to restart.
+    overlayWorker?.terminate();
+    overlayWorker = null;
     if (kernel && modelId !== null && modelId !== undefined) kernel.closeModel(modelId);
     requestFrame(true);
     emit("close", null);
@@ -495,7 +530,7 @@ export function createViewer(container, options = {}) {
     pack: () => model?.pack ?? null,
     /** The kernel's spatial hierarchy for the open model, or `null` for a pack. */
     hierarchy: () => model?.hierarchy ?? null,
-    /** `pending`, `ready`, `failed` or `off`: whether the overlay has been refined to shared planes. */
+    /** `pending`, `ready`, `exhausted`, `failed` or `off`: whether the overlay has been refined to shared planes. */
     overlayState: () => model?.overlay ?? null,
     modelId: () => model?.modelId ?? null,
   });

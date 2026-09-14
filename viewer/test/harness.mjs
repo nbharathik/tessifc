@@ -38,7 +38,8 @@ export async function instrumentViewer(page) {
       ready: () => Boolean(state.model),
       loadStatus: () => ({ state: state.loadOutcome, finished: !state.converting && state.loadOutcome !== "loading" }),
       streaming: () => Boolean(state.stream?.assembler),
-      overlayReady: () => state.model?.overlayAnalysis?.state === "ready",
+      overlayState: () => state.model?.overlayAnalysis?.state ?? null,
+      overlaySettled: () => Boolean(state.model?.overlayAnalysis) && state.model.overlayAnalysis.state !== "pending",
     };\n` });
   });
 }

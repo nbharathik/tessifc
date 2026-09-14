@@ -91,9 +91,16 @@ try {
   check(await page.evaluate(() => window.__tessifc.loadStatus().finished), 'a model without geometry reaches an explicit terminal state');
   await page.setInputFiles("#file-input", model);
   await page.waitForFunction(() => window.__tessifc.ready(), null, { timeout: 300_000 });
-  // The overlay assertions below measure the refined overlay, so wait for the plane analysis.
-  await page.waitForFunction(() => window.__tessifc.overlayReady(), null, { timeout: 120_000 });
-  check(await page.evaluate(() => Number.isInteger(window.__tessifc.renderer.displayInfo().depthOverlayTriangles)), "the worker's plane analysis refines the tie-break overlay to shared triangles");
+  // The overlay assertions below measure the settled overlay, so wait for the plane analysis.
+  await page.waitForFunction(() => window.__tessifc.overlaySettled(), null, { timeout: 120_000 });
+  const overlay = await page.evaluate(() => ({
+    state: window.__tessifc.overlayState(),
+    triangles: window.__tessifc.renderer.displayInfo().depthOverlayTriangles,
+  }));
+  check(
+    overlay.state === "ready" ? Number.isInteger(overlay.triangles) : overlay.state === "exhausted" && overlay.triangles === null,
+    `the worker's plane analysis refines the tie-break overlay to shared triangles, or keeps whole records past its budget (${overlay.state})`,
+  );
   await page.waitForTimeout(800);
   await checkInteraction(page, check);
   await checkRenderWork(page, check);

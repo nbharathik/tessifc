@@ -34,7 +34,7 @@ CLI.
 | Call | What it does |
 |---|---|
 | `createViewer(container, options)` | Creates the canvas inside `container`. Options: `kernel`, `hiddenFlags`, `lodPixels`, `theme`, `background`, `selectOnClick`, `focusOnDoubleClick`, `coincidence` (`false` skips the worker that refines the coincident-surface overlay). |
-| `open(source, { settings, modelSettings })` | Parses the IFC with the kernel and streams its geometry. Resolves with `modelId`, `info`, `summary` and `hierarchy`. |
+| `open(source, { settings, modelSettings })` | Parses the IFC with the kernel and streams its geometry. Resolves with `modelId`, `info`, `summary` and `hierarchy`, or `null` when a later `open`, `loadPack`, `close` or `dispose` superseded it. |
 | `loadPack(bytes)` | Shows an IGP pack directly, without a kernel. |
 | `close()` | Drops the model from the view and the kernel. |
 | `select(ids)`, `selection()` | Selects express ids (`null` clears); every part of a product is selected together. |
@@ -45,7 +45,7 @@ CLI.
 | `pick(clientX, clientY)` | The product and surface point under a pointer. |
 | `setPivot(point)`, `zoom(factor)` | The orbit and zoom centre, and a programmatic zoom step. |
 | `on(event, listener)` | `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`; returns the unsubscribe function. |
-| `pack()`, `hierarchy()`, `modelId()`, `overlayState()`, `renderer` | The assembled pack, the kernel's spatial tree, the model id, whether the coincident-surface overlay has been refined (`pending`, `ready`, `failed`, `off`) and the renderer itself for anything not covered above. |
+| `pack()`, `hierarchy()`, `modelId()`, `overlayState()`, `renderer` | The assembled pack, the kernel's spatial tree, the model id, whether the coincident-surface overlay has been refined (`pending`, `ready`, `exhausted` when the model was too large for the analysis budget and whole products stay in the overlay, `failed`, `off`) and the renderer itself for anything not covered above. |
 | `dispose()` | Releases the GPU resources and removes the canvas. |
 
 Left-drag orbits, right-drag or Shift-drag pans, the wheel zooms toward the

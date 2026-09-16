@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two model trees in the left panel: the IFC spatial structure and the
-//! element types. Both descend to individual elements. Nodes are built as data
-//! first and become DOM the first time their branch opens, so a large model
-//! only pays for what the user looks at.
+//! The two model trees in the left panel: the spatial structure and the element
+//! types. Nodes are data first and become DOM when their branch opens.
 
 import { classLabelColor, humanizeIfcClass } from "./igp.js";
 import { count as formatCount } from "./format.js";

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Where things are: `IfcLocalPlacement` chains resolved to world transforms.
-//!
-//! `RefDirection` is projected onto the plane normal to `Axis`, as the standard
-//! says; placements are shared, so each chain is resolved once and cached.
+//! `IfcLocalPlacement` chains resolved to world transforms. `RefDirection` is
+//! projected onto the plane normal to `Axis`; shared chains are resolved once.
 
 use crate::units::Units;
 use glam::{DMat4, DVec3};

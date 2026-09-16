@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-/**
- * three.js meshes from a TessIFC model. three.js is passed in, not imported,
- * so the package has no opinion about your version and adds no second copy.
- *
- * ```js
- * import init, { Kernel } from "@tessifc/core";
- * import { loadModel } from "@tessifc/three";
- *
- * await init();
- * const kernel = new Kernel();
- * const id = kernel.openModel(new Uint8Array(await file.arrayBuffer()));
- * const { group, bounds } = loadModel(THREE, kernel, id);
- * scene.add(group);
- * ```
- */
+
+//! three.js meshes from a TessIFC model. three.js is passed in, not imported,
+//! so the package has no opinion about your version and adds no second copy.
+//!
+//!   import init, { Kernel } from "@tessifc/core";
+//!   import { loadModel } from "@tessifc/three";
+//!   await init();
+//!   const kernel = new Kernel();
+//!   const id = kernel.openModel(new Uint8Array(await file.arrayBuffer()));
+//!   const { group, bounds } = loadModel(THREE, kernel, id);
+//!   scene.add(group);
 
 import { buildBatches, frame } from "./build.js";
 import { createRetainedModel } from "./retained.js";

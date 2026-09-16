@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The demo house through the model host, deterministically: every step's
-// affected products, the final counts, the verification against a fresh
-// evaluation, a reopen of the saved file, and the same house in IFC2X3.
+// The demo house through the model host: every step's affected products, the
+// final counts, verification, a reopen of the saved file, and IFC2X3.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";

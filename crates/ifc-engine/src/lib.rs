@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Orchestration: from a parsed model to placed geometry.
-//!
-//! This is the crate that decides *which* products to evaluate, in what order,
-//! and what to do when one of them fails. The rule is the fourth design
-//! principle: an element that cannot be evaluated yields a diagnostic and, where
-//! possible, a degraded mesh. It never takes the run down with it.
-//!
-//! Two ways in. [`Engine::evaluate`] does the whole model in one call, in
-//! parallel on native builds with the `parallel` feature. [`Engine::session`]
-//! does it in batches the caller sizes, so a viewer can draw the first storey
-//! while the last one is still being tessellated.
+//! Orchestration: which products to evaluate, in what order, and what to do when
+//! one fails (a diagnostic and, where possible, a degraded mesh). [`Engine::evaluate`]
+//! does the whole model; [`Engine::session`] streams it in batches the caller sizes.
 //!
 //! ```no_run
 //! use tessifc_engine::Engine;
@@ -401,10 +393,8 @@ impl Session {
         let mut products = Vec::new();
         let mut considered = 0;
         let mut filtered = 0;
-        // The offset is the lowest corner of the product placements, chosen
-        // before any geometry exists so that the first streamed batch and the
-        // last agree on it. A placement origin is where an exporter put the
-        // product, which is near its geometry; f32 needs it near, not exact.
+        // The lowest placement corner, chosen before any geometry exists so every
+        // streamed batch agrees on it; f32 needs the offset near the geometry, not exact.
         let mut lowest: Option<DVec3> = None;
         for product in model.entities_of_type("IfcProduct") {
             considered += 1;
@@ -665,11 +655,8 @@ fn evaluate_all(
     {
         use rayon::prelude::*;
         if rayon::current_num_threads() > 1 && ids.len() >= MIN_PARALLEL_PRODUCTS {
-            // One product is one unit of work, so a handful of boolean-heavy
-            // walls cannot pin the run to one thread. The caches follow the
-            // job rather than the product: rayon hands each split its own,
-            // and a family placed a hundred times is evaluated once per
-            // split, not once per placement.
+            // One product is one unit of work, so boolean-heavy walls cannot pin the
+            // run to one thread; each rayon split carries its own caches.
             let registry = Registry::shared(model.image().schema);
             let results: Vec<(Option<Shape>, Vec<Diagnostic>, PhaseTimings)> = ids
                 .par_iter()

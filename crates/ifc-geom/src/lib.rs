@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 //! IFC geometry evaluation: units, placements, curves, profiles and solids.
-//!
 //! A [`Registry`] maps IFC class to evaluator; adding a class is one file.
 //!
 //! ```no_run

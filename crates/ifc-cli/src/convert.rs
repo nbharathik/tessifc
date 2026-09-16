@@ -162,9 +162,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // The pool is process-wide and built once. A second convert in the same
-    // process would find it already built, which is fine.
-    // Bounded: a thread per core times a few is all the work can use.
+    // The pool is process-wide and built once; a thread per core times a few is all the work can use.
     let threads = options
         .jobs
         .unwrap_or_else(rayon::current_num_threads)
@@ -191,9 +189,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
         .map(|shape| shape.class.clone())
         .collect();
     let products_with_geometry = result.shapes.len();
-    // One record per colour. IGP carries one colour per record, so a window's
-    // frame and its glass are two records that share an express id; a family
-    // placed many times is one mesh and many records.
+    // One record per colour: a window's frame and glass are two records sharing an express id.
     for shape in &result.shapes {
         packer.add_shape_ref(shape);
     }

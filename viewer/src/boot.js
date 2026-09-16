@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Resolves the saved theme before first paint. A classic script, not a module,
-// so it runs before the splash is painted; a separate file so the page can
-// ship a Content-Security-Policy with no inline script allowance.
+// Resolves the saved theme before first paint: a classic script so it runs before
+// the splash, in its own file so the page needs no inline script allowance.
 (() => {
   let mode = "system";
   try {

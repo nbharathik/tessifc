@@ -150,8 +150,14 @@ export function parseValue(text, index = 0) {
     }
     return { value: decodeStepString(text.slice(i + 1, j)), end: j + 1 };
   }
+  if (char === "." && /[0-9]/.test(text[i + 1] ?? "")) {
+    let j = i + 1;
+    while (j < text.length && /[0-9.eE+-]/.test(text[j])) j += 1;
+    return { value: Number(text.slice(i, j)), end: j };
+  }
   if (char === ".") {
     const j = text.indexOf(".", i + 1);
+    if (j < 0) throw new Error("Unterminated enumeration in STEP value");
     const name = text.slice(i + 1, j);
     if (name === "T") return { value: true, end: j + 1 };
     if (name === "F") return { value: false, end: j + 1 };

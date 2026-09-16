@@ -182,9 +182,8 @@ fn compare_with_graph(
         return full_impact(impact, &new_products, origin, "product identity changed");
     }
 
-    // An unchanged entity references the same entities in both snapshots, so the
-    // candidate graph already holds its edges; only the old versions of changed
-    // and deleted entities add what the candidate no longer says.
+    // An unchanged entity has the same edges in both snapshots; only the old versions
+    // of changed and deleted entities add what the candidate no longer says.
     let mut kinds = Kinds::default();
     let mut graph = Dependencies::default();
     let old_changed: Vec<u32> = impact

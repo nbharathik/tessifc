@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Merging vertices that are the same point.
-//!
-//! An IFC B-rep names its vertices once per face, so a cube arrives as
-//! 24 or 36 vertices rather than 8. That costs memory, breaks edge counting
-//! (nothing is watertight if no two faces share a vertex), and stops any
-//! boolean kernel before it starts.
-//!
-//! Welding is a hash grid on quantised coordinates, not a spatial search. It is
-//! linear, it needs no tree, and the quantum is the model's own precision, so
-//! two points the file considers identical become identical here.
+//! Merging vertices that are the same point. A B-rep names each vertex once per
+//! face, so nothing is watertight until they are merged. The weld is a hash grid
+//! on coordinates quantised to the model's own precision.
 
 use crate::mesh::Mesh64;
 use glam::DVec3;
@@ -19,15 +12,9 @@ const MAX_CELL_INDEX: f64 = 1e15;
 
 /// Merge vertices closer together than `tolerance`, in place.
 ///
-/// Returns the number of vertices removed. Triangles that collapse to a line
-/// once their corners merge are dropped, because a zero-area triangle is not
-/// geometry and every later stage has to special-case it.
-///
-/// The grid is exact rather than approximate: two points land in the same cell
-/// or they do not. A pair straddling a cell boundary at 1.0001 times the
-/// tolerance stays separate, which is the price of doing this in one pass.
-/// Neighbour-cell probing would fix that and triple the cost; the tolerance
-/// comes from the file's own precision, so the case is rare in practice.
+/// Returns the number of vertices removed; triangles that collapse to a line
+/// are dropped. The grid is exact: a pair straddling a cell boundary stays
+/// separate, which is the price of one pass.
 pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
     if mesh.positions.is_empty() || !tolerance.is_finite() || tolerance <= 0.0 {
         return 0;
@@ -36,9 +23,8 @@ pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
         return 0;
     };
     let before = mesh.positions.len();
-    // Quantise from the box corner, and keep the cell index inside what f64
-    // counts exactly: a georeferenced coordinate would otherwise saturate the
-    // cast and weld the whole mesh into one vertex.
+    // Quantise from the box corner and keep the cell index exact in f64, or a
+    // georeferenced coordinate saturates the cast and welds everything together.
     let span = (high - low).max_element();
     let quantum = if span.is_finite() && span > tolerance * MAX_CELL_INDEX {
         span / MAX_CELL_INDEX
@@ -63,9 +49,7 @@ pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
             None => {
                 let index = kept.len() as u32;
                 cells.insert(key, index);
-                // Keep the first position seen rather than an average: an
-                // average would move the geometry, and the whole point is that
-                // these are the same point already.
+                // The first position seen, not an average: an average would move the geometry.
                 kept.push(*position);
                 remap.push(index);
             }
@@ -94,11 +78,8 @@ pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
 
 /// Remove coincident triangles, regardless of their winding.
 ///
-/// IFC exporters sometimes repeat the same face through two representation
-/// items, or emit both sides of a zero-thickness surface. Once vertices have
-/// been welded those faces have the same three indices. Keeping both makes a
-/// depth buffer alternate between them while the camera moves; one triangle is
-/// sufficient for a two-sided viewer and for all mesh measurements.
+/// Exporters repeat faces and emit both sides of zero-thickness surfaces; after
+/// welding those share three indices, and two of them flicker in a depth buffer.
 pub fn remove_duplicate_triangles(mesh: &mut Mesh64) -> usize {
     let before = mesh.triangle_count();
     let mut seen = HashSet::with_capacity(before);
@@ -199,16 +180,9 @@ pub fn weld_and_close(mesh: &mut Mesh64, tolerance: f64) -> usize {
     removed
 }
 
-/// Separate two faces that drew the same chord inside themselves.
-///
-/// Two triangulated faces meeting along a rim may each cut the same corner off
-/// it, and then that chord exists twice: once inside each face. The surface is
-/// watertight, but the edge is used four times and no edge count can tell that
-/// from a real defect. Splitting one of the two copies at its own midpoint
-/// changes no geometry at all, since the midpoint of a straight segment lies on
-/// it, and leaves every edge used twice.
-///
-/// Returns how many edges were separated.
+/// Separate two faces that drew the same chord inside themselves, so the
+/// edge is no longer used four times: one copy is split at its midpoint, which
+/// changes no geometry. Returns how many edges were separated.
 pub fn split_coincident_edges(mesh: &mut Mesh64, tolerance: f64) -> usize {
     let tol = if tolerance.is_finite() && tolerance > 0.0 {
         tolerance
@@ -300,18 +274,10 @@ pub fn split_coincident_edges(mesh: &mut Mesh64, tolerance: f64) -> usize {
 
 /// Split triangle edges that have another vertex sitting in the middle of them.
 ///
-/// A T-junction is what you get when two surfaces meet along a line that one
-/// side has subdivided and the other has not. The mesh looks watertight, the
-/// volume is right, and it is still not edge-manifold: the long edge is used
-/// once while the two short ones facing it are used once each. Renderers show
-/// it as a hairline crack, and any algorithm that walks edges sees a hole.
-///
-/// They are unavoidable when two independently triangulated surfaces are
-/// stitched - which is exactly what a difference does - so they are repaired
-/// afterwards rather than prevented.
-///
-/// Weld first: this matches vertices by position, and two copies of the same
-/// corner are two different obstacles. Returns how many splits were made.
+/// A T-junction leaves a mesh watertight but not edge-manifold, which renders
+/// as a hairline crack; stitching two triangulations, as a difference does,
+/// always makes some. Weld first, since vertices are matched by position.
+/// Returns how many splits were made.
 pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
     let tol = if tolerance.is_finite() && tolerance > 0.0 {
         tolerance
@@ -345,10 +311,8 @@ pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
         .collect();
     let mut done: Vec<[u32; 3]> = Vec::with_capacity(pending.len());
 
-    // Each split replaces one triangle with two, so the total is bounded; the
-    // cap is a guarantee of termination rather than an expectation. The
-    // candidate budget keeps a huge flat mesh, whose cells hold thousands of
-    // vertices each, from turning quadratic: past it the rest is left as is.
+    // The cap only guarantees termination; the candidate budget keeps a huge flat
+    // mesh from turning quadratic, and past it the rest is left as is.
     let limit = pending.len() * 8 + 64;
     let mut budget = mesh
         .positions
@@ -412,9 +376,8 @@ pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
             }
         }
         match split {
-            // Connect the intruding vertex to the corner opposite the edge it
-            // landed on. Both halves go back on the list: an edge can carry
-            // more than one.
+            // Connect the intruding vertex to the opposite corner; both halves go back
+            // on the list because an edge can carry more than one.
             Some((edge, vertex)) => {
                 let a = triangle[edge];
                 let b = triangle[(edge + 1) % 3];

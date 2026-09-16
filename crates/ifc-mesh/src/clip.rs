@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Cutting a mesh with a plane, and keeping it closed.
-//!
-//! This is the whole of "clip-only" mode. There is no general mesh-mesh
-//! boolean. There is [`clip`], which cuts a solid with one plane and caps
-//! it, and [`difference_convex`], which subtracts one convex solid from another
-//! using nothing but plane clips of single triangles. Between them they cover
-//! half-space solids, `IfcBooleanClippingResult`, and the rectangular openings
-//! that make up almost every hole in almost every wall.
-//!
-//! The reason to build on a plane clip rather than a general boolean is that a
-//! plane clip is *exact*. Every vertex it produces is either an original vertex
-//! or a point on a known plane, computed by one linear interpolation. There is
-//! no arithmetic here that can decide a coplanar case wrongly and hand back a
-//! solid with a hole in it, which is the failure mode that eats months in every
-//! engine that starts from a general boolean.
+//! Cutting a mesh with a plane and keeping it closed. [`clip`] cuts and caps a
+//! solid; [`difference_convex`] subtracts a convex solid using only plane clips,
+//! which are exact: every new vertex lies on a known plane.
 
 use crate::mesh::Mesh64;
 use crate::triangulate::{PlaneBasis, signed_area, triangulate_face};
@@ -143,9 +131,8 @@ pub fn clip(mesh: &Mesh64, plane: &Plane, tolerance: f64) -> Clipped {
         }
         any_kept = true;
 
-        // A triangle lying in the plane is kept whole and contributes no cut
-        // edges. Taking its edges would put three spurious segments into the
-        // boundary and break the chaining for everyone else.
+        // A coplanar triangle is kept whole and contributes no cut edges, or its
+        // three sides would break the boundary chaining.
         let coplanar = distances.iter().all(|d| d.abs() <= tol);
         if !coplanar && distances.iter().any(|d| *d > tol) {
             any_removed = true;
@@ -169,9 +156,8 @@ pub fn clip(mesh: &Mesh64, plane: &Plane, tolerance: f64) -> Clipped {
         if coplanar {
             continue;
         }
-        // Any edge of the kept polygon with both ends on the plane is an edge
-        // of the hole the cap has to fill. Reversed, because the cap faces the
-        // other way from the side wall that produced it.
+        // An edge with both ends on the plane bounds the hole the cap fills;
+        // reversed, because the cap faces the other way from the side wall.
         for index in 0..polygon.len() {
             let from = polygon[index];
             let to = polygon[(index + 1) % polygon.len()];
@@ -238,9 +224,8 @@ fn cap(mesh: &mut Mesh64, plane: &Plane, boundary: &[(DVec3, DVec3)], tol: f64) 
         return false;
     };
 
-    // With every loop wound consistently, an outer boundary encloses positive
-    // area about the plane normal and a hole encloses negative. That falls out
-    // of the input being a closed solid, so there is nothing to decide here.
+    // Consistent winding from a closed solid: an outer loop encloses positive area
+    // about the normal and a hole negative, so there is nothing to decide.
     let basis = PlaneBasis::from_normal(plane.normal, loops[0][0]);
     let mut outers: Vec<Vec<DVec3>> = Vec::new();
     let mut holes: Vec<Vec<DVec3>> = Vec::new();
@@ -482,17 +467,10 @@ pub fn difference_convex(body: &Mesh64, cutter: &Mesh64, tolerance: f64) -> Opti
 
 /// Subtract convex cutters from an extrusion whose profile may be non-convex.
 ///
-/// A triangulated extrusion is the union of one convex triangular prism per
-/// cap triangle. This function recognises the stable layout produced by the
-/// TessIFC extrusion evaluator, cuts those prisms independently, then keeps
-/// only triangles that separate the result from empty space. Probing both
-/// sides of each triangle removes the temporary faces between adjacent
-/// prisms, including faces split by a cutter.
-///
-/// This is deliberately narrower than a general mesh boolean. It returns
-/// `None` unless the body is a paired-cap extrusion and every cutter is convex.
-/// That makes it an exact fallback for common swept architectural elements
-/// while preserving the clip-only contract for arbitrary meshes.
+/// The body is split into one convex prism per cap triangle, each prism is cut
+/// on its own, and only the triangles that separate the result from empty space
+/// are kept. Returns `None` unless the body is a paired-cap extrusion and every
+/// cutter is convex; the caller then emits the body uncut and says so.
 pub fn difference_extrusion_many(
     body: &Mesh64,
     cutters: &[Mesh64],
@@ -562,9 +540,8 @@ pub fn difference_extrusion_many(
         let centre = (a + b + c) / 3.0;
         let negative = inside_result(centre - normal * probe);
         let positive = inside_result(centre + normal * probe);
-        // A real boundary has material on exactly one side. Material on both
-        // sides is a temporary prism interface. Material on neither side is
-        // numerical debris that is not part of the result surface.
+        // A real boundary has material on exactly one side; both sides is a prism
+        // interface, neither is numerical debris.
         if negative == positive {
             continue;
         }
@@ -643,9 +620,8 @@ fn extrusion_cells(mesh: &Mesh64, tol: f64) -> Option<Vec<Mesh64>> {
         return None;
     }
 
-    // Proving the side layout matters as much as finding matching caps. Without
-    // this check, an unrelated mesh that merely starts with paired triangles
-    // could be mistaken for an extrusion and have its remaining faces dropped.
+    // The side layout is proved too, or a mesh that merely starts with paired
+    // triangles would be taken for an extrusion and lose its remaining faces.
     let mut edges = Vec::with_capacity(cap_triangles.len() * 3);
     for triangle in cap_triangles {
         for (a, b) in [
@@ -751,26 +727,11 @@ fn valid_tolerance(tolerance: f64) -> f64 {
 
 /// Subtract several convex solids from a convex one, exactly.
 ///
-/// The result is built as a *surface*, not as a union of solid pieces:
-///
-/// ```text
-/// d(A \ B) = (dA outside every B)  u  (dB_i inside A and outside the others, facing the other way)
-/// ```
-///
-/// Both halves are plane clips of single triangles, so every vertex is either
-/// an original one or one linear interpolation along a known edge. Nothing is
-/// counted twice, which is the trap in the obvious alternative: decomposing
-/// `A \ B` into solid pieces gives the right volume but doubles every internal
-/// face, so the surface area comes out far too large and the shell stops being
-/// edge-manifold.
-///
-/// Taking every cutter at once is not an optimisation, it is the only thing
-/// that works: `A` has to be convex, and it stops being convex the moment the
-/// first window is cut out of it. A wall with three windows is one call.
-///
-/// The body and every cutter must be convex, which is checked. `None` means
-/// "not something this can cut", and the caller should emit the body un-cut and
-/// say so: a wall with an uncut window beats a missing wall.
+/// The result surface is the body's faces outside every cutter plus each
+/// cutter's faces inside the body and outside the others, reversed; both halves
+/// are plane clips of single triangles. All cutters are taken at once because
+/// the body stops being convex after the first cut. Convexity is checked and
+/// `None` means the caller should emit the body uncut and say so.
 pub fn difference_convex_many(body: &Mesh64, cutters: &[Mesh64], tolerance: f64) -> Option<Mesh64> {
     let tol = valid_tolerance(tolerance);
     if body.is_empty() || cutters.is_empty() {
@@ -814,21 +775,13 @@ pub fn difference_convex_many(body: &Mesh64, cutters: &[Mesh64], tolerance: f64)
         let high = corners[0].max(corners[1]).max(corners[2]);
         let mut pieces = vec![corners.to_vec()];
         for (planes, bounds) in cutter_planes.iter().zip(&cutter_bounds) {
-            // A triangle nowhere near this cutter keeps its own shape. This is
-            // what makes a wall with several openings affordable: without it
-            // every triangle is decomposed against every cutter and the piece
-            // count multiplies, which on a cutter with hundreds of faces is the
-            // difference between a millisecond and a second.
-            //
-            // Skipping can leave a vertex in the middle of a neighbour's edge,
-            // which is why the T-junction pass at the end is not optional.
+            // A triangle nowhere near this cutter keeps its shape; the T-junctions this
+            // leaves along neighbours are healed at the end.
             if low.cmpgt(bounds.1).any() || high.cmplt(bounds.0).any() {
                 continue;
             }
-            // A body face lying in a cutter face and pointing the same way is a
-            // face the cutter breaks through. The hole has to open there, so
-            // that plane must not take part: with it in, the whole triangle
-            // counts as outside and the opening gets a lid.
+            // A body face lying in a cutter face and pointing the same way is where the
+            // hole opens, so that plane must not take part or the opening gets a lid.
             let relevant: Vec<Plane> = planes
                 .iter()
                 .filter(|plane| {
@@ -865,9 +818,8 @@ pub fn difference_convex_many(body: &Mesh64, cutters: &[Mesh64], tolerance: f64)
                 continue;
             };
             let corners = [pa, pb, pc];
-            // A cutter face lying in a body face and pointing the same way is
-            // the cutter breaking the surface, not a wall of the hole. Keeping
-            // it would fill the opening back in with a lid.
+            // A cutter face lying in a body face and pointing the same way is the cutter
+            // breaking the surface, not a wall of the hole; keeping it would add a lid.
             let normal = (corners[1] - corners[0])
                 .cross(corners[2] - corners[0])
                 .normalize_or_zero();
@@ -966,14 +918,8 @@ fn decompose(
         if polygon.len() < 3 {
             continue;
         }
-        // Once a piece is outside one plane it is outside the cutter, and nothing
-        // further can remove any of it. Splitting it against the remaining planes
-        // anyway is what turns this from a piece per plane into a piece per *pair*
-        // of planes: on a cylindrical opening tessellated to sixty-four sides that
-        // is two thousand slivers where seventy triangles will do.
-        //
-        // Stopping early leaves T-junctions along the seams, which is exactly what
-        // heal_t_junctions is for.
+        // A piece outside one plane is outside the cutter; stopping here keeps the
+        // piece count linear and leaves T-junctions that heal_t_junctions removes.
         if outside {
             out.push(polygon);
             continue;
@@ -1004,14 +950,10 @@ fn emit(mesh: &mut Mesh64, polygon: &[DVec3]) {
 }
 /// Split a closed solid into convex cells whose union is the solid itself.
 ///
-/// Four cases, cheapest first: an already convex solid is its own only cell;
-/// a translational prism is swept from its merged cap; an extrusion in the
-/// paired-cap layout this crate emits uses [`extrusion_cells`]; anything else
-/// is cut into cells by a BSP of its own face planes, see [`crate::bsp`].
-///
-/// `None` means no decomposition could be *proved*, and the caller must fall
-/// back to the un-cut body and a diagnostic. A refusal here is never a
-/// licence to guess.
+/// Cheapest first: a convex solid is its own cell, a translational prism is
+/// swept from its merged cap, a paired-cap extrusion uses [`extrusion_cells`],
+/// and anything else goes through the BSP in [`crate::bsp`]. `None` means no
+/// decomposition could be proved; the caller emits the body uncut and says so.
 pub fn convex_cells(mesh: &Mesh64, tolerance: f64) -> Option<Vec<Mesh64>> {
     convex_cells_or_reason(mesh, tolerance).ok()
 }
@@ -1036,11 +978,8 @@ fn convex_cells_closing(
     if planes.len() >= 4 && is_convex(mesh, &planes, tol) {
         return Ok(vec![mesh.clone()]);
     }
-    // The geometric prism proof first: it accepts any triangulation, and it
-    // merges its cap into as few convex pieces as the shape allows, which is
-    // what the cost of the difference scales with. The index-layout proof is
-    // kept behind it for the meshes it recognises that this one cannot show
-    // are prisms, and the BSP takes whatever is left.
+    // The geometric prism proof first (any triangulation, fewest convex pieces),
+    // then the index-layout proof, and the BSP takes whatever is left.
     if let Some(cells) = prism_cells(mesh, tol) {
         return Ok(cells);
     }
@@ -1212,9 +1151,8 @@ fn combine(
     inside_result: &dyn Fn(DVec3) -> bool,
     tol: f64,
 ) -> Mesh64 {
-    // Where two shells of one solid touch, a face can be interface under one
-    // shell and boundary beside it, so such a solid's faces are split by its
-    // own cells too. A solid without coincident opposite faces has no such face.
+    // Where two shells of one solid touch, a face can be interface and boundary
+    // at once, so such a solid's faces are split by its own cells too.
     let own = |mesh: &Mesh64, set: &CellSet| {
         if has_opposite_faces(mesh, tol) {
             split_by_cells(mesh, set, tol)
@@ -1520,25 +1458,16 @@ const MAX_PRISM_DIRECTION_GROUPS: usize = 24;
 /// side; a cap is nowhere near it.
 const PRISM_SIDE_SKEW: f64 = 1e-5;
 
-/// Recover the triangular prisms whose union is a translational sweep.
-///
-/// A solid is a translational prism when its triangles fall into two parallel
-/// cap groups related by one displacement, plus side faces that all run along
-/// it. Sweeping each cap triangle by that displacement gives convex cells that
-/// tile the solid exactly.
-///
-/// Unlike [`extrusion_cells`] this reads the geometry rather than an index
-/// layout, so it also accepts a tessellated face set whose triangles arrive in
-/// any order and with any winding.
+/// Recover the triangular prisms whose union is a translational sweep: two
+/// parallel cap groups related by one displacement and side faces along it.
+/// Reads the geometry, not an index layout, so triangles may arrive in any
+/// order and winding.
 fn prism_cells(mesh: &Mesh64, tol: f64) -> Option<Vec<Mesh64>> {
     let faces = prism_faces(mesh, tol)?;
     let groups = plane_groups(&faces, tol)?;
 
-    // The sweep direction, not the caps, is what identifies a prism: every side
-    // face contains it, so it is perpendicular to every side normal. Two
-    // non-parallel side normals therefore cross to give it exactly. Searching
-    // for the caps first instead picks the two largest parallel faces, which on
-    // a wall are its two skins and not its caps at all.
+    // The sweep direction identifies a prism: two non-parallel side normals cross
+    // to give it exactly, where a search for caps would pick a wall's two skins.
     let mut directions: Vec<DVec3> = Vec::new();
     let limit = groups.len().min(MAX_PRISM_DIRECTION_GROUPS);
     for i in 0..limit {
@@ -1775,16 +1704,9 @@ fn prism_from_caps(
     Some(cells)
 }
 
-/// Join coplanar triangles into as few convex polygons as possible.
-///
-/// Hertel and Mehlhorn: start from the triangulation and drop every shared
-/// diagonal whose removal leaves both of its endpoints convex. One swept cell
-/// per merged polygon instead of one per triangle is the difference between
-/// cutting an opening in a few milliseconds and cutting it in tens of them,
-/// and a prism over a convex polygon is convex, which is the property the
-/// exact difference needs.
-///
-/// A merge that cannot be proved convex simply does not happen, so the worst
+/// Join coplanar triangles into as few convex polygons as possible (Hertel and
+/// Mehlhorn): drop every shared diagonal whose removal leaves both endpoints
+/// convex. A merge that cannot be proved convex does not happen, so the worst
 /// case is the triangulation this started from.
 fn merge_convex(triangles: &[[DVec3; 3]], normal: DVec3, tol: f64) -> Vec<Vec<DVec3>> {
     let mut vertices: Vec<DVec3> = Vec::new();
@@ -1848,9 +1770,8 @@ fn join_if_convex(
     vertices: &[DVec3],
     normal: DVec3,
 ) -> Option<Vec<u32>> {
-    // The shared edge runs one way round the left polygon and the other way
-    // round the right one. Two shared edges would mean splicing leaves a hole,
-    // so exactly one is required.
+    // The shared edge runs opposite ways round the two polygons; two shared edges
+    // would leave a hole after splicing, so exactly one is required.
     let mut shared = None;
     for (i, &a) in left.iter().enumerate() {
         let b = left[(i + 1) % left.len()];
@@ -1963,14 +1884,10 @@ fn cap_vertices(faces: &[PrismFace], group: &PlaneGroup, tol: f64) -> Vec<DVec3>
 
 /// Subtract closed solids from a closed solid, whatever their shape.
 ///
-/// The generalisation of [`difference_extrusion_many`]: both the body and every
-/// cutter are split into convex cells by [`convex_cells`], the faces of each
-/// side are split along the other side's cells, and a probe on both sides of
-/// every piece keeps the ones that separate the result from empty space.
-///
-/// With the BSP behind [`convex_cells`] this is the general difference. It
-/// still returns `None` whenever either side fails to prove a decomposition
-/// within budget, and the caller then emits the body un-cut and says so.
+/// Body and cutters are split into convex cells by [`convex_cells`], each
+/// side's faces are split along the other's cells, and a probe on both sides
+/// of every piece keeps the ones separating the result from empty space.
+/// `None` when either side fails to prove a decomposition within budget.
 pub fn difference_prismatic_many(
     body: &Mesh64,
     cutters: &[Mesh64],
@@ -2349,9 +2266,8 @@ mod tests {
 
     #[test]
     fn a_wall_with_t_junctions_is_still_cut() {
-        // An exporter's wall: a box whose top face is split into three triangles
-        // on one side and two on the other, so the shell is not edge-manifold as
-        // given but is watertight once healed.
+        // A box whose top face is split unevenly on its two sides: not edge-manifold
+        // as given, watertight once healed.
         let mut wall = box_mesh(DVec3::ZERO, DVec3::new(4.0, 0.3, 3.0));
         // Replace the top face (z = 3) by a fan around an extra midpoint on one edge.
         wall.indices.retain(|_| true);
@@ -2715,10 +2631,8 @@ mod tests {
             "16 less the 1x1x1 hole, got {volume}"
         );
 
-        // Two 4x4 faces less the hole, four 4x1 sides, and the four 1x1 walls
-        // of the hole itself: 2*(16-1) + 4*4 + 4*1 = 50. This is the number the
-        // solid-decomposition approach gets wrong, so it is the one worth
-        // asserting.
+        // Two 4x4 faces less the hole, four 4x1 sides and the four 1x1 hole walls:
+        // 2*(16-1) + 4*4 + 4*1 = 50.
         let area = result.surface_area();
         assert!((area - 50.0).abs() < 1e-9, "expected 50, got {area}");
         assert_eq!(
@@ -2751,9 +2665,8 @@ mod tests {
 
     #[test]
     fn a_wall_with_two_windows_gets_both() {
-        // The reason cutters are taken all at once: after the first hole the
-        // wall is no longer convex, so cutting them one after another would
-        // refuse the second.
+        // After the first hole the wall is no longer convex, so cutting the openings
+        // one after another would refuse the second.
         let wall = box_mesh(DVec3::ZERO, DVec3::new(6.0, 0.3, 3.0));
         let left = box_mesh(DVec3::new(1.0, -0.1, 1.0), DVec3::new(2.0, 0.4, 2.0));
         let right = box_mesh(DVec3::new(4.0, -0.1, 1.0), DVec3::new(5.0, 0.4, 2.0));
@@ -2807,9 +2720,8 @@ mod tests {
 
     #[test]
     fn an_opening_flush_with_a_face_does_not_get_a_lid() {
-        // The cutter's far face lands exactly on the body's far face, which is
-        // what an opening modelled to the outside of a wall looks like. The
-        // coplanar face must be dropped, or the hole is filled back in.
+        // The cutter's far face lands exactly on the body's far face, as an opening
+        // modelled to a wall's outside does; keeping it would fill the hole in.
         let wall = box_mesh(DVec3::ZERO, DVec3::new(4.0, 0.3, 3.0));
         let opening = box_mesh(DVec3::new(1.0, -0.1, 1.0), DVec3::new(2.0, 0.3, 2.0));
         let mut result = difference_convex(&wall, &opening, 1e-9).unwrap();
@@ -2902,9 +2814,8 @@ mod tests {
 
     #[test]
     fn a_hole_right_through_a_tube_caps_with_the_hole_as_a_hole() {
-        // Clipping a square tube gives a cap with an inner loop. If the winding
-        // rule were wrong, the cap would fill the bore in and the volume would
-        // come out too big.
+        // Clipping a square tube gives a cap with an inner loop; a wrong winding rule
+        // would fill the bore in.
         let mut tube = box_mesh(DVec3::new(-2.0, -2.0, -2.0), DVec3::new(2.0, 2.0, 2.0));
         let mut bore = box_mesh(DVec3::new(-1.0, -1.0, -2.0), DVec3::new(1.0, 1.0, 2.0));
         bore.flip_winding(); // an inner shell faces inward
@@ -2996,9 +2907,8 @@ mod tests {
 
     #[test]
     fn a_frustum_is_refused_rather_than_taken_for_a_prism() {
-        // Parallel top and bottom of different sizes. Treating them as caps
-        // would produce cells that do not tile the solid, so the proof has to
-        // fail rather than approximate.
+        // Parallel top and bottom of different sizes: taken as caps they would give
+        // cells that do not tile the solid.
         let mut mesh = Mesh64::new();
         for point in [
             DVec3::new(0.0, 0.0, 0.0),
@@ -3085,9 +2995,8 @@ mod tests {
         let cutter = box_mesh(DVec3::new(0.25, -0.5, 1.0), DVec3::new(0.75, 0.5, 2.0));
         let result = difference_prismatic_many(&body, std::slice::from_ref(&cutter), 1e-9)
             .expect("decomposable");
-        // The L prism: caps 2 x 3 = 6, sides (2+1+1+1+1+2) x 3 = 24. Total 30.
-        // The pocket takes 0.5 x 1.0 out of the y = 0 wall and adds its own
-        // five faces: a back, two sides and a top and bottom.
+        // The L prism has area 30 (caps 6, sides 24); the pocket removes 0.5 x 1.0
+        // from the y = 0 wall and adds its own five faces.
         let expected = 30.0 - 0.5 + 0.5 + 2.0 * 0.5 + 2.0 * 0.25;
         let area = result.surface_area();
         assert!(
@@ -3098,9 +3007,8 @@ mod tests {
 
     #[test]
     fn an_oblique_prism_still_decomposes() {
-        // A sweep that is not along the cap normal is a shear. Deriving the
-        // displacement from the cap normal instead of the cap centroids would
-        // place every cell wrongly.
+        // A sweep off the cap normal is a shear; the displacement must come from the
+        // cap centroids, not the normal.
         let mut prism = l_prism(3.0);
         let shear = DVec3::new(1.5, 0.5, 0.0);
         for point in prism.positions.iter_mut() {
@@ -3116,9 +3024,8 @@ mod tests {
 
     #[test]
     fn an_l_cap_merges_into_two_convex_cells_not_four_triangles() {
-        // The whole point of merging: an L tiles with four ear-clipped
-        // triangles and covers exactly as much with two convex pieces, and
-        // every cell costs a full pass of the exact difference.
+        // An L tiles with two convex pieces rather than four ear-clipped triangles,
+        // and every cell costs a pass of the exact difference.
         let prism = l_prism(3.0);
         let cells = convex_cells(&prism, 1e-9).expect("an L prism decomposes");
         assert!(

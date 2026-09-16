@@ -635,8 +635,7 @@ impl SolidEvaluator for ExtrudedAreaSolidTapered {
             * depth;
 
         // Loops with different corner counts are resampled by arc length to a common
-        // count. Two circles tessellated at different radii come out exact; an
-        // arbitrary outline loses its corners, and the file is told.
+        // count; an arbitrary outline loses its corners, and the file is told.
         let (mut start, mut end) = (start, end);
         let mut resampled = false;
         if start.outer.len() != end.outer.len() {
@@ -889,9 +888,8 @@ impl SolidEvaluator for AdvancedBrep {
             }
             weld_and_close(&mut mesh, ctx.tol.len);
         }
-        // Two faces meeting along a rim may each have cut the same corner off
-        // it. Separating those chords costs nothing and no edge count can tell
-        // them from a real defect.
+        // Two faces meeting along a rim may each have cut the same corner off it;
+        // no edge count can tell those chords from a real defect.
         if mesh.closed != Some(true)
             && tessifc_mesh::split_coincident_edges(&mut mesh, ctx.tol.len) > 0
         {
@@ -965,11 +963,8 @@ fn append_advanced_face(
     if !surface.is_a("IfcPlane") {
         let parametric = ctx.registry().surface(ctx, surface)?;
         if !matches!(parametric.kind, SurfaceKind::Plane) {
-            // The ruled strip between two boundary curves is exact on a
-            // developable patch, and it follows the edge samples, so it agrees
-            // with the faces beside it by construction. Take it whenever it can
-            // be shown to stay on the surface, and the parametric path
-            // otherwise; a class name cannot tell the two cases apart.
+            // A ruled strip between the boundary curves is exact on a developable patch and
+            // agrees with its neighbours; take it when it stays on the surface.
             let mut ruled = Mesh64::new();
             if append_ruled_advanced_face(ctx, face, &mut ruled).is_ok()
                 && !ruled.is_empty()
@@ -1024,10 +1019,8 @@ fn append_advanced_face(
     for hole in &arranged.holes {
         mesh.positions.extend_from_slice(hole);
     }
-    // Ear clipping drops a boundary point that lies on a straight run between
-    // its neighbours, and that point is shared with the face across the edge.
-    // Both this path and the trimmed-surface one must put them back, or the
-    // two disagree about a shared edge and the shell stops closing.
+    // Ear clipping drops a boundary point on a straight run, and the face across
+    // the edge still uses it; put such points back or the shell stops closing.
     let mut successor: std::collections::HashMap<u32, u32> = Default::default();
     let mut at = base;
     for ring in std::iter::once(&arranged.outer).chain(arranged.holes.iter()) {
@@ -1373,15 +1366,10 @@ fn strip_follows_surface(surface: &Surface, strip: &Mesh64, ctx: &EvalCtx<'_>) -
 /// Rounds of refinement. Each halves the edges that are still too coarse.
 const MAX_REFINEMENT_ROUNDS: usize = 12;
 
-/// Tessellate a face as the region of its surface that its edges bound.
-///
-/// The edges arrive as 3D points, are put back into the surface's own two
-/// parameters, and the region they bound is triangulated there. Interior
-/// points are then added until every triangle lies within the chord tolerance
-/// of the surface, and the whole thing is lifted back.
-///
-/// Boundary points keep the 3D positions the edge evaluators produced, exactly,
-/// so the face still welds to the ones beside it.
+/// Tessellate a face as the region of its surface that its edges bound: the
+/// edges go back into (u, v), the region is triangulated and refined to the
+/// chord tolerance there, and the result is lifted back. Boundary points keep
+/// the edge evaluators' exact positions so the face welds to its neighbours.
 fn append_trimmed_surface_face(
     ctx: &EvalCtx<'_>,
     face: Entity<'_>,
@@ -1489,9 +1477,8 @@ fn append_trimmed_surface_face(
             mesh.append(&patch);
             return Ok(());
         }
-        // A boundary through a pole cannot be trimmed in (u, v): every
-        // longitude meets there, so the loop comes back as a jump between two
-        // unrelated parameters and either half of the surface fits it.
+        // A boundary through a pole cannot be trimmed in (u, v): every longitude
+        // meets there and either half of the surface fits the loop.
         if points
             .iter()
             .any(|point| surface.is_singular(*point, ctx.tol.len))
@@ -1530,9 +1517,8 @@ fn append_trimmed_surface_face(
         .max_by(|left, right| left.1.total_cmp(right.1))
         .map(|(index, _)| index)
         .unwrap_or(0);
-    // A face that wraps a whole period is a seam face: the surface closes on
-    // itself and the region is the entire band, which a single (u, v) polygon
-    // cannot say. IFC writes those with an IfcSeamCurve used twice in one loop.
+    // A face wrapping a whole period is a seam face (an IfcSeamCurve used twice in
+    // one loop): the region is the entire band, which no (u, v) polygon can say.
     let (u_period, v_period) = surface.periods();
     for (_, parameters, _) in &loops {
         if all_explicit {
@@ -1600,12 +1586,8 @@ fn append_trimmed_surface_face(
         }
     }
 
-    // A rim arc shared with another face is often a straight run in (u, v):
-    // an arc round a cylinder at one height, or round a revolution. Ear
-    // clipping would cut the corner off such a run and leave a chord inside
-    // this face, and the face on the other side of the arc would cut the same
-    // chord, so the edge would end up used four times and the shell would not
-    // close. Hide the straight run from the triangulator and put it back after.
+    // A shared rim arc is often a straight run in (u, v); ear clipping would cut a
+    // chord off it on both sides of the edge, so hide the run and put it back after.
     let corners: Vec<Vec<u32>> = rings
         .iter()
         .map(|ring| straight_run_corners(ring, &uv))
@@ -1637,9 +1619,8 @@ fn append_trimmed_surface_face(
         triangles.push([corners[0], corners[1], corners[2]]);
     }
 
-    // Ear clipping drops a boundary point that sits on a straight run between
-    // its neighbours, and that point is shared with the face on the other side
-    // of the edge. Put them back before anything else touches the patch.
+    // Ear clipping drops a boundary point on a straight run that the face across
+    // the edge still uses; put them back before anything else touches the patch.
     let mut successor: std::collections::HashMap<u32, u32> = Default::default();
     for ring in &rings {
         for step in 0..ring.len() {

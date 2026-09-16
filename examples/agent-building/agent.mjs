@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Let a language model build the demo house through the agent tools: every
-//! proposal runs at once, the kernel's report goes back to the model, and the
-//! viewer follows when `--serve` is given. Set OPENROUTER_API_KEY (default
-//! provider) or ANTHROPIC_API_KEY with `--provider anthropic`.
+//! Let a language model build the demo house through the agent tools; every
+//! proposal runs at once and the kernel's report goes back to the model.
+//! Set OPENROUTER_API_KEY (the default provider) or ANTHROPIC_API_KEY.
 //!
 //!   node examples/agent-building/agent.mjs [house.ifc] [--provider openrouter|anthropic] [--model <id>]
 //!        [--serve] [--port 8000] [--max-turns 24] [--out transcript.json] [--prompt "..."]
@@ -81,8 +80,8 @@ ifc.addBeam, ifc.addProperties, ifc.setColor, ifc.byName, ifc.storeys. After eac
 the next turn. When every step is done and nothing is left, answer with the words BUILDING COMPLETE and the counts you know.`;
 let prompt = values.prompt ?? BRIEF;
 const history = [];
-let complete_ = false;
-for (let turn = 1; turn <= maxTurns && !complete_; turn += 1) {
+let finished = false;
+for (let turn = 1; turn <= maxTurns && !finished; turn += 1) {
   console.log(`\nTurn ${turn}: ${prompt.slice(0, 80)}${prompt.length > 80 ? "..." : ""}`);
   const outcome = await runAgentTurn({
     complete, tools, prompt, mode: "edit", context: host.context(), history,
@@ -101,16 +100,16 @@ for (let turn = 1; turn <= maxTurns && !complete_; turn += 1) {
     })),
   });
   history.push({ role: "user", text: prompt }, { role: "assistant", text: outcome.answer });
-  complete_ = /BUILDING COMPLETE/i.test(outcome.answer);
+  finished = /BUILDING COMPLETE/i.test(outcome.answer);
   prompt = "Continue with the next step. When every step is done, say BUILDING COMPLETE.";
 }
 
 const verified = host.verify();
 const info = host.session.info();
-transcript.final = { complete: complete_, revision: host.session.revision, products: info.products, verified,
+transcript.final = { complete: finished, revision: host.session.revision, products: info.products, verified,
   expected: EXPECTED, endedAt: new Date().toISOString() };
 writeFileSync(resolve(values.out), JSON.stringify(transcript, null, 2));
-console.log(`\n${complete_ ? "The model reported the building complete" : "Stopped after the turn limit"}; revision ${host.session.revision}, ` +
+console.log(`\n${finished ? "The model reported the building complete" : "Stopped after the turn limit"}; revision ${host.session.revision}, ` +
   `${verified.products} placed products, verification ${verified.ok ? "ok" : `${verified.mismatches.length} mismatches`}. Transcript: ${resolve(values.out)}`);
 if (viewer) {
   console.log("The viewer keeps following; press Ctrl+C to stop.");

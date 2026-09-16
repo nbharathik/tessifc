@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The model behind the MCP server: one kernel, one editing session, the
-//! current snapshot with its content version, the file it is saved to, and a
-//! scene mirror for verification. Every change goes through the session, so
-//! the kernel decides what the viewer rebuilds.
+//! The model behind the MCP server: one kernel, one editing session, the current
+//! snapshot with its content version, the file it is saved to, and a scene
+//! mirror for verification. Every change goes through the session.
 
 import { createHash } from "node:crypto";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
@@ -39,7 +38,7 @@ async function atomicWrite(target, bytes) {
       await rename(temp, target);
       return;
     } catch (error) {
-      if (error.code !== "EPERM" || attempt >= RENAME_RETRIES) {
+      if ((error.code !== "EPERM" && error.code !== "EBUSY") || attempt >= RENAME_RETRIES) {
         await unlink(temp).catch(() => {});
         throw error;
       }

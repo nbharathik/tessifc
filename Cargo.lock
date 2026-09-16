@@ -661,7 +661,6 @@ dependencies = [
  "tessifc-engine",
  "tessifc-geom",
  "tessifc-model",
- "tessifc-pack",
  "tessifc-schema",
  "tessifc-step",
 ]
@@ -719,7 +718,6 @@ version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The session panel: a script editor and an assistant over the open model.
-//! Scripts run in the browser (JavaScript) or, when a local session is
-//! connected, in Python with IfcOpenShell. Both publish revisions through the
-//! same snapshot path, so the report always comes from the kernel.
+//! Scripts run in the browser or, with a local session connected, on its host;
+//! both publish revisions through the same snapshot path.
 
 import { duration } from "./format.js";
 import { JAVASCRIPT_EXAMPLES, PYTHON_EXAMPLES } from "./script-examples.js";

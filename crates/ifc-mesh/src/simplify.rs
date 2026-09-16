@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Merging the coplanar fragments a boolean leaves behind.
-//!
-//! Splitting a face along a cell plane is how the general boolean decides
-//! which side of it is solid. Once the decision is made the split has served
-//! its purpose, and the vertices it introduced inside a flat face can go.
-//!
-//! Only vertices strictly inside a flat face are removed. A vertex on the rim
-//! of one is shared with the faces around it, and dropping it would open a
-//! seam that nothing downstream could tell from a modelling error.
+//! Merging the coplanar fragments a boolean leaves behind. Only vertices strictly
+//! inside a flat face go; a rim vertex is shared with neighbouring faces.
 
 use crate::mesh::Mesh64;
 use crate::triangulate::triangulate_face;
@@ -31,16 +24,9 @@ const PASSES: usize = 3;
 
 /// Merge coplanar triangles by removing the vertices interior to a flat face.
 ///
-/// Each removable vertex is replaced by a re-triangulation of the ring of
-/// triangles around it, so the ring, and everything outside it, is untouched.
-/// A vertex is kept whenever anything is in doubt: a fan that is not flat, a
-/// ring that does not close, a re-triangulation whose rim is not the ring, or
-/// one that would leave an edge used more than twice.
-///
-/// Returns how many triangles were removed. The mesh must be welded first;
-/// this works on vertex indices, not positions.
-///
-/// # Example
+/// Each removable vertex is replaced by a re-triangulation of the ring around
+/// it; a vertex is kept whenever anything is in doubt. Returns how many
+/// triangles were removed. Weld first: this works on indices, not positions.
 ///
 /// ```
 /// use tessifc_mesh::{Mesh64, merge_coplanar};
@@ -317,16 +303,10 @@ fn remove_vertex(
     Some(out)
 }
 
-/// Put back the boundary vertices ear clipping skipped as collinear.
-///
-/// A triangle edge that runs along the boundary but is not one of the
-/// boundary's own edges spans several of them. The triangle is fanned from its
-/// opposite corner through every vertex the edge passed, which restores the
-/// subdivision a neighbouring face is relying on.
-///
-/// `next` maps each boundary vertex to the one after it, so a face with holes
-/// carries every one of its loops in the same map. `None` when the map is
-/// inconsistent, which the caller should read as "leave it alone".
+/// Put back the boundary vertices ear clipping skipped as collinear: a
+/// triangle edge spanning several boundary edges is fanned through the
+/// vertices it passed. `next` maps each boundary vertex to the one after it,
+/// every loop in one map; `None` when the map is inconsistent.
 pub fn restore_boundary_vertices(
     triangles: Vec<[u32; 3]>,
     next: &HashMap<u32, u32>,

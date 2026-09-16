@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! From shapes to an IGP pack.
-//!
-//! One place for the decisions every host used to make separately: which
-//! instance flags a product gets, how the model offset is applied, and how a
-//! family that is placed two hundred times becomes one mesh and two hundred
-//! transforms rather than two hundred meshes.
+//! From shapes to an IGP pack: instance flags, the model offset, and one mesh
+//! plus many transforms for a family placed many times.
 
 use crate::{ProductCategory, Shape, ShapePart, codes};
 use glam::{DMat4, DVec3};

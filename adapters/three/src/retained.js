@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-/**
- * A retained three.js scene over IGP packs: one mesh per placed instance,
- * one BufferGeometry per IGP geometry shared by every instance of it, and
- * deltas that replace only the products a revision touched. three.js is
- * passed in, as everywhere in this package.
- *
- * ```js
- * const model = createRetainedModel(THREE, readIgp(packBytes));
- * scene.add(model.group);
- * const { report, delta } = session.runScript(source);
- * if (delta) model.applyDelta(delta);
- * ```
- */
+
+//! A retained three.js scene over IGP packs: one mesh per placed instance, one
+//! BufferGeometry per IGP geometry, and deltas that replace only the products
+//! a revision touched. three.js is passed in, as everywhere in this package.
+//!
+//!   const model = createRetainedModel(THREE, readIgp(packBytes));
+//!   scene.add(model.group);
+//!   const { report, delta } = session.runScript(source);
+//!   if (delta) model.applyDelta(delta);
 
 // IGP instance flags for helper geometry: openings, spaces and reference items.
 const HELPER_FLAGS = (1 << 1) | (1 << 2) | (1 << 4);

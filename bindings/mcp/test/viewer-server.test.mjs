@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The loopback viewer server over a model host: status and token, Host and
-// Origin checks, snapshots by version, the long poll, scripts, undo, the
-// selection and applied reports, and static file containment. Node only.
+// The loopback viewer server over a model host: status, origin checks, snapshots,
+// the long poll, scripts, undo, the reports and static file containment.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";

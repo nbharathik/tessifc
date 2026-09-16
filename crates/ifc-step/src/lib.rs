@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! STEP-21 (ISO 10303-21) reader for IFC files: bytes in, a flat immutable
-//! [`ModelImage`] out, with no interpretation of geometry or units.
-//! [`parse`] reports recoverable errors and retains what was readable.
-//!
-//! # Example
+//! [`ModelImage`] out, with no interpretation of geometry or units. [`parse`]
+//! reports recoverable errors as diagnostics and keeps what was readable.
 //!
 //! ```
 //! use tessifc_step::{ParseOptions, parse};

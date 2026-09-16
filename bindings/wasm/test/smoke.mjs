@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // The WASM smoke test: IFC crosses the boundary and comes back as meshes.
-// Build with python scripts/build-wasm.py, then run this file; it exits
-// non-zero on any mismatch. Set TESSIFC_TEST_MODEL to an IFC file to add a
-// whole-model comparison against the native CLI.
+// TESSIFC_TEST_MODEL names an optional IFC file to compare against the CLI.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync, mkdtempSync, unlinkSync, rmdirSync } from "node:fs";

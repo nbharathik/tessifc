@@ -47,7 +47,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: "undo_edit",
     description: "Undo the last published edit as a new revision. Use only when the user asks to undo.",
-    input_schema: { type: "object", properties: {}, additionalProperties: false },
+    input_schema: { type: "object", properties: {}, required: [], additionalProperties: false },
   }),
 ]);
 

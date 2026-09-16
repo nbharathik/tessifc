@@ -72,9 +72,8 @@ export async function checkInteraction(page, check) {
   check(navigation.orbitDrift < 0.5, `a zoomed-out orbit turns about the target instead of swinging it (${navigation.orbitDrift.toFixed(3)} px)`);
   check(navigation.closeDistance < 0.01, "zoom reaches small details below the old one-centimetre pivot limit");
   check(navigation.panDifference < 1e-9, "pan distance is independent of drawing-buffer resolution");
-  // The right side holds one panel at a time: the edit and session panels take the
-  // inspector's place and give it back when they close. Wide layouts only; narrow ones
-  // already open one panel at a time.
+  // The right side holds one panel at a time on wide layouts: the edit and session
+  // panels take the inspector's place and give it back when they close.
   const originalViewport = page.viewportSize();
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.waitForTimeout(100);

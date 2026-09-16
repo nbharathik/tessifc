@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! IGP: the IFC Geometry Pack.
-//!
-//! A GLB-shaped container: a 24-byte header, a UTF-8 JSON index and an
-//! 8-byte-aligned binary chunk. No codegen, no dependency to read it: a
-//! `DataView` in JavaScript, `numpy.frombuffer` in Python, a slice in Rust.
-//!
-//! The layout is **normative** and frozen for v0. It is specified in
-//! `docs/igp-format.md` and changing it needs an RFC.
+//! IGP, the IFC Geometry Pack: a 24-byte header, a UTF-8 JSON index and an
+//! 8-byte-aligned binary chunk, readable with a `DataView` or `numpy`. The v0
+//! layout is normative, specified in `docs/igp-format.md`; changing it needs an RFC.
 //!
 //! ```
 //! use tessifc_pack::{IgpWriter, Geometry, Instance};
@@ -394,9 +389,8 @@ impl IgpWriter {
             }
         }
 
-        // The provenance table, in first-seen order over the sorted instances,
-        // so the same model always produces the same bytes. Identical rows
-        // collapse: a family placed a thousand times costs one.
+        // Provenance rows in first-seen order over the sorted instances, identical
+        // rows collapsed, so the same model always produces the same bytes.
         let mut provenance_rows: Vec<&Provenance> = Vec::new();
         let mut provenance_of: Vec<u32> = Vec::with_capacity(self.instances.len());
         {
@@ -446,9 +440,8 @@ impl IgpWriter {
             .map(|(index, name)| (name.as_str(), index as u16))
             .collect();
 
-        // Compute binary offsets first, then serialise directly into the final
-        // output buffer. Keeping a complete BIN Vec and copying it into a
-        // second final Vec made peak pack memory grow by the full IGP payload.
+        // Offsets first, then serialise straight into the output buffer; a separate
+        // BIN buffer would double the peak memory.
         let mut binary_len = 0usize;
         let mut geometry_json = Vec::new();
 

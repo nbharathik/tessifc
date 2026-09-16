@@ -2,8 +2,6 @@
 //! Triangulation, welding, normals, clipping and bounded mesh booleans.
 //! These operations are independent of IFC and use f64 coordinates.
 //!
-//! # Example
-//!
 //! ```
 //! use tessifc_mesh::{Polygon2, triangulate_polygon};
 //! use glam::DVec2;

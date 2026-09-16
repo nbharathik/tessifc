@@ -492,9 +492,8 @@ pub fn product_parts(
                 {
                     Ok(result) => Some(result),
                     Err(why) => {
-                        // A body with no usable inside, whether a face-based cabinet
-                        // or a shell whose cells cannot be proved, still gets its
-                        // openings cut through its faces.
+                        // A body with no provable inside still gets its openings cut
+                        // through its faces.
                         if why.starts_with("body:")
                             && let Ok(result) = tessifc_mesh::difference_surface_many_or_reason(
                                 &body,
@@ -759,10 +758,8 @@ fn product_body_parts(
     split_colours: bool,
 ) -> Option<Vec<BodyPart>> {
     let Some(representation) = representation_of(product) else {
-        // The product was selected and then produced nothing, because every
-        // representation it carries is one this kernel does not draw: a
-        // FootPrint, an Axis, a 2D annotation, a grid's axes. Saying so is the
-        // difference between "not supported" and a product silently missing.
+        // Every representation is one this kernel does not draw (FootPrint, Axis,
+        // annotation); say so rather than let the product go missing silently.
         if product.attr("Representation").as_entity().is_some() {
             ctx.diag.warn(
                 codes::NO_DRAWN_REPRESENTATION,

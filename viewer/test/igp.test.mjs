@@ -140,9 +140,8 @@ assert.match(app, /renderer\.setViewportTheme\?\./, "canvas theme control must u
 assert.match(app, /function filterProperties\(/, "property filtering must be implemented locally");
 console.log("ok    task ribbon, model navigator, and inspector views are wired");
 
-// A URL to a real host is a network dependency; the XML namespace in an inline
-// SVG is an identifier, not a fetch. The policy's connect-src names the
-// assistant providers a user may choose, which is data, not code.
+// A URL to a real host is a network dependency; the SVG namespace and the
+// policy's connect-src provider list are not.
 const remoteUrl = /https?:\/\/(?!www\.w3\.org\/)/;
 const htmlWithoutPolicy = html.replace(/<meta\s+http-equiv="Content-Security-Policy"[\s\S]*?\/>/, "");
 assert.match(html, /connect-src 'self' https:\/\/openrouter\.ai https:\/\/api\.anthropic\.com http:\/\/127\.0\.0\.1:\* http:\/\/localhost:\*;/,

@@ -701,7 +701,7 @@ body.ribbon-collapsed #ribbon { height: 0; border-bottom: none; visibility: hidd
   color: var(--fg-3);
   user-select: none;
 }
-@keyframes panel-in { from { opacity: 0; transform: translateX(12px); } }
+@keyframes panel-in { from { opacity: 0; } }
 
 .panel-head {
   display: flex;
@@ -723,7 +723,7 @@ body.ribbon-collapsed #ribbon { height: 0; border-bottom: none; visibility: hidd
 .panel-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .panel-body.scroll { overflow-y: auto; }
 #inspector .panel-body { animation: tab-in var(--base) var(--ease); }
-@keyframes tab-in { from { opacity: 0; transform: translateY(4px); } }
+@keyframes tab-in { from { opacity: 0; } }
 
 .page { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; padding: 10px; gap: 9px; }
 

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `tessifc coverage`: what the evaluator registry actually handles.
-//!
-//! Generated from the registry rather than maintained by hand, so the table in
-//! `docs/coverage.md` cannot claim an evaluator that does not exist. That was
-//! the promise made when the table was first published with every row reading
-//! "not started"; this is the command that keeps it.
+//! `tessifc coverage`: what the evaluator registry handles, generated from the
+//! registry so `docs/coverage.md` cannot claim an evaluator that does not exist.
 
 use serde::Serialize;
 use std::process::ExitCode;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Values read out of a record, with the model attached so they can be used.
 
-use crate::Model;
+use crate::{Entity, Model};
 use tessifc_step::strings::StrId;
 use tessifc_step::tape::{Cursor, RawValue};
 
@@ -283,5 +283,3 @@ impl<'a> Iterator for ListIter<'a> {
         }
     }
 }
-
-use crate::Entity;

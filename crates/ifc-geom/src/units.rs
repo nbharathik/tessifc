@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! What the numbers in the file mean: everything downstream is metres and radians.
-//!
-//! Plane angle is the trap: a project declaring DEGREE puts `90.` where one
-//! declaring RADIAN puts `1.5708`, and assuming radians draws a 90-radian arc.
+//! What the numbers in the file mean: everything downstream is metres and
+//! radians. A project declaring DEGREE writes `90.` where RADIAN writes `1.5708`.
 
 use tessifc_model::{Entity, Model};
 

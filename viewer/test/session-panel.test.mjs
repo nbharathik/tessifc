@@ -117,9 +117,8 @@ try {
   assert.equal(await page.evaluate(() => window.__tessifc.state.dirty), true);
   console.log("ok the door example cuts an opening and adds a door through the selective path");
 
-  // The refresh keeps the panels steady: changed products fade from a highlight, the selected
-  // element keeps its attributes on screen, the tree keeps its open branches, and the only
-  // unsaved-edit cue is the download chip in the top bar.
+  // The refresh keeps the panels steady: a highlight fade, the inspector and the
+  // tree unchanged, and the download chip as the only unsaved-edit cue.
   assert.equal(flashing, true, "changed products are highlighted after the update");
   await page.waitForFunction(() => !window.__tessifc.renderer.animating, null, { timeout: 10000 });
   assert.equal(await page.evaluate(() => window.__loadingSeen), false, "the inspector never showed a loading gap");

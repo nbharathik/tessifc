@@ -2200,12 +2200,8 @@ export class IfcRenderer {
     const cappable = this.opaqueBatches.filter((batch) => batch.closed && !batch.culled);
     if (!cappable.length) return;
 
-    // Count faces on the kept side: a pixel with an unbalanced count is inside
-    // a solid where the plane cuts it. The section discard in the shader is
-    // what opens the solid up in the first place.
-    // Two-sided stencil, so face culling stays off: IFC winding is unreliable
-    // and the renderer never culls, but a closed shell the kernel welded is
-    // wound consistently, which is the only thing this count needs.
+    // A pixel with an unbalanced face count on the kept side is inside a cut solid.
+    // Two-sided stencil: the renderer never culls, and a welded shell is wound consistently.
     gl.enable(gl.STENCIL_TEST);
     gl.colorMask(false, false, false, false);
     gl.depthMask(false);
@@ -3006,17 +3002,13 @@ void main() {
   }
   vec3 toCamera = safeNormalize(uCameraPosition - vWorld, vec3(0.0, 0.0, 1.0));
   vec3 normal = safeNormalize(cross(dFdx(vWorld), dFdy(vWorld)), toCamera);
-  // Screen-space derivatives already describe the visible geometric plane.
-  // Orient that plane toward the camera instead of trusting IFC winding: open
-  // shells and malformed tessellated sets commonly mix face directions.
+  // Face the derivative normal toward the camera rather than trust IFC winding.
   if (dot(normal, toCamera) < 0.0) normal = -normal;
   vec3 lightA = normalize(vec3(0.42, -0.58, 0.70));
   vec3 lightB = normalize(vec3(-0.65, 0.20, 0.42));
   float hemisphere = mix(0.38, 0.58, normal.z * 0.5 + 0.5);
   float diffuse = hemisphere + max(dot(normal, lightA), 0.0) * 0.52 + max(dot(normal, lightB), 0.0) * 0.16;
-  // IGP colours are display-space values. Light in approximately linear space
-  // and convert back so pale concrete does not clip to flat white while sides
-  // still retain readable contrast.
+  // IGP colours are display-space values: light in roughly linear space and convert back.
   vec3 color = vColor.rgb * pow(max(diffuse, 0.0), 1.0 / 2.2);
   if (vSelected > 0.5) color = mix(color, vec3(1.0, 0.28, 0.12), 0.72);
   else if (vSelected > 0.0) color = mix(color, vec3(0.36, 0.74, 1.0), min(vSelected * 1.5, 0.75));

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The editing session end to end in Node: evaluate, script, snapshot, attribute
-// edits, direct refresh, undo and redo, the agent tools over the session, and
-// the three.js retained scene consuming the deltas through a THREE stub.
+// The editing session end to end in Node: scripts, snapshots, attribute edits,
+// undo and redo, the agent tools, and the retained three.js scene on the deltas.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Build the demo house step by step with the editing session, printing the
-//! kernel's report after every step. With `--serve` the reference viewer
-//! follows along at the printed address and shows the house grow.
+//! kernel's report after every step; `--serve` lets the viewer follow along.
 //!
 //!   node examples/agent-building/build-house.mjs [house.ifc] [--serve] [--port 8000] [--schema IFC4] [--pause 1500]
 

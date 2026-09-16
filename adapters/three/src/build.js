@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-/**
- * Turning a TessIFC kernel into draw calls, with no three.js in sight. This
- * half is pure: kernel in, typed arrays out, so the batching decisions can be
- * tested. `index.js` wraps the arrays in `THREE.BufferGeometry`.
- */
+
+//! Draw batches from a TessIFC kernel, with no three.js in sight: kernel in,
+//! typed arrays out, so the batching can be tested. `index.js` wraps them.
 
 /** How many vertices before a batch is closed and a new one started. */
 export const BATCH_VERTEX_LIMIT = 65_000 * 4;

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The viewer follows a tessifc-mcp session: it opens the empty model, shows
-// every edit an MCP client makes, runs the panel's JavaScript examples on the
-// host, reports its selection back, and reopens when the host starts a new
-// model. One browser, one child process.
+// The viewer follows a tessifc-mcp session: edits, the panel's examples on the
+// host, the selection report, and a reopen when the host starts a new model.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";

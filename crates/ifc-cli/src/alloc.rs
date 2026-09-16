@@ -68,10 +68,8 @@ fn update(current: &AtomicIsize, peak: &AtomicUsize, delta: isize) {
     peak.fetch_max(now.max(0) as usize, Ordering::Relaxed);
 }
 
-// SAFETY: every method forwards to the system allocator with the same layout it
-// was given, and only adds bookkeeping around it. The bookkeeping is a
-// thread-local cell and two atomics, none of which affect the pointers
-// returned, and none of which allocate.
+// SAFETY: every method forwards to the system allocator with the layout it was
+// given; the bookkeeping (a thread-local cell and two atomics) never allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller upholds the GlobalAlloc contract for `layout`.

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! The IGP v0 reader: header, JSON index and typed-array views over the
+//! binary chunk, plus the instance flags and class helpers viewers share.
+
 const IGP_MAGIC = 0x00504749;
 const IGP_VERSION = 0;
 const HEADER_BYTES = 24;
@@ -22,7 +25,7 @@ export function readIgp(input) {
   const binaryLength = readU64(view, 12);
   const flags = view.getUint32(20, true);
 
-  if (magic !== IGP_MAGIC) throw new Error("The worker returned a file that is not IGP geometry.");
+  if (magic !== IGP_MAGIC) throw new Error("The bytes are not IGP geometry.");
   if (version !== IGP_VERSION) throw new Error(`IGP version ${version} is not supported.`);
 
   const binaryStart = HEADER_BYTES + Math.ceil(jsonLength / 8) * 8;
@@ -32,7 +35,7 @@ export function readIgp(input) {
 
   let index;
   try {
-    index = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(24, 24 + jsonLength)));
+    index = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(HEADER_BYTES, HEADER_BYTES + jsonLength)));
   } catch (error) {
     throw new Error(`The IGP index is not valid JSON: ${error.message}`);
   }
@@ -123,7 +126,7 @@ export function readIgp(input) {
     instances.colors.byteLength +
     instances.flags.byteLength +
     (instances.provenance ? instances.provenance.byteLength : 0);
-  const normalsBytes = geometry.reduce((sum, mesh) => sum + (mesh.positions.length / 3) * 3 * 4, 0);
+  const normalsBytes = geometry.reduce((sum, mesh) => sum + mesh.positions.length * 4, 0);
   const gpuBytes = geometryBytes + normalsBytes + count * (16 * 4 + 3 * 4);
 
   return {

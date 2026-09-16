@@ -74,6 +74,8 @@ class GeneratedSite(unittest.TestCase):
     def setUpClass(cls):
         if not (site.REPO / "bindings" / "wasm" / "pkg" / "tessifc_wasm_bg.wasm").is_file():
             raise unittest.SkipTest("build the browser WASM package to run the generated-site checks")
+        if importlib.util.find_spec("mkdocs") is None:
+            raise unittest.SkipTest("install requirements-site.txt to run the generated-site checks")
         temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temporary.cleanup)
         cls.out = Path(temporary.name) / "site"

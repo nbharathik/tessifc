@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * A first-party pavilion, generated in memory so the tests need no model downloads.
- * `duplicateGuids` gives every column the same GlobalId; `family` adds two seats
- * that share one mapped representation.
+ * A first-party pavilion generated in memory. `duplicateGuids` gives every column
+ * the same GlobalId; `family` adds two seats sharing one mapped representation.
  */
 export function pavilionIfc({ duplicateGuids = false, family = false } = {}) {
   const lines = [];

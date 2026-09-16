@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! FNV-1a, a small non-cryptographic hash used only for string interning.
-//! Not collision-resistant; the intern table compares bytes on every probe.
+//! FNV-1a, a small non-cryptographic hash for string interning and record
+//! provenance. Not collision-resistant; the intern table compares bytes.
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;

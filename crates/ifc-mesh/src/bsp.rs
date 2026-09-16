@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Convex cells of any closed solid, from a BSP of its own face planes.
-//!
-//! An outward-wound closed mesh partitions space when its faces are used as
-//! splitters: the region behind a face is locally inside. A leaf reached with
-//! nothing left behind it is an inside cell, convex by construction, and the
-//! inside cells tile the solid. The classical construction from the computer
-//! graphics literature, written from its published description.
+//! Convex cells of a closed solid from a BSP of its own face planes: the region
+//! behind a face is locally inside, so the inside leaves tile the solid. The
+//! classical construction, written from its published description.
 
 use crate::clip::{Plane, clip_polygon};
 use crate::mesh::Mesh64;
@@ -326,9 +322,8 @@ pub(crate) fn bsp_cells_closing(
     if mesh.is_empty() {
         return Err("empty mesh".into());
     }
-    // The construction reads faces as outward and needs a closed surface: a
-    // shell with T-junctions is healed first, faces that disagree about the
-    // outside are turned to agree, and an inside-out shell is turned whole.
+    // The construction needs a closed, outward-wound surface: heal T-junctions,
+    // then turn disagreeing faces and an inside-out shell.
     let mut oriented;
     let mesh =
         if mesh.is_edge_manifold() && mesh.is_consistently_wound() && mesh.signed_volume() >= 0.0 {
@@ -440,9 +435,8 @@ pub(crate) fn bsp_cells_closing(
         }
     }
 
-    // Cells as meshes: a box round the solid, cut down by every half-space on
-    // the cell's path. Each cut rebuilds the new face as the convex hull of the
-    // cut points, so no boundary has to be chained and a sliver cannot fail.
+    // Each cell is a box round the solid cut by every half-space on its path; the
+    // new face is the hull of the cut points, so no boundary is chained.
     let margin = (high - low).length().max(1.0) + tol;
     let hull = hull_faces(low - DVec3::splat(margin), high + DVec3::splat(margin));
     let mut out = Vec::with_capacity(cells.len());

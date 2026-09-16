@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Parametric surfaces, and the inversion that puts a point back on one.
-//!
-//! An advanced face is a region of a surface cut out by 3D edge curves. To
-//! tessellate it, the edges are put back into the surface's own two
-//! parameters, the region is triangulated there, and the result is lifted onto
-//! the surface again. Everything in this module exists to serve that: a point
-//! at (u, v), and the (u, v) of a point.
+//! Parametric surfaces and their inversion: a point at (u, v), and the (u, v)
+//! of a point. Advanced faces are trimmed and triangulated in the surface's own
+//! parameters and lifted back onto it.
 
 use crate::context::EvalCtx;
 use crate::error::GeomError;
@@ -172,9 +168,8 @@ impl SurfaceEvaluator for Swept {
                 "a revolution about an axis of no length".into(),
             ));
         }
-        // The profile in the half-plane it spans: radius from the axis and
-        // height along it. A profile that does not lie in one half-plane is
-        // not a surface of revolution and is refused rather than guessed at.
+        // The profile as radius from the axis and height along it; one that does not
+        // lie in a single half-plane is not a surface of revolution and is refused.
         let flat = &points;
         let mut reference = DVec3::ZERO;
         for point in flat {

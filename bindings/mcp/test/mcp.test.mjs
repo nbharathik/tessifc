@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The MCP server end to end: the CLI is spawned, an SDK client speaks to it
-// over stdio, the tools match the contract, a model is created, edited,
-// undone, exported and verified, the viewer route sees the change, and the
-// child's stdout carries nothing but the protocol.
+// The MCP server end to end over a spawned CLI: the tools match the contract,
+// a model is created, edited, undone, exported and verified.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";

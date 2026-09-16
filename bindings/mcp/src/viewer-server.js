@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A loopback HTTP server the viewer follows: the model snapshot with its
-//! content version, a long poll for changes, scripts, undo and redo, the
-//! page's selection, and the checkout's static files. Same routes and checks
-//! as the Python session server, so the viewer's session client speaks to both.
+//! A loopback HTTP server the viewer follows: the snapshot and its content
+//! version, a long poll, scripts, undo and redo, the page's reports and the
+//! checkout's static files. The same routes as the Python session server.
 
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";

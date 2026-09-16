@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # @tessifc/core
 
-**v0.1 developer preview.** The TessIFC IFC geometry kernel as WebAssembly,
+**v0.2 developer preview.** The TessIFC IFC geometry kernel as WebAssembly,
 with browser and Node builds and generated TypeScript declarations.
 IFC-SPF in, render-ready meshes out. Apache-2.0.
 

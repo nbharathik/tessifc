@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import secrets
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -46,6 +47,7 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
                 except OSError:
                     self.send_error(503, "IFC snapshot not ready")
                     return
+                session.viewer_seen = time.time()
                 status = session.describe(assistant)
                 status["token"] = token
                 self.respond_json(status)
@@ -91,6 +93,18 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
                         self.respond_json({"error": "No assistant provider is configured for this session."}, 404)
                         return
                     result = assistant.respond(body)
+                elif target.path == "/__tessifc/selection":
+                    session.report_selection(body)
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                elif target.path == "/__tessifc/applied":
+                    session.report_applied(body)
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 else:
                     self.send_error(404)
                     return

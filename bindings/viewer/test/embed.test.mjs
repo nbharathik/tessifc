@@ -185,6 +185,59 @@ try {
   });
   check(plain.state === "off" && plain.events.length === 1 && plain.events[0].state === "off", `coincidence: false reports the overlay as off (${plain.state})`);
   check(plain.models === 0, "dispose closes the kernel model");
+
+  // An empty model opens as an empty scene; the session and applyDelta fill it in place.
+  const built = await page.evaluate(async () => {
+    const { createViewer } = await import("../../bindings/viewer/src/index.js");
+    const { createModel } = await import("../../bindings/edit/src/create-model.js");
+    const v = createViewer(document.getElementById("host"), { kernel: window.tessifcKernel, coincidence: false });
+    const events = [];
+    v.on("load", (detail) => events.push(["load", detail.empty]));
+    v.on("revision", (detail) => events.push(["revision", detail.revision, detail.affectedProducts.length, detail.changed]));
+    const opened = await v.open(createModel({ name: "Empty", storeys: [{ name: "Ground floor", elevation: 0 }] }));
+    const emptyBatches = v.renderer.batches.length;
+    const session = v.session();
+    const { report, delta } = session.runScript('const w = ifc.addWall({ from: [0, 0], to: [4, 0], height: 3 }); ifc.addColumn({ at: [1, 1], height: 3 }); print(w.id);');
+    const applied = v.applyDelta(delta);
+    v.renderer.render(true);
+    const wallId = Number(report.stdout);
+    v.select(wallId);
+    const second = session.runScript(`ifc.get(${wallId}).Representation.Representations[0].Items[0].Depth = 4;`);
+    const again = v.applyDelta(second.delta);
+    const result = { opened: opened.empty, emptyBatches, applied, again, batches: v.renderer.batches.length, instances: v.pack().instances.active.reduce((a, b) => a + b, 0),
+      selected: v.selection()?.expressIds, events, revision: session.revision };
+    v.dispose();
+    return result;
+  });
+  check(built.opened === true && built.emptyBatches === 0 && built.events[0]?.[1] === true, "an empty model opens as an empty scene and says so in the load event");
+  check(built.applied.revision === "1" && built.applied.affectedProducts.length === 2 && built.batches > 0 && built.instances === 2, `the session's delta adds the wall and the column (${built.batches} batches)`);
+  check(built.again.affectedProducts.length === 1 && built.selected?.[0] > 0 && built.events.at(-1)?.[1] === "2", "a second delta keeps the selection and reports revision 2");
+
+  // The page follows a local session server and applies every version it publishes.
+  const { createModelHost } = await import("../../mcp/src/session-host.js");
+  const { createViewerServer } = await import("../../mcp/src/viewer-server.js");
+  const { Kernel } = createRequire(import.meta.url)(fileURLToPath(new URL("../../wasm/pkg-node/tessifc_wasm.js", import.meta.url)));
+  const host = createModelHost({ Kernel, save: false, version: "test" });
+  await host.newModel({ name: "Followed", storeys: [{ name: "Ground floor", elevation: 0 }] });
+  const followed = createViewerServer(host, { root: fileURLToPath(new URL("../../../", import.meta.url)), port: 0 });
+  const followedUrl = await followed.listen();
+  try {
+    await page.goto(`${followedUrl}/examples/embed-viewer/?session=file`);
+    await page.waitForFunction(() => Boolean(window.tessifcViewer) && window.tessifcViewer.pack() !== null, null, { timeout: 60_000 });
+    await page.evaluate(() => {
+      window.__revisions = [];
+      window.tessifcViewer.on("revision", (detail) => window.__revisions.push(detail));
+    });
+    await host.run('ifc.addWall({ from: [0, 0], to: [5, 0], height: 3, name: "Followed wall" });');
+    await page.waitForFunction(() => window.__revisions.length === 1, null, { timeout: 60_000 });
+    const following = await page.evaluate(() => ({ revisions: window.__revisions, instances: window.tessifcViewer.pack().instances.active.reduce((a, b) => a + b, 0),
+      status: document.getElementById("status").textContent }));
+    check(following.revisions[0].revision === "1" && following.revisions[0].affectedProducts.length === 1 && following.instances === 1, "a followed session's edit arrives as a revision event");
+    check(/Revision 1: 1 updated/.test(following.status), `the example page shows the kernel's counts (${following.status})`);
+  } finally {
+    await followed.close();
+    host.dispose();
+  }
   check(errors.length === 0, `no page errors (${errors.join("; ")})`);
 } finally {
   await browser.close();

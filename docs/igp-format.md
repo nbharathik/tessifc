@@ -54,7 +54,7 @@ buffer instead of copying.
 ```json
 {
   "igp": 0,
-  "generator": "tessifc 0.1.0",
+  "generator": "tessifc 0.2.0",
   "schema": "IFC4",
   "units": { "length_scale_to_m": 0.001 },
   "model_offset": [420000.0, 5900000.0, 12.0],
@@ -212,8 +212,9 @@ always after at least one product. The viewer asks for a 45 ms first chunk
 and 220 ms chunks after that.
 
 A chunk with `final: true` and `chunk: 0` is also how a re-evaluated subset of
-products travels after an edit (`evaluateProducts`): it is self-contained, its
-records are baked into world space, and its geometry ids start where the
+products travels after an edit (`evaluateProducts` and staged revisions): it is
+self-contained, a family shared by several of its products is written once and
+placed by its transforms like in a stream, and its geometry ids start where the
 caller says so they cannot collide with the pack being patched.
 
 ## Determinism

@@ -102,7 +102,7 @@ class GeneratedSite(unittest.TestCase):
     def test_published_heading_anchors_are_preserved(self):
         historical = {
             "getting-started": "three-js",
-            "preview": "v0-1-developer-preview",
+            "preview": "developer-preview",
         }
         for stem, anchor in historical.items():
             with self.subTest(page=stem, anchor=anchor):

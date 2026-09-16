@@ -1,0 +1,58 @@
+{
+  "name": "@tessifc/mcp",
+  "version": "0.2.0",
+  "description": "An MCP server over the TessIFC kernel: agents edit or create IFC models and a viewer follows every change",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "tessifc-mcp": "src/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./server": "./src/server.js",
+    "./session-host": "./src/session-host.js",
+    "./viewer-server": "./src/viewer-server.js",
+    "./contract": "./contract.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "src/",
+    "contract.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node test/viewer-server.test.mjs && node test/mcp.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.6.5"
+  },
+  "peerDependencies": {
+    "@tessifc/core": "0.2.0",
+    "@tessifc/edit": "0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@tessifc/core": {
+      "optional": true
+    },
+    "@tessifc/edit": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/mcp"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

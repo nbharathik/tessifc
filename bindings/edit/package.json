@@ -1,6 +1,6 @@
 {
   "name": "@tessifc/edit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Editing sessions, browser scripts, IGP reading and agent tools over the TessIFC kernel",
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
@@ -11,7 +11,13 @@
     "./session": "./src/session.js",
     "./script-engine": "./src/script-engine.js",
     "./igp": "./src/igp.js",
-    "./agent-tools": "./src/agent-tools.js"
+    "./agent-tools": "./src/agent-tools.js",
+    "./create-model": "./src/create-model.js",
+    "./providers": "./src/providers.js",
+    "./describe": "./src/describe.js",
+    "./script-helpers": "./src/script-helpers.js",
+    "./verify": "./src/verify.js",
+    "./examples": "./src/examples.js"
   },
   "sideEffects": false,
   "files": [
@@ -40,10 +46,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/script-engine.test.mjs && node test/session.test.mjs"
+    "test": "node test/script-engine.test.mjs && node test/providers.test.mjs && node test/session.test.mjs"
   },
   "peerDependencies": {
-    "@tessifc/core": "0.1.0"
+    "@tessifc/core": "0.2.0"
   },
   "peerDependenciesMeta": {
     "@tessifc/core": {

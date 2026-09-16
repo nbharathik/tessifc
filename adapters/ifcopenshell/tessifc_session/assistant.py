@@ -61,6 +61,14 @@ PROPOSE_TOOL = {
 }
 
 
+UNDO_TOOL = {
+    "name": "undo_edit",
+    "description": "Undo the last published edit as a new revision. Use only when the user asks to undo.",
+    "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    "strict": True,
+}
+
+
 class AssistantError(Exception):
     """A provider or request problem reported to the panel."""
 
@@ -215,7 +223,7 @@ class Assistant:
             raise AssistantError("The request is too long.")
         selection = request.get("selection") or {}
         history = self._history(request.get("history"))
-        tools = [INSPECT_TOOL] + ([PROPOSE_TOOL] if mode == "edit" else [])
+        tools = [INSPECT_TOOL] + ([PROPOSE_TOOL, UNDO_TOOL] if mode == "edit" else [])
         system = [
             {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": f"Mode: {mode}. Edit policy: {policy}.\n" + self.context(selection)},
@@ -280,6 +288,13 @@ class Assistant:
             outcome["run"] = run
             report = json.dumps({key: run.get(key) for key in ("ok", "changed", "error", "traceback", "stdout", "operations")}, default=str)
             return clip(report, TOOL_OUTPUT_CHARS), not run["ok"]
+        if name == "undo_edit":
+            try:
+                run = self.session.undo()
+            except SessionError as error:
+                return str(error), True
+            outcome["run"] = run
+            return json.dumps({key: run.get(key) for key in ("ok", "label", "version", "revision")}, default=str), False
         return f"Unknown tool {name}.", True
 
     @staticmethod

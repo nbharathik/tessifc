@@ -4,9 +4,11 @@
 //! application adds its panels and ribbon on top of these same pieces.
 
 import { DEFAULT_HIDDEN_INSTANCE_FLAGS, readIgp } from "@tessifc/edit/igp";
+import { createEditingSession } from "@tessifc/edit/session";
 import { DEFAULT_LOD_PIXELS, IfcRenderer } from "./renderer.js";
 import { createPackAssembler } from "./stream.js";
 import { createFrameScheduler, createTaskQueue } from "./scheduler.js";
+import { createSessionClient } from "./session-client.js";
 
 export { IfcRenderer, DEFAULT_LOD_PIXELS } from "./renderer.js";
 export { createPackAssembler } from "./stream.js";
@@ -14,6 +16,7 @@ export { createFrameScheduler, createTaskQueue } from "./scheduler.js";
 export { frameSphere, wheelZoomFactor, zoomCamera } from "./navigation.js";
 export { projectPoint, snapToTriangle, measurementBetween } from "./measure.js";
 export { findContestedTriangles, planeKey } from "./depth-planes.js";
+export { createSessionClient } from "./session-client.js";
 
 /** Helper geometry is kept in the pack so a host can reveal it without converting again. */
 export const GEOMETRY_SETTINGS = {
@@ -41,8 +44,9 @@ const CLICK_TRAVEL_PX = 4;
  * Options: `kernel` (a `Kernel` from `@tessifc/core/web`, needed by `open`),
  * `hiddenFlags` (instance flags hidden at load; spaces, openings and
  * references by default), `lodPixels` (skip products smaller than this on
- * screen, 0 to draw everything), `theme` (`"light"` or `"dark"`) and
- * `background` (a CSS hex colour for the canvas).
+ * screen, 0 to draw everything), `theme` (`"light"` or `"dark"`),
+ * `background` (a CSS hex colour for the canvas) and `requireGeometry`
+ * (refuse a model with no drawable product instead of showing it empty).
  */
 export function createViewer(container, options = {}) {
   if (!(container instanceof Element)) throw new TypeError("createViewer needs a DOM element");
@@ -139,10 +143,142 @@ export function createViewer(container, options = {}) {
   }
 
   function adopt(pack, assembler, extra) {
-    model = { pack, assembler, byExpressId: indexPack(pack), overlay: "pending", ...extra };
+    model = { pack, assembler, byExpressId: indexPack(pack), overlay: "pending", session: null, ...extra };
     requestFrame(true);
-    emit("load", { modelId: model.modelId ?? null, info: model.info ?? null, summary: model.summary ?? null });
+    emit("load", { modelId: model.modelId ?? null, info: model.info ?? null, summary: model.summary ?? null, empty: Boolean(model.empty) });
     refineOverlay();
+  }
+
+  // ------------------------------------------------------------ revisions
+
+  /** The editing session over the open model, created on first use and kept in the scene's frame. */
+  function session() {
+    if (!model?.kernel || model.modelId === null || model.modelId === undefined) throw new Error("Open a model with the kernel first.");
+    model.session ??= createEditingSession(model.kernel, model.modelId, { settings: model.settings ?? GEOMETRY_SETTINGS });
+    // The assembler allocates geometry ids; the session works in the same pack space.
+    model.session.adopt({ modelOffset: model.pack.index.model_offset ?? [0, 0, 0], nextGeometryId: model.assembler.nextGeometryId() });
+    return model.session;
+  }
+
+  function hierarchyGuids(hierarchy) {
+    const guids = new Map();
+    for (const node of hierarchy?.nodes ?? []) if (node.globalId) guids.set(node.expressId, node.globalId);
+    return guids;
+  }
+
+  function hierarchyIds(hierarchy) {
+    const ids = new Map();
+    for (const node of hierarchy?.nodes ?? []) {
+      if (!node.globalId) continue;
+      ids.set(node.globalId, ids.has(node.globalId) ? null : node.expressId);
+    }
+    return ids;
+  }
+
+  function identitiesOf(records, guids) {
+    const ids = new Set();
+    for (const record of records) ids.add(model.pack.instances.expressIds[record]);
+    return [...ids].map((id) => ({ id, guid: guids.get(id) ?? null }));
+  }
+
+  function restoreIdentities(identities, ids, fullRebuild) {
+    return identities.map(({ id, guid }) => {
+      if (!guid) return fullRebuild ? null : id;
+      const found = ids.get(guid);
+      if (Number.isInteger(found)) return found;
+      return found === null && !fullRebuild ? id : null;
+    }).filter((id) => Number.isInteger(id));
+  }
+
+  /**
+   * Apply a scene delta from `@tessifc/edit` (a session's `runScript`,
+   * `applySnapshot`, `undo`, or a delta received from elsewhere): affected and
+   * removed products are retired, the delta's instances added, unrelated GPU
+   * batches kept, and selection and visibility restored by product identity.
+   */
+  function applyDelta(delta) {
+    if (!model) throw new Error("Open a model first.");
+    if (!delta?.pack) throw new Error("applyDelta needs a delta with its parsed pack.");
+    const full = delta.kind === "full" || Boolean(delta.fullRebuild);
+    const affected = delta.affectedProducts ?? [];
+    const removed = delta.removedProducts ?? [];
+    const metadata = delta.metadataProducts ?? [];
+    const guids = hierarchyGuids(model.hierarchy);
+    const kept = { hidden: identitiesOf(hidden, guids), shown: identitiesOf(shown, guids), isolated: isolated ? identitiesOf(isolated, guids) : null,
+      selected: selection ? selection.expressIds.map((id) => ({ id, guid: guids.get(id) ?? null })) : [] };
+    let assembler = model.assembler;
+    let result;
+    if (full) {
+      assembler = createPackAssembler();
+      assembler.append(delta.pack);
+      result = { changed: true };
+    } else {
+      result = assembler.replaceProducts([...new Set([...affected, ...removed])], delta.pack);
+    }
+    const pack = assembler.pack();
+    const hierarchy = delta.hierarchy ?? model.hierarchy;
+    const ids = hierarchyIds(hierarchy);
+    model = { ...model, pack, assembler, byExpressId: indexPack(pack), hierarchy, empty: !pack.instances.count };
+    const restore = (items) => new Set(recordsOf(restoreIdentities(items, ids, full)));
+    const nextHidden = restore(kept.hidden);
+    const nextShown = restore(kept.shown);
+    hidden.clear();
+    shown.clear();
+    for (const record of nextHidden) hidden.add(record);
+    for (const record of nextShown) shown.add(record);
+    isolated = kept.isolated ? restore(kept.isolated) : null;
+    if (result.changed) {
+      if (full) renderer.reload(pack, visibleIn(pack));
+      else renderer.applyDelta(pack, result, visibleIn(pack));
+    }
+    const selectedIds = restoreIdentities(kept.selected, ids, full).filter((id) => model.byExpressId.has(id));
+    if (selectedIds.length) {
+      selection = { expressIds: selectedIds, records: recordsOf(selectedIds) };
+      renderer.select(selection.records);
+    } else if (selection) {
+      selection = null;
+      renderer.select([]);
+      emit("select", null);
+    }
+    if (result.changed && !full) renderer.flash?.(recordsOf([...affected, ...metadata]));
+    if (result.changed) refineOverlay();
+    requestFrame(true);
+    const report = { revision: delta.revision ?? null, kind: delta.kind ?? (full ? "full" : "selective"), affectedProducts: affected,
+      removedProducts: removed, metadataProducts: metadata, fullRebuild: full, changed: Boolean(result.changed) };
+    emit("revision", report);
+    return report;
+  }
+
+  let following = null;
+
+  /**
+   * Follow a local editing session (tessifc-mcp or the Python session server)
+   * at `target`, a base URL or `{ baseUrl }`; "" means the page's own origin.
+   * Every published version is opened or applied as a delta and reported as a
+   * `revision` event; `session` events carry the host's status. Returns the client.
+   */
+  function follow(target = "") {
+    unfollow();
+    const baseUrl = typeof target === "string" ? target : target?.baseUrl ?? "";
+    const client = createSessionClient({
+      baseUrl: baseUrl.replace(/\/$/, ""),
+      ready: () => !disposed && !streaming,
+      loaded: () => Boolean(model?.kernel),
+      open: (file) => open(file),
+      update: async (file) => {
+        const delta = session().applySnapshot(new Uint8Array(await file.arrayBuffer()));
+        return applyDelta(delta);
+      },
+      report: (message) => emit("session", { error: message }),
+      status: (status) => emit("session", { status }),
+    });
+    following = client;
+    return client;
+  }
+
+  function unfollow() {
+    following?.stop();
+    following = null;
   }
 
   // The coincident-surface overlay starts from bounding boxes; a worker then finds the
@@ -276,14 +412,16 @@ export function createViewer(container, options = {}) {
       }
       streaming = false;
       const pack = assembler.pack();
-      if (!pack.instances.count || !pack.geometry.length) {
+      const empty = !pack.instances.count || !pack.geometry.length;
+      if (empty && (openOptions.requireGeometry ?? options.requireGeometry)) {
         renderer.clear();
         throw new Error("The IFC parsed correctly, but no supported product geometry was produced.");
       }
+      // An empty scene stays open: a session or a delta adds the products.
       renderer.finishStream(pack, visibleIn(pack));
       const hierarchy = JSON.parse(kernel.getSpatialHierarchy?.(modelId) ?? '{"nodes":[]}');
-      adopt(pack, assembler, { modelId, kernel, info, summary, hierarchy });
-      return { modelId, info, summary, hierarchy };
+      adopt(pack, assembler, { modelId, kernel, info, summary, hierarchy, settings: { ...GEOMETRY_SETTINGS, ...openOptions.settings }, empty });
+      return { modelId, info, summary, hierarchy, empty };
     } catch (error) {
       if (modelId !== undefined) kernel.closeModel(modelId);
       if (!superseded()) {
@@ -315,6 +453,7 @@ export function createViewer(container, options = {}) {
     if (!model && !streaming) return;
     const kernel = model?.kernel;
     const modelId = model?.modelId;
+    model?.session?.close();
     model = null;
     streaming = false;
     resetState();
@@ -474,7 +613,7 @@ export function createViewer(container, options = {}) {
 
   // ------------------------------------------------------------------ events
 
-  /** Listen for `load`, `progress`, `select`, `visibility`, `camera`, `overlay` or `close`; returns the unsubscribe function. */
+  /** Listen for `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`, `revision` or `session`; returns the unsubscribe function. */
   function on(event, listener) {
     const list = listeners.get(event) ?? [];
     list.push(listener);
@@ -488,6 +627,7 @@ export function createViewer(container, options = {}) {
   function dispose() {
     if (disposed) return;
     disposed = true;
+    unfollow();
     close();
     scheduler.cancel();
     tasks.dispose();
@@ -526,6 +666,10 @@ export function createViewer(container, options = {}) {
     resize: () => renderer.resize(),
     on,
     dispose,
+    applyDelta,
+    session,
+    follow,
+    unfollow,
     /** The assembled IGP pack of the open model, or `null`. */
     pack: () => model?.pack ?? null,
     /** The kernel's spatial hierarchy for the open model, or `null` for a pack. */

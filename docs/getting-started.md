@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Getting started
 
-Start from the checkout for the v0.1 developer preview. Rust is pinned in
+Start from the checkout for the v0.2 developer preview. Rust is pinned in
 `rust-toolchain.toml`; the helper scripts use Python 3.11 or newer. Node 20
 or newer is needed for Node integrations and JavaScript tests.
 
@@ -106,6 +106,14 @@ After publication, use `require("@tessifc/core/node")` or
 `require("@tessifc/core")`. Use a worker thread or child process for workloads
 that must not block a Node server.
 
+To edit rather than only read, wrap the open model in a session from
+`bindings/edit` (`@tessifc/edit`): scripts, attribute edits, undo and a
+model built from nothing all come back as deltas that name the affected
+products. To let an agent do the editing while the viewer follows, start
+`node bindings/mcp/src/cli.js --new house.ifc` (after `npm ci --prefix
+bindings/mcp`) and register it with your MCP client; see
+[Agents and pipelines](agents.md).
+
 ## Command line
 
 ```sh
@@ -178,4 +186,5 @@ WASM package and redirects are included. Run the website regression checks with
 `python -m unittest discover -s scripts -p 'test_build_site.py'`.
 
 Continue with the [SDK](sdk.md), [coverage](coverage.md),
-[preview contract](preview.md), [IGP format](igp-format.md) and [editing](editing.md).
+[preview contract](preview.md), [IGP format](igp-format.md), [editing](editing.md)
+and [agents and pipelines](agents.md).

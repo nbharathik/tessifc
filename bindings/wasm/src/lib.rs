@@ -18,7 +18,7 @@
 use glam::DVec3;
 use std::collections::{BTreeMap, BTreeSet};
 use tessifc_engine::pack::{PackState, Packer};
-use tessifc_engine::revision::{ChangeImpact, compare_revisions};
+use tessifc_engine::revision::{ChangeImpact, compare_revisions_with_sources};
 use tessifc_engine::{Engine, EvaluationResult, ProductOutcome, ProductState, Session};
 use tessifc_geom::{Settings as Settings3d, product_category};
 use tessifc_model::Model;
@@ -136,6 +136,32 @@ fn now_ms() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
+/// Sub-millisecond time for stage reports: `performance.now()` where the host has it.
+#[cfg(target_arch = "wasm32")]
+fn precise_now_ms() -> f64 {
+    use std::cell::OnceCell;
+    thread_local! {
+        static CLOCK: OnceCell<Option<(js_sys::Object, js_sys::Function)>> = const { OnceCell::new() };
+    }
+    CLOCK.with(|clock| {
+        let clock = clock.get_or_init(|| {
+            let performance =
+                js_sys::Reflect::get(&js_sys::global(), &"performance".into()).ok()?;
+            let now = js_sys::Reflect::get(&performance, &"now".into()).ok()?;
+            Some((performance.dyn_into().ok()?, now.dyn_into().ok()?))
+        });
+        clock
+            .as_ref()
+            .and_then(|(performance, now)| now.call0(performance).ok()?.as_f64())
+            .unwrap_or_else(js_sys::Date::now)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn precise_now_ms() -> f64 {
+    now_ms()
+}
+
 /// Version of the TessIFC crates this module was built from.
 #[wasm_bindgen]
 pub fn version() -> String {
@@ -201,6 +227,23 @@ struct Stream {
     chunk: u32,
 }
 
+/// Milliseconds spent in each stage of preparing and evaluating a revision.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RevisionTimings {
+    validate_source_ms: f64,
+    parse_ms: f64,
+    validate_model_ms: f64,
+    compare_ms: f64,
+    prepare_ms: f64,
+    session_ms: f64,
+    evaluate_ms: f64,
+    outcomes_ms: f64,
+    pack_ms: f64,
+    baseline_ms: f64,
+    evaluate_total_ms: f64,
+}
+
 /// An unpublished model and the result of checking its replacement geometry.
 struct PreparedRevision {
     source: Vec<u8>,
@@ -216,6 +259,8 @@ struct PreparedRevision {
     evaluation_settings: Option<serde_json::Value>,
     model_offset: Option<[f64; 3]>,
     refused_boolean_products: Vec<u32>,
+    timings: RevisionTimings,
+    dangling: BTreeSet<(u32, u32)>,
 }
 
 struct GeometryBasis {
@@ -240,6 +285,7 @@ impl PreparedRevision {
             .unwrap_or(serde_json::Value::Null);
         report["modelOffset"] = serde_json::json!(self.model_offset);
         report["refusedBooleanProducts"] = serde_json::json!(self.refused_boolean_products);
+        report["timings"] = serde_json::to_value(&self.timings).unwrap_or(serde_json::Value::Null);
         report.to_string()
     }
 }
@@ -268,6 +314,8 @@ pub struct Kernel {
     options: BTreeMap<u32, OpenOptions>,
     revisions: BTreeMap<u32, u64>,
     prepared: BTreeMap<u32, PreparedRevision>,
+    /// Dangling references of each committed model, found once and carried across revisions.
+    dangling: BTreeMap<u32, BTreeSet<(u32, u32)>>,
     next_candidate: u64,
     geometry_basis: BTreeMap<u32, GeometryBasis>,
     published_outcomes: BTreeMap<u32, Vec<ProductOutcome>>,
@@ -296,6 +344,7 @@ impl Kernel {
             sources: BTreeMap::new(),
             revisions: BTreeMap::new(),
             prepared: BTreeMap::new(),
+            dangling: BTreeMap::new(),
             next_candidate: 1,
             geometry_basis: BTreeMap::new(),
             published_outcomes: BTreeMap::new(),
@@ -474,6 +523,24 @@ impl Kernel {
             })
             .to_string(),
         )
+    }
+
+    /// The class and its supertypes up to the root, as a JSON array of names;
+    /// `undefined` for an unknown model or a class outside its schema.
+    #[wasm_bindgen(js_name = getClassSupertypes)]
+    pub fn get_class_supertypes(&self, model_id: u32, class_name: &str) -> Option<String> {
+        let model = self.models.get(&model_id)?;
+        let schema = model.schema();
+        let mut names = Vec::new();
+        let mut next = Some(schema.class_by_name(class_name)?);
+        while let Some(class) = next
+            && names.len() < schema.class_count()
+        {
+            let definition = schema.class(class);
+            names.push(definition.name);
+            next = definition.parent;
+        }
+        Some(serde_json::json!(names).to_string())
     }
 
     /// The rendered building hierarchy as a flat JSON node list of products and
@@ -1189,6 +1256,7 @@ impl Kernel {
         self.geometry_basis.remove(&model_id);
         self.published_outcomes.remove(&model_id);
         self.prepared.remove(&model_id);
+        self.dangling.remove(&model_id);
         self.revisions.remove(&model_id);
         self.geometry.remove(&model_id);
         self.streams.remove(&model_id);
@@ -1209,6 +1277,7 @@ impl Kernel {
         self.geometry_basis.clear();
         self.published_outcomes.clear();
         self.prepared.clear();
+        self.dangling.clear();
         self.revisions.clear();
         self.geometry.clear();
         self.streams.clear();
@@ -1267,12 +1336,34 @@ impl Kernel {
         if self.prepared.contains_key(&model_id) {
             return Err("discard the existing prepared revision first".into());
         }
+        let started = precise_now_ms();
         validate_complete_source(&source)?;
+        let validated = precise_now_ms();
         let old = self.models.get(&model_id).ok_or("model is not open")?;
         let options = self.options.get(&model_id).cloned().unwrap_or_default();
         let model = Model::new(parse(&source, &options.parse_options()));
-        validate_revision_model(old, &model)?;
-        let impact = compare_revisions(old, &model);
+        let parsed = precise_now_ms();
+        let old_dangling = self
+            .dangling
+            .entry(model_id)
+            .or_insert_with(|| dangling_references(old));
+        let dangling = validate_revision_model(old, &model, old_dangling)?;
+        let checked = precise_now_ms();
+        let old_source = self
+            .sources
+            .get(&model_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let impact = compare_revisions_with_sources(old, old_source, &model, &source);
+        let compared = precise_now_ms();
+        let timings = RevisionTimings {
+            validate_source_ms: validated - started,
+            parse_ms: parsed - validated,
+            validate_model_ms: checked - parsed,
+            compare_ms: compared - checked,
+            prepare_ms: compared - started,
+            ..RevisionTimings::default()
+        };
         let revision = base.checked_add(1).ok_or("revision counter exhausted")?;
         let token = self.next_candidate;
         self.next_candidate = token.checked_add(1).ok_or("candidate counter exhausted")?;
@@ -1290,6 +1381,8 @@ impl Kernel {
             evaluation_settings: None,
             model_offset: None,
             refused_boolean_products: Vec::new(),
+            timings,
+            dangling,
         };
         let report = prepared.report();
         self.prepared.insert(model_id, prepared);
@@ -1367,11 +1460,13 @@ impl Kernel {
         if self.revisions.get(&model_id) != Some(&prepared.base_revision) {
             return Err("stale prepared revision".into());
         }
+        let started = precise_now_ms();
         let result = evaluate_subset(
             &prepared.model,
             &prepared.impact.affected_products,
             &options,
         );
+        let evaluated = precise_now_ms();
         // A broad invalidation must not fail merely because an unchanged object
         // was already unsupported. Verify those exceptions against the old model.
         let old = self.models.get(&model_id).ok_or("model is not open")?;
@@ -1439,6 +1534,13 @@ impl Kernel {
         prepared.refused_boolean_products = result.refused_boolean_products;
         prepared.evaluation_settings = Some(effective_settings(&options.geometry));
         prepared.model_offset = Some(result.model_offset);
+        let finished = precise_now_ms();
+        prepared.timings.session_ms = result.stages.session_ms;
+        prepared.timings.evaluate_ms = result.stages.evaluate_ms;
+        prepared.timings.outcomes_ms = result.stages.outcomes_ms;
+        prepared.timings.pack_ms = result.stages.pack_ms;
+        prepared.timings.baseline_ms = finished - evaluated;
+        prepared.timings.evaluate_total_ms = finished - started;
         Ok(result.bytes)
     }
 
@@ -1499,6 +1601,7 @@ impl Kernel {
         self.sources.insert(model_id, prepared.source);
         self.models.insert(model_id, prepared.model);
         self.revisions.insert(model_id, prepared.revision);
+        self.dangling.insert(model_id, prepared.dangling);
         Ok(prepared.revision.to_string())
     }
 
@@ -1567,6 +1670,7 @@ impl Kernel {
             .checked_add(1)
             .ok_or_else(|| JsValue::from_str("revision counter exhausted"))?;
         self.prepared.remove(&model_id);
+        self.dangling.remove(&model_id);
         self.revisions.insert(model_id, revision);
         self.geometry.remove(&model_id);
         // A finished stream still describes the pack the viewer holds; keep it.
@@ -1587,6 +1691,15 @@ struct SubsetEvaluation {
     diagnostics: Vec<tessifc_step::Diagnostic>,
     model_offset: [f64; 3],
     refused_boolean_products: Vec<u32>,
+    stages: SubsetStages,
+}
+
+#[derive(Default)]
+struct SubsetStages {
+    session_ms: f64,
+    evaluate_ms: f64,
+    outcomes_ms: f64,
+    pack_ms: f64,
 }
 
 fn failed_outcome(state: ProductState) -> bool {
@@ -1601,19 +1714,23 @@ fn evaluate_subset(
     express_ids: &[u32],
     options: &GeometrySettings,
 ) -> SubsetEvaluation {
+    let started = precise_now_ms();
     let mut session = Engine::with_settings(options.geometry.clone()).session(model);
     session.restrict(express_ids);
     if let Some(offset) = options.model_offset {
         session.set_model_offset(DVec3::from_array(offset));
     }
     let total = session.total();
+    let prepared = precise_now_ms();
     let mut batch = session.next(model, |_| false);
+    let evaluated = precise_now_ms();
     let ids: BTreeSet<u32> = express_ids.iter().copied().collect();
     let mut outcomes: Vec<ProductOutcome> = session
         .outcomes(model)
         .into_iter()
         .filter(|outcome| ids.contains(&outcome.express_id))
         .collect();
+    let classified = precise_now_ms();
     let state = PackState {
         stream: tessifc_pack::StreamState {
             known: Default::default(),
@@ -1635,6 +1752,7 @@ fn evaluate_subset(
         products_total: total,
     });
     let mut refused_boolean_products = Vec::new();
+    let products = batch.shapes.len();
     for shape in batch.shapes {
         let product_id = shape.express_id;
         let expected_parts = shape.parts.len();
@@ -1646,23 +1764,9 @@ fn evaluate_subset(
         {
             refused_boolean_products.push(product_id);
         }
-        // A patch is self-contained; it cannot refer to an absent family mesh.
-        let parts = shape
-            .parts
-            .into_iter()
-            .map(|part| tessifc_engine::ShapePart {
-                geometry: tessifc_engine::PartGeometry::Unique(part.mesh()),
-                color: part.color,
-                provenance: part.provenance.clone(),
-            })
-            .collect();
-        packer.add_shape(tessifc_engine::Shape {
-            express_id: shape.express_id,
-            class: shape.class,
-            category: shape.category,
-            color: shape.color,
-            parts,
-        });
+        // The packer starts with no known families, so a shared mesh is written once
+        // inside this patch and placed by its transforms, like the initial stream.
+        packer.add_shape(shape);
         if packer.instance_count() - before_parts != expected_parts {
             batch.diagnostics.push(tessifc_step::Diagnostic::error(
                 tessifc_step::DiagCode("E_REVISION_PACK_FAILED"), 0,
@@ -1674,12 +1778,21 @@ fn evaluate_subset(
         }
     }
     packer.add_diagnostics(&batch.diagnostics);
+    packer.set_stat("products", products as f64);
+    packer.set_stat("triangles", packer.triangles() as f64);
+    let bytes = packer.finish();
     SubsetEvaluation {
-        bytes: packer.finish(),
+        bytes,
         outcomes,
         diagnostics: batch.diagnostics,
         model_offset: session.model_offset().to_array(),
         refused_boolean_products,
+        stages: SubsetStages {
+            session_ms: prepared - started,
+            evaluate_ms: evaluated - prepared,
+            outcomes_ms: classified - evaluated,
+            pack_ms: precise_now_ms() - classified,
+        },
     }
 }
 
@@ -1700,8 +1813,11 @@ fn references(model: &Model, id: u32) -> Vec<u32> {
 fn dangling_references(model: &Model) -> BTreeSet<(u32, u32)> {
     let mut result = BTreeSet::new();
     for entry in &model.image().index {
-        for target in references(model, entry.express_id) {
-            if model.entity(target).is_none() {
+        let mut cursor = model.image().args_of(entry);
+        while let Some(value) = cursor.read() {
+            if let tessifc_step::RawValue::Ref(target) = value
+                && model.entity(target).is_none()
+            {
                 result.insert((entry.express_id, target));
             }
         }
@@ -1727,7 +1843,13 @@ fn unchanged_forward_graph(old: &Model, new: &Model, product: u32) -> bool {
     true
 }
 
-fn validate_revision_model(old: &Model, new: &Model) -> Result<(), String> {
+/// Reject what the permissive parser accepted but a revision must not introduce;
+/// returns the candidate's dangling references for the next comparison.
+fn validate_revision_model(
+    old: &Model,
+    new: &Model,
+    old_dangling: &BTreeSet<(u32, u32)>,
+) -> Result<BTreeSet<(u32, u32)>, String> {
     use tessifc_step::{DiagCode, Severity};
     let diagnostics = &new.image().diagnostics;
     if diagnostics.dropped() != 0 {
@@ -1757,13 +1879,13 @@ fn validate_revision_model(old: &Model, new: &Model) -> Result<(), String> {
             return Err(format!("candidate IFC introduced an arity mismatch: {d}"));
         }
     }
-    let old_dangling = dangling_references(old);
-    if let Some((owner, target)) = dangling_references(new).difference(&old_dangling).next() {
+    let dangling = dangling_references(new);
+    if let Some((owner, target)) = dangling.difference(old_dangling).next() {
         return Err(format!(
             "candidate IFC introduced dangling reference #{owner} -> #{target}"
         ));
     }
-    Ok(())
+    Ok(dangling)
 }
 
 /// The permissive parser accepts partial input for viewing. Revision publication
@@ -2163,6 +2285,24 @@ ENDSEC;\nEND-ISO-10303-21;\n";
     }
 
     #[test]
+    fn class_supertypes_walk_to_the_root() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(TINY.to_vec(), None).unwrap();
+        let chain: Vec<String> = serde_json::from_str(
+            &kernel
+                .get_class_supertypes(id, "IfcWallStandardCase")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chain[0], "IfcWallStandardCase");
+        assert_eq!(chain[1], "IfcWall");
+        assert!(chain.iter().any(|name| name == "IfcProduct"));
+        assert_eq!(chain.last().map(String::as_str), Some("IfcRoot"));
+        assert!(kernel.get_class_supertypes(id, "IfcSpaceship").is_none());
+        assert!(kernel.get_class_supertypes(99, "IfcWall").is_none());
+    }
+
+    #[test]
     fn spatial_hierarchy_follows_aggregation_and_containment() {
         let mut kernel = Kernel::new();
         let id = kernel.open_model(HIERARCHY.to_vec(), None).unwrap();
@@ -2289,6 +2429,108 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert!(OpenOptions::from_json(r#"{"maxEntities":-1}"#).is_err());
         let options = OpenOptions::from_json(r#"{"maxEntities":7,"other":true}"#).unwrap();
         assert_eq!(options.max_entities, Some(7));
+    }
+
+    #[test]
+    fn a_patch_keeps_shared_families_and_carries_stats() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(FOUR_PRODUCTS.to_vec(), None).unwrap();
+        let options = r#"{"firstGeometryId":40}"#;
+        let patch = json_of(
+            &kernel
+                .evaluate_products(id, &[33, 43], Some(options.into()))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(patch["instances"]["count"], 2);
+        assert_eq!(patch["geometries"].as_array().unwrap().len(), 1);
+        assert_eq!(patch["geometries"][0]["id"], 40);
+        assert_eq!(patch["stats"]["products"], 2.0);
+        assert!(patch["stats"]["triangles"].as_f64().unwrap() > 0.0);
+
+        // A full rebuild through the revision path shares what the stream shares.
+        kernel.evaluate_geometry(id, None).unwrap();
+        let whole = json_of(&kernel.take_pack(id).unwrap());
+        let renamed_guid = String::from_utf8_lossy(FOUR_PRODUCTS)
+            .replace("IFCWALL('a'", "IFCWALL('z'")
+            .into_bytes();
+        let report: serde_json::Value = serde_json::from_str(
+            &kernel
+                .prepare_revision_inner(id, renamed_guid, "0")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["fullRebuild"], true);
+        let settings = GeometrySettings::from_json(r#"{"firstGeometryId":100}"#).unwrap();
+        let rebuilt = json_of(
+            &kernel
+                .evaluate_prepared_revision_inner(id, settings)
+                .unwrap(),
+        );
+        assert_eq!(rebuilt["instances"]["count"], whole["instances"]["count"]);
+        assert_eq!(
+            rebuilt["geometries"].as_array().unwrap().len(),
+            whole["geometries"].as_array().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn dangling_references_are_checked_against_the_committed_model() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let renamed = String::from_utf8_lossy(BOX)
+            .replace("'W1'", "'W2'")
+            .into_bytes();
+        kernel
+            .prepare_revision_inner(id, renamed.clone(), "0")
+            .unwrap();
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+        assert!(kernel.dangling.contains_key(&id));
+        let dangling = String::from_utf8_lossy(&renamed)
+            .replace("#8=IFCLOCALPLACEMENT($,#7)", "#8=IFCLOCALPLACEMENT($,#77)")
+            .into_bytes();
+        let refused = kernel
+            .prepare_revision_inner(id, dangling, "1")
+            .unwrap_err();
+        assert!(
+            refused.contains("dangling reference #8 -> #77"),
+            "{refused}"
+        );
+        // A legacy edit replaces the model; the next comparison starts from a fresh scan.
+        kernel.set_attribute(id, 9, "Name", "W3", false).unwrap();
+        assert!(!kernel.dangling.contains_key(&id));
+        let again = String::from_utf8_lossy(&kernel.export_model(id).unwrap())
+            .replace("'W3'", "'W4'")
+            .into_bytes();
+        kernel.prepare_revision_inner(id, again, "2").unwrap();
+        assert!(kernel.dangling.contains_key(&id));
+    }
+
+    #[test]
+    fn the_prepared_report_carries_stage_timings() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let edited = String::from_utf8_lossy(BOX)
+            .replace("#2,3.)", "#2,5.)")
+            .into_bytes();
+        let report: serde_json::Value =
+            serde_json::from_str(&kernel.prepare_revision_inner(id, edited, "0").unwrap()).unwrap();
+        let timings = &report["timings"];
+        let stage = |name: &str| timings[name].as_f64().unwrap();
+        assert!(stage("prepareMs") >= stage("parseMs") && stage("parseMs") >= 0.0);
+        assert_eq!(stage("evaluateTotalMs"), 0.0);
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::from_json("{}").unwrap())
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&kernel.get_prepared_revision_info(id).unwrap()).unwrap();
+        let after = &report["timings"];
+        assert!(
+            after["evaluateTotalMs"].as_f64().unwrap() >= after["evaluateMs"].as_f64().unwrap()
+        );
+        assert!(
+            after["sessionMs"].as_f64().unwrap() >= 0.0 && after["packMs"].as_f64().unwrap() >= 0.0
+        );
     }
 
     #[test]

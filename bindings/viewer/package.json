@@ -1,6 +1,6 @@
 {
   "name": "@tessifc/viewer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A minimal WebGL2 IFC viewer over the TessIFC kernel: open a file, stream its geometry, select, hide, section and frame; build your own interface on top",
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
@@ -15,7 +15,8 @@
     "./picking": "./src/picking.js",
     "./culling": "./src/culling.js",
     "./scheduler": "./src/scheduler.js",
-    "./depth-planes": "./src/depth-planes.js"
+    "./depth-planes": "./src/depth-planes.js",
+    "./session-client": "./src/session-client.js"
   },
   "sideEffects": false,
   "files": [
@@ -47,10 +48,10 @@
     "test": "node test/embed.test.mjs"
   },
   "dependencies": {
-    "@tessifc/edit": "0.1.0"
+    "@tessifc/edit": "0.2.0"
   },
   "peerDependencies": {
-    "@tessifc/core": "0.1.0"
+    "@tessifc/core": "0.2.0"
   },
   "peerDependenciesMeta": {
     "@tessifc/core": {

@@ -141,11 +141,49 @@ try {
   assert.equal(await products(), before + 2);
   console.log("ok undo and redo publish the stored source as new revisions");
 
+  // Inspector saves and external updates enter the same history as scripts, so undo never
+  // silently reverts them, and a new change clears the redo stack.
+  const historyAt = () => page.evaluate(() => ({ ...window.__tessifc.state.scriptHistory }));
+  const nameOf = () => page.evaluate(() => window.__tessifc.state.selection?.info?.fields.find((field) => field.name === "Name")?.value ?? null);
+  const undoBefore = (await historyAt()).undo;
+  await page.evaluate((id) => window.__tessifc.selectExpressId(id), wallId);
+  await page.waitForFunction(() => document.querySelector('#edit-fields [data-attribute="Name"]'));
+  await page.evaluate(() => {
+    const input = document.querySelector('#edit-fields [data-attribute="Name"]');
+    input.value = "Inspector name";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector("#edit-apply").click();
+  });
+  await revision("4");
+  assert.equal((await historyAt()).undo, undoBefore + 1, "an inspector save is an undo entry");
+  assert.equal(await nameOf(), "Inspector name");
+  await page.click("#script-undo");
+  await revision("5");
+  await page.waitForFunction(() => window.__tessifc.state.selection?.infoState === "ready");
+  assert.equal(await nameOf(), "Gallery wall", "undo restores the name the inspector changed");
+  assert.deepEqual(await historyAt(), { undo: undoBefore, redo: 1 });
+  page.once("dialog", (dialog) => dialog.accept());
+  const external = Buffer.from(pavilionFile().buffer.toString("latin1").replace("'Roof'", "'Roof edited'"), "latin1");
+  await page.setInputFiles("#revision-input", { name: "pavilion.ifc", mimeType: "application/octet-stream", buffer: external });
+  await revision("6");
+  assert.deepEqual(await historyAt(), { undo: undoBefore + 1, redo: 0 }, "an external update is an undo entry and clears redo");
+  const hasDoor = () => page.evaluate(() => {
+    const pack = window.__tessifc.pack();
+    return Array.from(pack.instances.classIds).some((classId, record) => pack.instances.active[record] && String(pack.index.classes[classId]) === "IfcDoor");
+  });
+  assert.equal(await hasDoor(), false, "the pristine file has no door");
+  await page.click("#script-undo");
+  await revision("7");
+  assert.equal(await hasDoor(), true, "undoing the external update brings the door back");
+  assert.deepEqual(await historyAt(), { undo: undoBefore, redo: 1 });
+  assert.deepEqual(problems, []);
+  console.log("ok inspector saves and external updates share the undo history");
+
   await page.fill("#script-editor", 'print("before");\nmissing();\n');
   await page.keyboard.press("Control+Enter");
   await page.waitForFunction(() => /ReferenceError: missing is not defined/.test(document.querySelector("#script-output").textContent));
   assert.match(await page.textContent("#script-output"), /line 2: missing\(\);/);
-  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "3");
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "7");
   console.log("ok a failing script reports its line and publishes nothing");
 
   // A read-only script publishes nothing either.
@@ -153,8 +191,19 @@ try {
   seen = await metaCount();
   await page.click("#script-run");
   seen = await nextMeta(seen, /No changes/);
-  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "3");
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "7");
   console.log("ok a read-only script publishes no revision");
+
+  // A script the kernel refuses (the wall loses its profile) reports the reason and publishes nothing.
+  await page.evaluate((id) => window.__tessifc.selectExpressId(id), wallId);
+  await page.waitForFunction(() => window.__tessifc.state.selection?.infoState === "ready");
+  await page.fill("#script-editor", "selected.Representation.Representations[0].Items[0].SweptArea = null;");
+  await page.keyboard.press("Control+Enter");
+  await page.waitForFunction(() => /rejected/.test(document.querySelector("#script-output").textContent), null, { timeout: 60000 });
+  assert.match(await page.textContent("#script-output"), /rejected: (E_|#\d+)/);
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "7");
+  assert.equal(await page.evaluate(() => window.__tessifc.state.revisionPending), null);
+  console.log("ok a rejected script names the kernel's reason and publishes nothing");
 
   // Deleting the selected door removes it and its relationships; the selection clears.
   const doorId = await page.evaluate(() => {
@@ -168,7 +217,7 @@ try {
   await page.waitForFunction(() => window.__tessifc.state.selection?.infoState === "ready");
   await page.selectOption("#script-example", { label: "Delete the selection" });
   await page.click("#script-run");
-  await revision("4");
+  await revision("8");
   assert.deepEqual(await page.evaluate(() => window.__tessifc.state.model.lastUpdate.removedProducts), [doorId]);
   assert.equal(await page.evaluate(() => window.__tessifc.state.selection), null);
   console.log("ok deleting the selection removes the product and clears the selection");
@@ -178,7 +227,7 @@ try {
   await page.fill("#assistant-prompt", "How many walls are there?");
   await page.keyboard.press("Enter");
   await page.waitForFunction(() => /Fake assistant: walls 2/.test(document.querySelector("#assistant-log").textContent), null, { timeout: 60000 });
-  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "4");
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "8");
   const askRequest = provider.requests[0];
   assert.equal(askRequest.headers.authorization, "Bearer test-key");
   assert.equal(askRequest.payload.model, "fake-model");
@@ -192,11 +241,11 @@ try {
   await page.click("#assistant-send");
   await page.waitForSelector("#assistant-log .proposal", { timeout: 60000 });
   assert.match(await page.textContent("#assistant-log .proposal-code"), /Assistant renamed wall/);
-  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "4");
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "8");
   seen = await metaCount();
   await page.click("#assistant-log .proposal .btn.accent");
-  await revision("5");
-  seen = await nextMeta(seen, /View updated: revision 5, 0 geometry updates/);
+  await revision("9");
+  seen = await nextMeta(seen, /View updated: revision 9, 0 geometry updates/);
   assert.equal(await page.evaluate(() => window.__tessifc.state.model.lastUpdate.affectedProducts.length), 0);
   console.log("ok an edit proposal is reviewed and then run through the script path");
 
@@ -205,7 +254,7 @@ try {
   await page.check("#assistant-auto");
   await page.fill("#assistant-prompt", "Raise the first wall");
   await page.click("#assistant-send");
-  await revision("6");
+  await revision("10");
   await page.waitForFunction(() => document.querySelectorAll("#assistant-log .proposal button.accent[disabled]").length === 2, null, { timeout: 60000 });
   assert.equal(await page.evaluate(() => window.__tessifc.state.model.lastUpdate.affectedProducts.length), 1);
   console.log("ok the automatic policy runs the proposal and reports the impact");

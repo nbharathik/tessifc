@@ -67,6 +67,9 @@ check(doorDefinition.attributes[0].name === "GlobalId" && !doorDefinition.attrib
 check(doorDefinition.attributes.find((a) => a.name === "OverallHeight")?.base === "real", "attribute bases are reported");
 check(JSON.parse(kernel.getClassAttributes(tinyId, "IfcProduct")).abstract === true, "abstract classes are flagged");
 check(kernel.getClassAttributes(tinyId, "IfcSpaceship") === undefined, "an unknown class is undefined");
+const doorChain = JSON.parse(kernel.getClassSupertypes(tinyId, "IfcDoor"));
+check(doorChain[0] === "IfcDoor" && doorChain.includes("IfcProduct") && doorChain.at(-1) === "IfcRoot", "getClassSupertypes walks to IfcRoot");
+check(kernel.getClassSupertypes(tinyId, "IfcSpaceship") === undefined, "supertypes of an unknown class are undefined");
 
 // Garbage must not throw, and must be reported rather than swallowed.
 const junkId = kernel.openModel(new Uint8Array([0, 1, 2, 3, 255, 254]));

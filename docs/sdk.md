@@ -1,19 +1,22 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # The TessIFC SDK
 
-The v0.1 developer preview exposes one Rust kernel through native and WASM
-interfaces. Start with the [local build](getting-started.md) and read the
-[preview contract](preview.md). Registry installation applies after publication.
+The v0.2 developer preview exposes one Rust kernel through native and WASM
+interfaces, an editing session over it, and two ways for an agent to drive
+that session. Start with the [local build](getting-started.md) and read the
+[preview contract](preview.md). Packages ship as tarballs on the Releases
+page; registry installation applies after publication.
 
 ## Packages
 
 | Package | Registry | What it is | Status |
 |---|---|---|---|
 | `@tessifc/core` | npm | The WebAssembly kernel and its TypeScript declarations. Browser and Node builds. | preview |
-| `@tessifc/edit` | npm | The editing session, browser scripts, the IGP reader and agent tools over the kernel. | preview |
-| `@tessifc/viewer` | npm | The WebGL2 renderer behind the reference viewer as an embeddable component: open, stream, select, hide, section, frame. | preview |
+| `@tessifc/edit` | npm | The editing session, scripts with building helpers, new models from nothing, the IGP reader, agent tools, provider adapters and verification over the kernel. | preview |
+| `@tessifc/viewer` | npm | The WebGL2 renderer behind the reference viewer as an embeddable component: open, stream, select, hide, section, frame, apply deltas, follow a session. | preview |
+| `@tessifc/mcp` | npm | A Model Context Protocol server over the kernel for Claude Code, Claude Desktop and other MCP clients, with the loopback viewer server. | preview |
 | `@tessifc/three` | npm | Shape arrays to three.js meshes, a retained scene that applies deltas, camera fitting and cleanup. | preview |
-| `tessifc-session` | source only | The optional Python editing session behind the viewer's Session panel. | preview |
+| `tessifc-session` | source only | The optional Python editing session behind the viewer's Session panel, with the same MCP tools over IfcOpenShell (`[mcp]` extra). | preview |
 | `tessifc-cli` | crates.io | The `tessifc` binary: `info`, `convert`, `edit`, `coverage`. | preview |
 | `tessifc-step`, `-schema`, `-model`, `-geom`, `-mesh`, `-pack`, `-engine` | crates.io | The kernel crates, for Rust hosts and for people writing evaluators. | preview |
 | the viewer | GitHub Pages | The reference application over `@tessifc/core` and `@tessifc/viewer`. | preview |
@@ -98,6 +101,7 @@ crosses as typed arrays, which is the one place the cost is measurable.
 | `getEntityInfo(id, expressId)` | JSON: attributes by schema name with raw STEP spelling and decoded text. Vendor classes expose numbered arguments. |
 | `getSpatialHierarchy(id)` | JSON node list: project, site, building, storey, and every rendered product under its container. |
 | `getClassAttributes(id, className)` | JSON: `class`, `abstract` and `attributes` in STEP argument order with `name`, `type`, `base`, `aggDepth`, `optional` and `derived`; `undefined` for a class outside the model's schema. |
+| `getClassSupertypes(id, className)` | JSON array of class names from the class itself up to `IfcRoot` (or the schema root); `undefined` for a class outside the model's schema. |
 
 The kernel report is camelCase; `tessifc info --json` is snake_case. The two
 cover most of the same ground, and each carries what only it can see: the CLI
@@ -242,8 +246,11 @@ so a delayed operation cannot accidentally commit a replacement candidate.
 Legacy immediate attribute edits advance the revision and discard any candidate.
 
 The impact reports `createdEntities`, `modifiedEntities`, `deletedEntities`,
-`affectedProducts`, `removedProducts`, `metadataProducts`, `fullRebuild`, and
-`reasons` entries with `expressId`, `entityId` and `reason`. Entity IDs belong to
+`affectedProducts`, `removedProducts`, `metadataProducts`, `fullRebuild`,
+`reasons` entries with `expressId`, `entityId` and `reason`, and `timings` with
+the milliseconds each preparation and evaluation stage took (`validateSourceMs`,
+`parseMs`, `validateModelMs`, `compareMs`, `prepareMs`, `sessionMs`,
+`evaluateMs`, `outcomesMs`, `packMs`, `baselineMs`, `evaluateTotalMs`). Entity IDs belong to
 the relevant old or new snapshot: removed products address the old scene;
 affected products address the candidate. A full rebuild replaces the entire
 scene, including its old identities. Hierarchy nodes include available `globalId`
@@ -288,9 +295,8 @@ The reference viewer's assembler keeps unchanged instance slots stable and adds
 an `active` column to its in-memory assembled pack. Consumers must skip inactive
 slots; `activeCount` counts live instances while `count` includes retired slots.
 These columns are viewer state, not additions to the IGP v0 binary format. Its
-renderer applies the resulting delta to affected GPU batches. The three.js
-adapter currently remains a static-load adapter; hosts integrating revisions
-there must implement scene replacement and resource ownership themselves.
+renderer applies the resulting delta to affected GPU batches, and the three.js
+retained model applies the same delta mesh by mesh.
 
 ### Editing and export
 
@@ -321,18 +327,22 @@ const { report, delta } = session.runScript('ifc.byType("IfcWall")[0].Name = "Re
 A host that streamed or evaluated the model itself calls
 `session.adopt({ modelOffset, nextGeometryId })` instead of `evaluate()`; the
 kernel requires every patch to keep the initial settings and coordinate frame.
+Options: `settings` (the geometry settings), `label` (the file name in
+reports), `historyLimit` and `historyBytes` (how much undo history to keep).
 
 | Method | Effect |
 |---|---|
-| `evaluate()` | Evaluate the whole model; returns `{ pack, summary, outcomes, hierarchy }` and fixes the scene basis. |
+| `evaluate()` | Evaluate the whole model; returns `{ pack, summary, outcomes, hierarchy }` and fixes the scene basis. A model with no product geometry evaluates to an empty pack. |
 | `adopt({ modelOffset, nextGeometryId })` | Take over a scene the host built, with the pack's offset and the next free geometry id. |
-| `runScript(source, selection, { commit })` | Run a browser script; returns `{ report, delta }`, `delta` null when nothing changed. `commit: false` discards edits. |
+| `runScript(source, selection, { commit })` | Run a script; returns `{ report, delta }`, `delta` null when nothing changed. `commit: false` discards edits. |
 | `setAttributes(edits)` | Publish `{ expressId, attribute, value, raw }` edits, preserving unrelated bytes. |
 | `applySnapshot(bytes)` | Publish an externally edited copy of the file. |
 | `refreshProducts(expressIds)` | Re-tessellate named products without a revision; the host chose the set. |
 | `undo()`, `redo()` | Republish the source before or after the last change as a new revision. |
 | `export()`, `entity(id)`, `classDefinition(name)`, `hierarchy()` | The committed bytes, one entity's attributes, a class's schema, the spatial tree. |
-| `revision`, `history`, `modelOffset`, `nextGeometryId` | The committed revision, undo and redo depths, and the scene basis. |
+| `info()`, `idsOfType(className)`, `diagnostics()`, `settings()` | The kernel's model info, every instance of a class, the parse diagnostics, the geometry settings. |
+| `revision`, `history`, `modelOffset`, `nextGeometryId`, `name` | The committed revision, undo and redo depths, the scene basis, the label. |
+| `close()` | Closes the model in the kernel. |
 
 A delta is a plain object:
 
@@ -342,12 +352,46 @@ A delta is a plain object:
 | `revision`, `baseRevision` | The committed revision after and before; unchanged for `direct`. |
 | `chunk`, `pack` | The IGP v0 bytes and their parsed form: every instance of every affected product. |
 | `affectedProducts`, `removedProducts`, `metadataProducts` | Products to replace, to drop, and whose attributes changed without geometry. |
+| `fullRebuild` | Whether the whole scene was replaced. |
 | `impact` | The kernel's full report with `reasons`, `productOutcomes` and `diagnostics`; null for `direct`. |
-| `hierarchy` | The spatial tree after the change. |
-| `timings` | `prepareMs`, `geometryMs`, `totalMs`. |
+| `hierarchy` | The spatial tree after the change; null for `direct`. |
+| `emptyProducts` | `direct` only: requested products that produced no geometry. |
+| `label` | `undo` or `redo` on the deltas those calls return. |
+| `timings` | `prepareMs`, `geometryMs`, `commitMs`, `packReadMs`, `hierarchyMs`, `totalMs`, and `kernel`, the kernel's own stage times from the prepared report. |
 
 A rejected candidate throws; the error carries `impact` with the diagnostics.
-The committed revision is untouched.
+The committed revision is untouched. If the kernel commits but the delta
+cannot be completed afterwards, the error carries `committed: true` and the
+new `revision`; the history already reflects the commit, so a host reloads
+from `export()` rather than retrying.
+
+### Creating a model
+
+`createModel(options)` returns the bytes of a minimal IFC file, so a session
+can start from nothing and scripts add the products:
+
+```js
+import { createModel } from "@tessifc/edit";
+
+const bytes = createModel({
+  schema: "IFC4",                       // IFC2X3, IFC4 or IFC4X3
+  name: "House", units: "m",            // or "mm"
+  site: "Site", building: "Building",
+  storeys: [{ name: "Ground floor", elevation: 0 }, { name: "Upper floor", elevation: 3 }],
+});
+const session = createEditingSession(kernel, kernel.openModel(bytes));
+session.evaluate();                     // an empty scene with the origin as its offset
+```
+
+The file carries the header, SI units, a `Model` context with its `Body`
+subcontext, the project, site, building and storeys with placements and
+aggregation, and in IFC2X3 a person, organisation, application and owner
+history that every rooted record references. `createModelText` returns the
+same as a string; `author`, `organisation`, `producer`, `timestamp` and
+`guid` (a generator) are injectable for deterministic output. The first
+script publishes a normal selective delta; the scene offset stays at the
+origin, so a model that is later moved to georeferenced coordinates should be
+reopened.
 
 ### Browser scripts
 
@@ -355,19 +399,48 @@ The committed revision is untouched.
 edits into a snapshot for `prepareRevision`. The engine is exported on its
 own (`createScriptEngine`, `runScript` from `@tessifc/edit/script-engine`) for
 hosts that publish differently. Scripts see `ifc`, `selected`, `selection`
-and `print`:
+and `print`; `API_REFERENCE` is the same list as prose for a prompt:
 
 | Name | Effect |
 |---|---|
 | `ifc.byType(name)`, `ifc.get(id)`, `ifc.byGuid(guid)` | Entities of a class and its subtypes, one entity by express id, one rooted entity by GlobalId. |
 | `entity.Name`, `entity.Items[0].Depth`, `entity.Name = "x"` | Attributes by IFC name; references resolve to entities, lists to arrays, `$` to `null`. Assignment records an edit. |
 | `entity.id`, `entity.type`, `entity.is(name)`, `entity.attributes()` | Identity, class, subtype test, all attributes as an object. |
-| `ifc.add(className, attributes)` | A new record from attributes by name (or a positional array) in the model's schema; missing required attributes are an error, a missing `GlobalId` is generated. |
+| `ifc.add(className, attributes)` | A new record from attributes by name (or a positional array) in the model's schema; missing required attributes are an error, a missing `GlobalId` is generated, and a required `OwnerHistory` (IFC2X3) is filled from the model's first one. |
 | `ifc.remove(entity)` | Deletes the record and detaches every reference; a relationship that loses a required end is removed too. |
-| `ifc.addBox(className, name, { at, size, relativeTo, attributes })` | A placed rectangular extrusion with a Body representation. |
+| `ifc.addBox(className, name, { at, size, relativeTo, rotation, direction, axis, attributes })` | A placed rectangular extrusion with a Body representation, centred on its placement in x and y and rising from z; `rotation` in degrees about z, or explicit `direction` and `axis` vectors. |
 | `ifc.contain`, `ifc.void`, `ifc.fill`, `ifc.aggregate` | The containment, voiding, filling and aggregation relationships. |
-| `ifc.inverses(entity, className)`, `ifc.container(product)` | Entities referencing one; the containing spatial structure. |
+| `ifc.inverses(entity, className)`, `ifc.container(product)` | Entities referencing one, including records added or changed earlier in the same script; the containing spatial structure. |
 | `ifc.newGuid()`, `ifc.enum(v)`, `ifc.typed(type, v)`, `ifc.int(n)`, `ifc.context()`, `ifc.schema` | Values that need a marked form, the model context and its schema name. |
+
+`entity.is(name)` and `ifc.byType(name)` follow the schema's supertypes, so
+a `IfcWallStandardCase` added by the script is an `IfcWall` and an
+`IfcProduct` at once. The reference scan that `ifc.remove` and
+`ifc.inverses` use reads the record structure, not the text, so `#8` inside a
+name or a comment is never mistaken for a reference.
+
+#### Building helpers
+
+Lengths are in the model's length unit, z is up, and every helper contains
+its product in a storey (the lowest by default, or `storey` as an entity or
+a name) and returns the entity:
+
+| Helper | Effect |
+|---|---|
+| `ifc.addStorey({ name, elevation, building })` | A new storey aggregated to the building, placed at its elevation. |
+| `ifc.addWall({ from, to, height, thickness, storey, name })` | A wall along the line between two points, as a rotated box. |
+| `ifc.addSlab({ polygon or size, at, thickness, type, storey, name })` | A slab from a polygon (an arbitrary closed profile) or a rectangle; `type` is `FLOOR`, `ROOF`, `BASESLAB` or `LANDING`. |
+| `ifc.addOpening({ in, at, size, depth, name })` | An opening cut through a host; the depth defaults to the host's thickness. |
+| `ifc.addDoor({ in, at, size, name })`, `ifc.addWindow({ in, at, size, name })` | The opening, the filling element, the voiding and filling relationships and the containment; `at[0]` runs along the wall from its centre, `at[2]` is the sill. |
+| `ifc.addColumn({ at, size, height, storey, name })`, `ifc.addBeam({ from, to, size, storey, name })` | A vertical box, and a box whose extrusion axis follows the beam. |
+| `ifc.addProperties(entity, psetName, values)` | Creates or extends a property set; strings become labels, numbers reals, booleans booleans. |
+| `ifc.setColor(entity, [r, g, b, a])` | A surface style on the product's body items, components from 0 to 1, replacing an earlier one. |
+| `ifc.storeys()`, `ifc.byName(className, name)`, `ifc.describe()` | The storeys lowest first, one entity by class and name, and the schema, unit, product counts and storeys as an object. |
+
+The helpers write ordinary IFC (extrusions, profiles, placements,
+relationships, property sets and styles) in the model's schema, including the
+IFC2X3 spellings, so the result opens anywhere. `JAVASCRIPT_EXAMPLES` from
+`@tessifc/edit/examples` holds ready-made scripts, among them a small house.
 
 The report carries `ok`, `stdout`, `error`, `traceback` (the failing script
 line), `changed` and `operations` (created, modified and deleted record
@@ -382,10 +455,61 @@ with STEP escapes; untouched records keep their bytes.
 `SYSTEM_PROMPT` with the script API, `TOOLS` (`inspect_model`,
 `propose_edit`, `undo_edit`), `toolsFor(mode)`, the `toMessagesTools` and
 `toChatTools` mappers, `createAgentTools(session, { policy, selection,
-onDelta })` which executes calls against a session, and `runAgentTurn` which
-drives any `complete` function until the model answers. [Agents and
-pipelines](agents.md) walks through it. The viewer's assistant is one client
-of these; its provider adapters are in `viewer/src/assistant.js`.
+onDelta, maxProposalsPerTurn })` which executes calls against a session, and
+`runAgentTurn({ complete, tools, prompt, mode, context, history, maxRounds,
+signal, onEvent })` which drives any `complete` function until the model
+answers and returns `answer`, `proposals`, `usage`, `rounds` and `stop`.
+`describeModel(session, { selection })` from `@tessifc/edit/describe` builds
+the context text, and `describeModelInfo(data)` formats it from plain data.
+[Agents and pipelines](agents.md) walks through it. The viewer's assistant is
+one client of these.
+
+### Providers
+
+`@tessifc/edit/providers` turns the two common wire formats into a `complete`
+function for `runAgentTurn`, with no dependency beyond `fetch`:
+
+```js
+import { chatCompletions, anthropicMessages } from "@tessifc/edit/providers";
+
+const viaOpenRouter = chatCompletions({ baseUrl: "https://openrouter.ai/api/v1", key, model: "..." });
+const viaOllama = chatCompletions({ baseUrl: "http://127.0.0.1:11434/v1", model: "..." });
+const viaAnthropic = anthropicMessages({ key, model: "...", thinking: { type: "enabled", budget_tokens: 4000 }, effort: "high" });
+```
+
+`chatCompletions({ baseUrl, key, model, headers, fetch, maxTokens })` speaks
+the chat-completions format; `anthropicMessages({ baseUrl, key, model, fetch,
+browser, maxTokens, headers, thinking, effort })` speaks the Messages API,
+`browser: true` adding the header a page needs and `thinking` and `effort`
+passed through as given. Both take an `AbortSignal` through `complete`,
+report token usage, and throw a `ProviderError` with the status and the body
+on failure. `encodeChatRequest`, `decodeChatReply`,
+`encodeMessagesRequest` and `decodeMessagesReply` are the pure halves for a
+transport of your own.
+
+### Verification
+
+`@tessifc/edit/verify` checks a scene against the file it claims to show.
+`createSceneMirror(pack)` keeps what a renderer would keep, product by
+product, and applies deltas; `evaluateScene(Kernel, bytes, settings)`
+evaluates a file from scratch; `normalizeScene(pack)` reduces a pack to
+sorted per-product triangle sets; and `verifyRevision({ Kernel, session,
+mirror, settings })` compares the mirror with a fresh evaluation of the
+session's export and returns `ok`, `revision`, `products`, `mismatches`
+(`id`, `reason`) and `elapsedMs`.
+
+### The MCP server
+
+`@tessifc/mcp` puts a session behind the Model Context Protocol so Claude
+Code, Claude Desktop or any MCP client edits a model with the tools listed in
+[Agents and pipelines](agents.md#the-tools), while the reference viewer
+follows at a loopback address. `node bindings/mcp/src/cli.js model.ifc`
+serves an existing file, `--new house.ifc` starts from a project, site,
+building and storeys. As a library, `createModelHost({ Kernel })` owns the
+kernel, the session, the saved file and a scene mirror;
+`createViewerServer(host, { root, port })` is the loopback server the viewer
+follows; `createTessifcServer(host)` is the MCP server for a transport of
+your choice. The package README lists the flags and the tools.
 
 ### The embeddable viewer
 
@@ -394,11 +518,12 @@ reference viewer's renderer in any element with a small API and no chrome:
 `open(file)` streams geometry as the kernel produces it, `select`, `hide`,
 `isolate`, `showAll`, `focus`, `setView`, `setStyle` and `setSection` take
 express ids and plain values, `pick` answers a pointer, and `on` reports
-`load`, `progress`, `select`, `visibility` and `camera`. `loadPack` shows an
-IGP pack from any producer, so a host that already runs the kernel in a
-worker feeds the view without a second parse. `viewer.renderer` is the
-`IfcRenderer` underneath for anything the API leaves out. The package README
-lists every call; `examples/embed-viewer/` is a complete page.
+`load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`,
+`revision` and `session`. `loadPack` shows an IGP pack from any producer, so
+a host that already runs the kernel in a worker feeds the view without a
+second parse. `viewer.renderer` is the `IfcRenderer` underneath for anything
+the API leaves out. The package README lists every call;
+`examples/embed-viewer/` is a complete page.
 
 ```js
 import init, { Kernel } from "@tessifc/core/web";
@@ -408,6 +533,23 @@ await init();
 const viewer = createViewer(host, { kernel: new Kernel() });
 viewer.on("select", (selection) => showProperties(selection?.expressIds[0]));
 const { hierarchy } = await viewer.open(file);
+```
+
+The viewer edits too. A model with entities but no drawable geometry opens
+(the `load` event says `empty: true`; `requireGeometry: true` restores the
+old refusal), `viewer.session()` is an editing session over the open model,
+and `viewer.applyDelta(delta)` applies any delta while keeping selection and
+visibility by GlobalId and emits `revision`. `viewer.follow(baseUrl)` runs the
+session client against `tessifc-mcp` or the Python session server, opening
+or applying every published version and emitting `session` with the host's
+status; `unfollow()` stops it. `createSessionClient` from
+`@tessifc/viewer/session-client` is that client on its own, for a page that
+wants to send scripts, undo, redo or the selection to the host.
+
+```js
+const session = viewer.session();
+viewer.applyDelta(session.runScript(`ifc.addWall({ from: [0, 0], to: [6, 0], height: 3, thickness: 0.3 })`).delta);
+viewer.follow("");                       // the host at the page's own origin
 ```
 
 ### three.js
@@ -436,34 +578,45 @@ result["ok"], result["changed"], result["stdout"], result["operations"]
 session.undo()
 ```
 
-`run_script(source, selection=None, commit=True)` executes inside a transaction
-and returns `ok`, `changed`, `version`, `stdout`, `operations` (journaled
-create, edit and delete counts), `elapsedMs`, and on failure `error` and
-`traceback`. `commit=False` discards every change, which is how the assistant
-inspects the model. `undo()` and `redo()` restore content as new versions.
+`run_script(source, selection=None, commit=True, label="script")` executes
+inside a transaction and returns `ok`, `label`, `changed`, `version`,
+`revision`, `stdout`, `operations` (journaled create, edit and delete
+counts), `elapsedMs`, and on failure `error` and `traceback`. `commit=False`
+discards every change, which is how the assistant inspects the model.
+`undo()` and `redo()` restore content as new versions.
 `wait_for_change(version, timeout)` blocks until the file has different
-content, whichever process wrote it.
+content, whichever process wrote it. In IFC2X3 the IfcOpenShell owner hooks
+are set while a script runs, so `api.run("root.create_entity", ...)` writes
+a valid owner history. `tessifc_session.model.create_model(schema, name=,
+units=, site=, building=, storeys=)` writes the same skeleton as
+`createModel` in JavaScript, and `write_model(model, path)` saves atomically.
 
 The server exposes the session on the loopback interface. Every command needs
 the `X-Tessifc-Token` header carried by the status response, and a matching
-`Origin` header.
+`Origin` header. `tessifc-mcp` speaks the same protocol, so one viewer client
+follows either.
 
 | Route | Effect |
 |---|---|
-| `GET /__tessifc/session?after=<version>&timeout=<s>` | Status JSON: `name`, `version`, `revision`, `busy`, `undo`, `redo`, `capabilities` and `token`. With `after`, it waits until the version changes or the timeout passes. |
+| `GET /__tessifc/session?after=<version>&timeout=<s>` | Status JSON: `name`, `version`, `revision`, `generation`, `busy`, `undo`, `redo`, `capabilities` (`authoring` is `"python"`, `"javascript"` or `false`, plus `assistant`, `selection`, `applied`), `examples` and `token`. With `after`, it waits until the version changes or the timeout passes. A changed `generation` means the host opened another file. |
 | `GET /__tessifc/model.ifc?version=<version>` | The snapshot bytes for that version, or 409 when the content moved on. |
 | `POST /__tessifc/run` | `{ "script": "...", "selection": { "guids": [], "ids": [] } }` runs a script; the result is the `run_script` record plus `status`. |
 | `POST /__tessifc/undo`, `POST /__tessifc/redo` | Publish the previous or restored content. |
-| `POST /__tessifc/assistant` | `{ "mode": "ask" or "edit", "prompt", "policy": "review" or "auto", "selection", "history" }` returns `answer`, `proposal` (`script`, `summary`), `run` and `usage`. |
+| `POST /__tessifc/assistant` | `{ "mode": "ask" or "edit", "prompt", "policy": "review" or "auto", "selection", "history" }` returns `mode`, `policy`, `answer`, `proposal` (`script`, `summary`), `run`, `usage`, `rounds` and `status`. |
+| `POST /__tessifc/selection` | `{ "ids": [], "guids": [], "className", "name" }`: what the viewer has selected, for the `get_selection` tool. |
+| `POST /__tessifc/applied` | `{ "version", "revision", "affectedProducts", "removedProducts", "fullRebuild" }`: the viewer's report after applying a version, which the Python `edit_model` tool waits for. |
 
 A host that drives this protocol from its own tools gets the same behaviour as
-the panel: `viewer/src/file-session.js` is the reference client, including the
-long poll and the wait for the viewer to apply a version. The viewer's own
-kernel then computes the affected products; the script never decides that.
+the panel: `createSessionClient` in `bindings/viewer/src/session-client.js` is
+the reference client, including the long poll, the generation change and the
+wait for the viewer to apply a version. The viewer's own kernel then computes
+the affected products; the script never decides that.
 
 The assistant provider is selected with `--assistant anthropic`, `fake` or
 `none`; `anthropic` is the default when `ANTHROPIC_API_KEY` is set and needs
 `pip install anthropic`. `--model` and `--effort` pass through to the request.
+`--mcp` speaks MCP on stdin and stdout for an agent while the viewer server
+keeps running, `--new` creates the file first (`--schema`, `--storeys`).
 Scripts run in the session process without a sandbox.
 
 ## Reading IGP
@@ -526,6 +679,14 @@ overrun a chunk's time limit. Terminate the worker for a hard cancellation.
 * Closing models frees allocations for reuse; it does not shrink WASM linear
   memory. Terminating a worker releases its instance and memory.
 
+## Types
+
+`@tessifc/core` ships generated TypeScript declarations. The JavaScript
+packages (`@tessifc/edit`, `@tessifc/viewer`, `@tessifc/mcp`,
+`@tessifc/three`) are plain ES modules with JSDoc on every export and no
+declarations yet; a TypeScript host imports them with `allowJs` or a local
+declaration until they ship.
+
 ## Bundlers and hosting
 
 The generated declarations include `Symbol.dispose`. For TypeScript, include
@@ -575,5 +736,5 @@ around the events and calls above.
 ## Preview feedback
 
 Report missing representations with element IDs, settings and minimal inputs.
-New bindings and formats are separate proposals; the supported v0.1 surface
+New bindings and formats are separate proposals; the supported v0.2 surface
 is the package and API set documented above.

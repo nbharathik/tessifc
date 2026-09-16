@@ -7,7 +7,8 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { pavilionIfc } from "../../../viewer/test/fixture.mjs";
 import {
-  Enum, Ref, Typed, createScriptEngine, decodeStepString, encodeStepString, formatValue, newGuid, parseValue, runScript, splitArguments,
+  Enum, Ref, Typed, containsRef, createScriptEngine, decodeStepString, encodeStepString, formatValue, indexRecords, newGuid, parseValue,
+  runScript, splitArguments,
 } from "../src/script-engine.js";
 
 let passed = 0;
@@ -60,6 +61,35 @@ const guid = newGuid();
 assert.match(guid, /^[0-3][0-9A-Za-z_$]{21}$/);
 assert.notEqual(guid, newGuid());
 ok(true, "new GlobalIds have 22 characters and a leading 0-3");
+
+const TRICKY = [
+  "ISO-10303-21;",
+  "HEADER;",
+  "FILE_DESCRIPTION(('#1=IFCWALL in the header'),'2;1');",
+  "ENDSEC;",
+  "DATA;",
+  "/* #9=IFCWALL('g9',$,$,$,$,#8,$,$,$); a commented-out record */",
+  "#5=IFCCARTESIANPOINT((0.,0.,0.));",
+  "#7=IFCWALL('g7',$,'Named #8',' #5= it''s',$,#8,$,$,$);",
+  "#8 = IFCLOCALPLACEMENT($,#5);\r",
+  "#10=(IFCNAMEDUNIT(*)IFCSIUNIT(.LENGTHUNIT.,$,.METRE.));",
+  "#11=IFCPROPERTYSINGLEVALUE('p',$,IFCLABEL('#7'),$);",
+  "ENDSEC;",
+  "END-ISO-10303-21;",
+].join("\n");
+const scanned = indexRecords(TRICKY);
+assert.deepEqual([...scanned.records.keys()], [5, 7, 8, 10, 11]);
+assert.equal(scanned.records.get(7).className, "IFCWALL");
+assert.equal(TRICKY.slice(scanned.records.get(7).argsStart, scanned.records.get(7).argsEnd), "'g7',$,'Named #8',' #5= it''s',$,#8,$,$,$");
+assert.equal(TRICKY.slice(scanned.records.get(8).lineStart, scanned.records.get(8).lineEnd), "#8 = IFCLOCALPLACEMENT($,#5);\r\n");
+assert.equal(scanned.records.get(10).className, "");
+assert.deepEqual([...scanned.users.get(8)], [7]);
+assert.deepEqual([...scanned.users.get(5)], [8]);
+assert.equal(scanned.users.get(7), undefined);
+assert.equal(scanned.users.get(9), undefined);
+assert.ok(containsRef(parseValue("(#1,IFCLABEL('x'),(#2))").value, 2));
+assert.ok(!containsRef(parseValue("'#2'").value, 2));
+ok(true, "the record scanner ignores strings, comments and the header, and maps reference users");
 
 // ------------------------------------------------------------ kernel
 
@@ -149,6 +179,50 @@ if (!existsSync(pkg)) {
   assert.equal(failing.traceback, "line 3: x.missing.deeper;");
   assert.equal(failing.stdout, "first");
   ok(true, "runtime errors report the script line and keep earlier output");
+
+  const subtype = runScript(createScriptEngine(kernel, modelId), `
+    const c = ifc.add("IfcWallStandardCase", { Name: "New" });
+    print(c.is("IfcProduct"), c.is("IfcWall"), c.is("IfcColumn"), ifc.byType("IfcProduct").some((e) => e.id === c.id), ifc.byType("IfcWall").length);
+  `, null);
+  assert.equal(subtype.ok, true, subtype.error);
+  assert.equal(subtype.stdout, "true true false true 3");
+  ok(true, "added entities answer is() and byType() through the schema's supertypes");
+
+  const trickyId = kernel.openModel(Buffer.from(TRICKY.replace("\r", "")));
+  assert.equal(JSON.parse(kernel.getModelInfo(trickyId)).entities, 5);
+  const tricky = createScriptEngine(kernel, trickyId);
+  const trickyRun = runScript(tricky, `
+    const wall = ifc.get(7);
+    print(ifc.inverses(ifc.get(8)).map((e) => e.id), ifc.byGuid("g7").id, ifc.byGuid("g9"), wall.Name, wall.Description);
+    ifc.remove(ifc.get(8));
+    print(wall.ObjectPlacement, ifc.byType("IfcWall").length);
+  `, null);
+  assert.equal(trickyRun.ok, true, trickyRun.error);
+  assert.equal(trickyRun.stdout, "[7] 7 null Named #8  #5= it's\nnull 1");
+  const trickyText = new TextDecoder("latin1").decode(tricky.snapshotBytes());
+  assert.match(trickyText, /'Named #8'/);
+  assert.match(trickyText, /#7=IFCWALL\('g7',\$,'Named #8',' #5= it''s',\$,\$,\$,\$,\$\);/);
+  assert.ok(!trickyText.includes("#8 = IFCLOCALPLACEMENT"));
+  const trickyCandidate = JSON.parse(kernel.prepareRevision(trickyId, tricky.snapshotBytes(), kernel.getModelRevision(trickyId)));
+  assert.deepEqual(trickyCandidate.deletedEntities, [8]);
+  assert.deepEqual(trickyCandidate.modifiedEntities, [7]);
+  kernel.discardRevision(trickyId, trickyCandidate.candidateToken);
+  kernel.closeModel(trickyId);
+  ok(true, "references inside strings and comments never count, so removal keeps the text that mentions them");
+
+  const placed = runScript(createScriptEngine(kernel, modelId), `
+    const wall = ifc.addWall({ from: [0, 0], to: [3, 4], height: 2.8, thickness: 0.2 });
+    const beam = ifc.addBeam({ from: [0, 0, 3], to: [0, 5, 3], size: [0.4, 0.2] });
+    const post = ifc.addBeam({ from: [1, 1, 0], to: [1, 1, 4] });
+    const axes = (p) => p.ObjectPlacement.RelativePlacement;
+    const solid = (p) => p.Representation.Representations[0].Items[0];
+    print(JSON.stringify([axes(wall).RefDirection.DirectionRatios, axes(wall).Axis, solid(wall).SweptArea.XDim, solid(wall).Depth,
+      axes(beam).Axis.DirectionRatios, axes(beam).RefDirection.DirectionRatios, solid(beam).Depth, solid(beam).SweptArea.XDim,
+      axes(post).RefDirection.DirectionRatios, ifc.container(wall).Name]));
+  `, null);
+  assert.equal(placed.ok, true, placed.error);
+  assert.deepEqual(JSON.parse(placed.stdout), [[0.6, 0.8, 0], null, 5, 2.8, [0, 1, 0], [0, 0, 1], 5, 0.4, [1, 0, 0], "Ground floor"]);
+  ok(true, "walls follow their line and beams their axis, with the profile depth vertical");
 
   const invalid = runScript(createScriptEngine(kernel, modelId), 'ifc.add("IfcExtrudedAreaSolid", { Depth: 1 });', null);
   assert.equal(invalid.error, "Error: IfcExtrudedAreaSolid needs SweptArea, ExtrudedDirection");

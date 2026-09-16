@@ -26,7 +26,7 @@ class.
 
 ## What it is not
 
-This is a compact v0.1 integration example. It has no
+This is a compact v0.2 integration example. It has no
 tree, no properties panel, no section planes and no measurement. `three.js`
 comes from a CDN through an import map so that there is nothing to install.
 

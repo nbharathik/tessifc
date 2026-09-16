@@ -20,6 +20,8 @@ from collections import deque
 from contextlib import redirect_stdout
 from pathlib import Path
 
+from .model import owner_scope
+
 MAX_OUTPUT_CHARS = 64_000
 SCRIPT_NAME = "<session script>"
 
@@ -93,6 +95,12 @@ class EditSession:
         self.ifcopenshell = None
         self.authoring_error = None
         self._summary = None
+        # Counts the files this session has held; a viewer reopens when it changes.
+        self.generation = 1
+        self.selection = None
+        self.applied = None
+        # When a viewer last asked for the status; edits wait for its report only while one is around.
+        self.viewer_seen = None
         self.snapshot()
 
     # ----------------------------------------------------------- snapshots
@@ -234,7 +242,7 @@ class EditSession:
             linecache.cache[SCRIPT_NAME] = (len(source), None, source.splitlines(True), SCRIPT_NAME)
             model.begin_transaction()
             try:
-                with redirect_stdout(output):
+                with redirect_stdout(output), owner_scope(model):
                     exec(code, namespace)
             except Exception as error:
                 operations = list(model.transaction.operations) if model.transaction else []
@@ -351,16 +359,67 @@ class EditSession:
                 "name": self.path.name,
                 "version": self.version,
                 "revision": self.revision,
+                "generation": self.generation,
                 "busy": self.model_lock.locked(),
                 "undo": len(self.undo_stack),
                 "redo": len(self.redo_stack),
                 "capabilities": {
-                    "authoring": authoring,
+                    "authoring": "python" if authoring else False,
                     "authoringError": None if authoring else self.authoring_error,
                     "ifcopenshell": version,
                     "assistant": assistant.describe() if assistant is not None else None,
+                    "selection": True,
+                    "applied": True,
                 },
+                "examples": [],
             }
+
+    def switch_to(self, path):
+        """Follow another file; the viewer sees a new generation and reopens."""
+        with self.lock:
+            self.path = Path(path).resolve(strict=True)
+            self.signature = None
+            self.version = None
+            self.revision = 0
+            self.payload = b""
+            self.model = None
+            self._baseline = None
+            self._summary = None
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.selection = None
+            self.applied = None
+            self.generation += 1
+            self.snapshot()
+            self.changed.notify_all()
+
+    def report_selection(self, body: dict):
+        """What the viewer has selected, as the page reported it."""
+        with self.lock:
+            ids = body.get("ids") or []
+            guids = body.get("guids") or []
+            self.selection = {"ids": ids, "guids": guids, "className": body.get("className"), "name": body.get("name"),
+                              "reportedAt": time.time()} if (ids or guids) else None
+
+    def report_applied(self, body: dict):
+        """The viewer's report of the version it displayed and what the kernel rebuilt."""
+        with self.lock:
+            self.applied = {"version": body.get("version"), "revision": body.get("revision"),
+                            "affectedProducts": body.get("affectedProducts") or [], "removedProducts": body.get("removedProducts") or [],
+                            "fullRebuild": bool(body.get("fullRebuild")), "reportedAt": time.time()}
+            self.changed.notify_all()
+
+    def wait_for_applied(self, version: str, timeout: float):
+        """Block until the viewer reports `version` applied, or the timeout passes; returns the report or None."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self.lock:
+            while True:
+                if self.applied and self.applied.get("version") == version:
+                    return dict(self.applied)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.changed.wait(min(remaining, 0.5))
 
     def summary(self) -> dict:
         """Schema, units, product counts and storeys, computed once per version."""

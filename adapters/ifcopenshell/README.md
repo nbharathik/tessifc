@@ -11,13 +11,33 @@ that talks to the viewer over a loopback HTTP protocol. IfcOpenShell and the
 assistant SDK are installed separately by you.
 
 ```sh
-pip install -e adapters/ifcopenshell[authoring,assistant]
+pip install -e "adapters/ifcopenshell[authoring,assistant,mcp]"
 tessifc-session model.ifc                # or: python scripts/serve-edit-session.py model.ifc
+tessifc-session house.ifc --new          # a new model: project, site, building and storeys
 ```
 
 Open the printed address. The viewer's **Session** panel then runs Python
 instead of its built-in browser JavaScript, and, when a provider is
-configured, the Ask and Edit assistant runs on this process.
+configured, the Ask and Edit assistant runs on this process. `--new` creates
+the file first (`--schema IFC2X3|IFC4|IFC4X3`, `--storeys "Ground floor:0,Upper floor:3"`).
+
+## For an agent over MCP
+
+```sh
+claude mcp add tessifc-py -- python scripts/serve-edit-session.py house.ifc --mcp --new
+```
+
+With `--mcp` (the `mcp` extra) the process speaks the Model Context Protocol
+on stdin and stdout while the viewer server keeps running, so Claude Code,
+Claude Desktop or any MCP client edits the model with Python scripts and a
+person watches at the printed address. The tools are the ones `@tessifc/mcp`
+offers (`describe_model`, `find_products`, `product_info`, `inspect_model`,
+`edit_model`, `undo`, `redo`, `export_model`, `new_model`, `open_model`,
+`get_selection`, `list_examples`; `verify_revision` needs the TessIFC kernel
+and is Node only). An `edit_model` result carries the affected products the
+viewer reported once it applied the version, or `null` with a note when no
+viewer is attached. Every message the process prints goes to stderr;
+stdout is the protocol.
 
 ## From Python
 
@@ -39,6 +59,14 @@ Scripts see `model`, `ifcopenshell`, `api`, `element`, `guid`, `selection` and
 it back and nothing is written. A script that changes nothing publishes nothing.
 Each accepted run replaces the file atomically, and a running viewer session
 picks the new content up through the same snapshot path as **Update IFC**.
+In IFC2X3 the API's owner hooks are set while a script runs, so entities the
+script creates carry a valid owner history.
+
+`tessifc_session.model.create_model(schema, name=, units=, site=, building=,
+storeys=)` returns a new `ifcopenshell.file` with the same skeleton the
+JavaScript `createModel` writes, and `write_model(model, path)` saves it
+atomically. `examples/agent-building/build_house.py` builds the demo house
+with `ifcopenshell.api` on top of it.
 
 ## Assistant
 
@@ -56,9 +84,9 @@ stand-in used by the tests.
 shaped response (`content` blocks, `stop_reason`, `usage`); `FakeProvider`
 is the smallest example. To drive the tools from a loop you already have,
 call `assistant.execute_tool(name, arguments, selection, policy)` with the
-definitions in `INSPECT_TOOL` and `PROPOSE_TOOL`; it returns the tool result
-text and an error flag. [Agents and pipelines](../../docs/agents.md) describes
-the loop and the review policy.
+definitions in `INSPECT_TOOL`, `PROPOSE_TOOL` and `UNDO_TOOL`; it returns the
+tool result text and an error flag. [Agents and pipelines](../../docs/agents.md)
+describes the loop and the review policy.
 
 ## Boundary
 

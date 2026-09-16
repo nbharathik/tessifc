@@ -20,6 +20,7 @@ const HISTORY_BYTES = 256 << 20;
  */
 export function createEditingSession(kernel, modelId, options = {}) {
   const settings = { ...(options.settings ?? {}) };
+  const label = options.label ?? null;
   let modelOffset = options.modelOffset ?? null;
   let nextGeometryId = options.firstGeometryId ?? null;
   const limits = { count: options.historyLimit ?? HISTORY_LIMIT, bytes: options.historyBytes ?? HISTORY_BYTES };
@@ -75,30 +76,45 @@ export function createEditingSession(kernel, modelId, options = {}) {
     return JSON.parse(kernel.getSpatialHierarchy?.(modelId) ?? '{"nodes":[]}');
   }
 
-  /** Stage, evaluate, check and commit one candidate; the delta describes what changed. */
+  /**
+   * Stage, evaluate, check and commit one candidate; the delta describes what
+   * changed. An error thrown after the commit carries `committed: true` and the
+   * new `revision`: the model moved on even though no delta was returned.
+   */
   function publish(prepare, extra = {}) {
     ready();
     const started = now();
     const baseRevision = kernel.getModelRevision(modelId);
     const candidate = JSON.parse(prepare(baseRevision));
+    const prepareMs = now() - started;
     let committed = false;
+    let revision = null;
     try {
       const geometryStarted = now();
       const chunk = kernel.evaluatePreparedRevision(modelId, candidate.candidateToken, patchSettings());
+      const geometryMs = now() - geometryStarted;
       const impact = JSON.parse(kernel.getPreparedRevisionInfo(modelId));
       if (!impact.evaluationAccepted) {
         const error = new Error(rejectionMessage(impact));
         error.impact = impact;
         throw error;
       }
-      const revision = kernel.commitRevision(modelId, baseRevision, candidate.candidateToken);
+      const commitStarted = now();
+      revision = kernel.commitRevision(modelId, baseRevision, candidate.candidateToken);
       committed = true;
-      const pack = readIgp(chunk);
-      consume(pack);
+      const commitMs = now() - commitStarted;
+      // History follows the commit, whatever happens to the delta afterwards.
       if (extra.before) {
         pushHistory(history.undo, extra.before);
         history.redo.length = 0;
       }
+      extra.afterCommit?.();
+      const readStarted = now();
+      const pack = readIgp(chunk);
+      consume(pack);
+      const packReadMs = now() - readStarted;
+      const hierarchyStarted = now();
+      const tree = hierarchy();
       return {
         kind: impact.fullRebuild ? "full" : "selective",
         revision,
@@ -110,10 +126,19 @@ export function createEditingSession(kernel, modelId, options = {}) {
         removedProducts: impact.removedProducts ?? [],
         metadataProducts: impact.metadataProducts ?? [],
         fullRebuild: Boolean(impact.fullRebuild),
-        hierarchy: hierarchy(),
-        timings: { prepareMs: geometryStarted - started, geometryMs: now() - geometryStarted, totalMs: now() - started },
+        hierarchy: tree,
+        timings: {
+          prepareMs, geometryMs, commitMs, packReadMs, hierarchyMs: now() - hierarchyStarted, totalMs: now() - started,
+          kernel: impact.timings ?? null,
+        },
         ...extra.result,
       };
+    } catch (error) {
+      if (committed && error instanceof Error) {
+        error.committed = true;
+        error.revision = revision;
+      }
+      throw error;
     } finally {
       if (!committed) kernel.discardRevision(modelId, candidate.candidateToken);
     }
@@ -185,11 +210,13 @@ export function createEditingSession(kernel, modelId, options = {}) {
     const bytes = source.pop();
     const current = kernel.exportModel(modelId);
     try {
-      const delta = publish((base) => kernel.prepareRevision(modelId, bytes, base), { result: { label } });
-      pushHistory(target, current);
-      return delta;
+      return publish((base) => kernel.prepareRevision(modelId, bytes, base), {
+        result: { label },
+        afterCommit: () => pushHistory(target, current),
+      });
     } catch (error) {
-      source.push(bytes);
+      // Only an uncommitted failure leaves the model where it was.
+      if (!error?.committed) source.push(bytes);
       throw error;
     }
   }
@@ -231,6 +258,12 @@ export function createEditingSession(kernel, modelId, options = {}) {
     },
     entity: (expressId) => JSON.parse(kernel.getEntityInfo(modelId, expressId) ?? "null"),
     classDefinition: (className) => JSON.parse(kernel.getClassAttributes(modelId, className) ?? "null"),
+    info: () => JSON.parse(kernel.getModelInfo(modelId)),
+    idsOfType: (className) => Array.from(kernel.getIdsOfType(modelId, String(className))),
+    diagnostics: () => JSON.parse(kernel.getDiagnostics?.(modelId) ?? "[]"),
+    get name() {
+      return label;
+    },
     hierarchy,
     close() {
       closed = true;
@@ -243,8 +276,13 @@ export function createEditingSession(kernel, modelId, options = {}) {
 function rejectionMessage(impact) {
   const diagnostics = Array.isArray(impact.diagnostics) ? impact.diagnostics : [];
   const first = diagnostics.find((item) => item?.severity === "error") ?? diagnostics[0];
-  return first ? `The candidate revision was rejected: ${first.code ?? ""} ${first.message ?? ""}`.trim()
-    : "The candidate revision was rejected by the kernel.";
+  if (first) return `The candidate revision was rejected: ${first.code ?? ""} ${first.message ?? ""}`.trim();
+  const outcomes = Array.isArray(impact.productOutcomes) ? impact.productOutcomes : [];
+  const failed = outcomes.find((item) => item?.state === "empty_or_failed");
+  if (failed) return `The candidate revision was rejected: #${failed.expressId} ${failed.class ?? ""} produced no usable geometry`.trim();
+  const refused = impact.refusedBooleanProducts?.[0];
+  if (refused !== undefined) return `The candidate revision was rejected: the boolean operation of #${refused} was refused`;
+  return "The candidate revision was rejected by the kernel.";
 }
 
 function asBytes(input) {

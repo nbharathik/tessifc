@@ -91,7 +91,7 @@ try {
   await page.waitForFunction(() => !document.querySelector("#session").classList.contains("collapsed"));
   const status = await page.evaluate(() => window.__tessifc.state.fileSession.status());
   assert.equal(status.name, "model.ifc");
-  assert.equal(status.capabilities.authoring, authoring);
+  assert.equal(status.capabilities.authoring, authoring ? "python" : false);
   assert.equal(status.capabilities.assistant.provider, "fake");
   assert.match(await page.textContent("#session-status"), authoring ? /model\.ifc · Python · IfcOpenShell/ : /model\.ifc · Python · scripts unavailable/);
   assert.equal(await page.getAttribute("#rail-script", "aria-pressed"), "true");

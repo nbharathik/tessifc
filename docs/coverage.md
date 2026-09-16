@@ -2,7 +2,7 @@
 # Coverage
 
 Which IFC representation items TessIFC can turn into geometry, and which it
-cannot yet in the v0.1 developer preview. See the [preview contract](preview.md)
+cannot yet in the v0.2 developer preview. See the [preview contract](preview.md)
 for the distinction between schema recognition and complete geometry support.
 
 Legend: **covered** the kernel handles it; **partial** it handles the common

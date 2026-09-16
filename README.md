@@ -21,16 +21,18 @@
 
 **tessifc** is an IFC geometry kernel: IFC files in, render-ready triangle
 meshes out. One Rust codebase runs in the browser through WebAssembly, in Node
-and as a command line tool, and it ships with a viewer that uses it.
+and as a command line tool, and it ships with a viewer that uses it. Edits
+become revisions: a script, an attribute change or a saved file re-tessellates
+only the products it touched, and an agent can drive the same loop.
 
-This is the **v0.1 developer preview**.
+This is the **v0.2 developer preview**.
 
 ![The TessIFC viewer inspecting a pavilion model](docs/assets/viewer.png)
 
 ## Install
 
-Preview packages are not on npm yet, so build the browser package from this
-checkout:
+Preview packages are not on a registry yet. Build the browser and Node
+packages from this checkout:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -38,8 +40,10 @@ python scripts/build-wasm.py --target both
 ```
 
 That writes the browser module to `bindings/wasm/pkg` and the Node module to
-`bindings/wasm/pkg-node`. Once the preview is published, `npm install
-@tessifc/core` gives you the same API.
+`bindings/wasm/pkg-node`. Each release also carries the npm packages as
+tarballs, so `npm install ./tessifc-core-0.2.0.tgz` works without a build.
+Once the preview is published, `npm install @tessifc/core` gives you the same
+API.
 
 ## Quick setup
 
@@ -82,6 +86,32 @@ double-click to frame an element, and use the ribbon to inspect, section,
 measure, hide and isolate. See the [viewer guide](viewer/README.md) for the
 full tool list and shortcuts.
 
+## Edit
+
+The viewer's **Session** panel runs scripts against the open model: pick an
+example such as *Add a door to a wall* or *Build a small house*, press Run,
+and the kernel reports which products it rebuilt. The **Assistant** tab asks
+a model of your choice to explain the model or propose an edit that you
+review and run. Everything runs in the browser; with IfcOpenShell installed,
+`python scripts/serve-edit-session.py model.ifc` runs the scripts in Python
+instead. See [editing](docs/editing.md).
+
+## Agents
+
+An agent edits or creates a model through the same session while the viewer
+follows. With Claude Code:
+
+```sh
+npm ci --prefix bindings/mcp
+claude mcp add tessifc -- node bindings/mcp/src/cli.js --new house.ifc
+```
+
+Open the viewer address the server prints and ask for a building.
+`examples/agent-building/` builds a two-storey house step by step, from a
+script, from an MCP client, from a provider of your choice, or with
+IfcOpenShell. [Agents and pipelines](docs/agents.md) describes the tools,
+the Node and Python SDK loops and how to verify what an agent did.
+
 ## Command line
 
 ```sh
@@ -102,6 +132,9 @@ or repaired.
 * Streams geometry and reports per product what was unsupported, repaired or
   degraded.
 * Reads attributes and writes source-preserving edits.
+* Turns scripts, attribute edits and saved snapshots into revisions that
+  re-tessellate only the affected products, and reports what changed.
+* Lets agents drive the same loop over MCP, in Node or in Python.
 
 Schema recognition is broader than geometry support, and complex trims,
 booleans and malformed topology still have limits. Read the conversion report
@@ -126,16 +159,25 @@ prints the exact command to install the matching version. A current
 ```sh
 cargo test --workspace
 npm --prefix bindings/wasm test
+npm --prefix bindings/edit test
+npm ci --prefix bindings/mcp && npm --prefix bindings/mcp test
+node examples/agent-building/build-house.test.mjs
+node adapters/three/test/build.test.mjs
 node viewer/test/igp.test.mjs
 ```
 
-`igp.test.mjs` needs only Node. The viewer's pixel tests need a headless
-browser:
+These need only Node. The viewer's pixel tests and the embedded viewer
+package need a headless browser:
 
 ```sh
 npm ci --prefix viewer
 cd viewer && npx playwright install chromium && npm test
+npm --prefix bindings/viewer test
 ```
+
+The Python session's tests run with `python -m unittest discover -s
+adapters/ifcopenshell/tests`; the ones that need IfcOpenShell or the `mcp`
+package skip when those are not installed.
 
 ## Documentation
 
@@ -147,8 +189,9 @@ cd viewer && npx playwright install chromium && npm test
 | [Geometry coverage](docs/coverage.md) | Supported representations and conditions |
 | [Architecture](docs/architecture.md) | Pipeline and extension points |
 | [IGP format](docs/igp-format.md) | Mesh container and readers |
-| [Editing](docs/editing.md) | Source-preserving attribute changes, revisions and the scripted editing session |
-| [Agents and pipelines](docs/agents.md) | Scripts, sessions and deltas for your own tools and agents |
+| [Editing](docs/editing.md) | Source-preserving attribute changes, revisions, scripts and the assistant |
+| [Agents and pipelines](docs/agents.md) | MCP servers, the Node and Python SDK loops, verification |
+| [Agent builds a house](examples/agent-building/README.md) | The demo: an empty model to a two-storey house, step by step |
 
 ## Licence
 

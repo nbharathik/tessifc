@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc-cli
 
-Version 0.1 is a developer preview. Review the [coverage](../../docs/coverage.md)
+Version 0.2 is a developer preview. Review the [coverage](../../docs/coverage.md)
 and [preview contract](../../docs/preview.md) before accepting conversion output.
 
 The `tessifc` command line tool. Build locally with

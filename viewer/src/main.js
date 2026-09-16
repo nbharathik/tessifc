@@ -23,6 +23,7 @@ import { bytes, coordinate, count, duration, errorText, plural } from "./format.
 import { startFileSession } from "./file-session.js";
 import { createSessionPanel } from "./session-panel.js";
 import { PROVIDERS, createBrowserAssistant } from "./assistant.js";
+import { describeModelInfo } from "../../bindings/edit/src/describe.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -573,6 +574,7 @@ function clearSelection() {
   scheduleRender();
   state.selection = null;
   sessionPanel.setSelection(false);
+  state.fileSession?.reportSelection?.(null);
   inspector.clearSelection();
   panelWork.selection = true;
   schedulePanelWork();
@@ -775,16 +777,10 @@ function startWorker() {
         return receiveEntityInfo(data);
       case "entity-error":
         return receiveEntityError(data);
-      case "edit-result":
-        return receiveEditResult(data);
-      case "edit-error":
-        return receiveEditError(data);
       case "export-result":
         return receiveExport(data);
       case "export-error":
         return shell.toast(data.message, "error");
-      case "product-geometry":
-        return receiveProductGeometry(data);
       case "script-result":
         receiveScriptResult(data);
         break;
@@ -965,7 +961,7 @@ function requestContestedTriangles() {
   if (!model || !state.worker || typeof renderer.applyContestedTriangles !== "function") return;
   const { pack } = model;
   const requestId = ++state.requestId;
-  model.overlayAnalysis = { requestId, state: "pending" };
+  model.overlayAnalysis = { requestId, state: "pending", requestedAt: performance.now() };
   // Copies, not views: a view would clone the whole chunk buffer behind it.
   const geometries = pack.geometry.map((geometry) => ({
     id: geometry.id,
@@ -988,6 +984,10 @@ function requestContestedTriangles() {
 function receiveContestedTriangles(data) {
   const model = state.model;
   if (!model || model.overlayAnalysis?.requestId !== data.requestId) return;
+  if (model.lastUpdate?.stages && model.overlayAnalysis.requestedAt) {
+    model.lastUpdate.stages.overlayMs = performance.now() - model.overlayAnalysis.requestedAt;
+    model.lastUpdate.stages.overlayWorkerMs = data.elapsedMs ?? null;
+  }
   if (data.error) {
     model.overlayAnalysis = { requestId: data.requestId, state: "failed", error: data.error };
     return;
@@ -1055,19 +1055,11 @@ function showResult(data) {
       assembler = state.stream.assembler;
       state.stream = null;
       pack = assembler.pack();
-      if (!pack.instances.count || !pack.geometry.length) {
-        renderer.clear();
-        state.loadOutcome = "empty";
-        throw new Error("The IFC parsed correctly, but no supported product geometry was produced.");
-      }
+      // An empty scene stays open: scripts and sessions add the products.
       model = renderer.finishStream(pack, (record) => isRecordVisibleInPack(pack, record));
     } else {
       state.stream = null;
       pack = readIgp(data.pack);
-      if (!pack.instances.count || !pack.geometry.length) {
-        state.loadOutcome = "empty";
-        throw new Error("The IFC parsed correctly, but no supported product geometry was produced.");
-      }
       disposeModel();
       // Through the assembler too, so an edit can patch it the same way.
       assembler = createPackAssembler();
@@ -1080,6 +1072,7 @@ function showResult(data) {
       pack,
       assembler,
       info: data.info,
+      facts: data.facts ?? null,
       summary: data.summary,
       hierarchy: data.hierarchy,
       modelId: data.modelId,
@@ -1087,7 +1080,8 @@ function showResult(data) {
       index: buildIndex(pack),
       file: state.pendingFile,
     };
-    state.loadOutcome = "ready";
+    // An open model with nothing to draw is a terminal state of its own.
+    state.loadOutcome = pack.instances.count ? "ready" : "empty";
     state.dirty = false;
     setDirty(false);
 
@@ -1174,7 +1168,16 @@ function describeModel(data, pack, totalMs) {
     `${plural(data.summary.products, "product")}, ${count(data.summary.triangles)} tris, ` +
     `${count(pack.geometry.length)} meshes, ${count(state.model.drawCalls)} draws`;
   $("status-offset").textContent = `offset ${pack.index.model_offset.map(coordinate).join(" / ")}`;
-  if (totalMs !== null) setStatus(`Ready in ${duration(totalMs)}`, "on");
+  if (totalMs !== null) {
+    if (!pack.instances.count) {
+      const spatial = new Set(["IfcProject", "IfcSite", "IfcBuilding", "IfcBuildingStorey", "IfcSpace"]);
+      const onlySpatial = Object.keys(data.info?.products ?? {}).every((name) => spatial.has(name));
+      setStatus(onlySpatial ? "Empty model: no product geometry yet" : "No supported product geometry", onlySpatial ? "on" : "err");
+      if (!onlySpatial) shell.toast("The IFC parsed correctly, but no supported product geometry was produced.", "error");
+    } else {
+      setStatus(`Ready in ${duration(totalMs)}`, "on");
+    }
+  }
   $("gizmo-host").classList.remove("hidden");
   $("hint-bar").classList.remove("hidden");
   setTimeout(() => $("hint-bar").classList.add("hidden"), 6000);
@@ -1290,6 +1293,7 @@ function receiveEntityInfo(data) {
   state.selection.infoState = "ready";
   panelWork.properties = { selection: state.selection, info: data.info };
   schedulePanelWork();
+  state.fileSession?.reportSelection?.(selectionSummary());
 }
 
 function receiveEntityError(data) {
@@ -1344,24 +1348,20 @@ async function assistantContext() {
   const model = state.model;
   if (!model) return "No model is open.";
   const info = model.info ?? {};
-  const products = Object.entries(info.products ?? {}).sort((left, right) => right[1] - left[1]).slice(0, 40)
-    .map(([name, total]) => `${name} ${total}`).join(", ");
-  const storeys = (model.hierarchy?.nodes ?? []).filter((node) => node.class === "IfcBuildingStorey").slice(0, 20)
-    .map((node) => `#${node.expressId} ${node.name ?? "unnamed"}`).join("; ");
-  const lines = [
-    `File: ${model.file?.name ?? "model.ifc"} (${info.schema ?? "unknown schema"}), revision ${model.revision}, lengths in the model's length unit.`,
-    `Products by class: ${products || "none"}.`,
-  ];
-  if (storeys) lines.push(`Storeys: ${storeys}.`);
   const selection = selectionSummary();
-  if (selection) {
-    const fields = (state.selection?.info?.fields ?? []).filter((field) => field.raw && field.raw !== "$").slice(0, 40)
-      .map((field) => `${field.name}=${field.raw}`).join(", ");
-    lines.push(`Selected in the viewer (the \`selected\` entity): #${selection.expressId} ${selection.className}${fields ? ` with ${fields}` : ""}.`);
-  } else {
-    lines.push("Nothing is selected in the viewer.");
-  }
-  return lines.join("\n");
+  // Storeys come by class from the worker; the hierarchy is empty until geometry exists.
+  const storeys = model.facts?.storeys?.length
+    ? model.facts.storeys
+    : (model.hierarchy?.nodes ?? []).filter((node) => node.class === "IfcBuildingStorey").map((node) => ({ expressId: node.expressId, name: node.name ?? null }));
+  return describeModelInfo({
+    name: model.file?.name ?? "model.ifc",
+    schema: info.schema ?? null,
+    revision: model.revision,
+    lengthUnit: model.facts?.lengthUnit ?? null,
+    products: info.products ?? {},
+    storeys,
+    selection: selection ? { expressId: selection.expressId, className: selection.className, fields: state.selection?.info?.fields ?? [] } : null,
+  });
 }
 
 function applyEdits(changes) {
@@ -1397,46 +1397,6 @@ function applyEdits(changes) {
   }
 }
 
-/** Swap in the edited product's fresh geometry; the scene is rebuilt only if the triangles changed. */
-function receiveProductGeometry(data) {
-  const model = state.model;
-  if (!model?.assembler || data.modelId !== model.modelId) return;
-  try {
-    const chunk = readIgp(data.buffer);
-    // Read before the columns are compacted, or every hidden record above the edit would shift.
-    const hiddenIds = expressIdsOf(state.hiddenRecords);
-    const shownIds = expressIdsOf(state.shownRecords);
-    const isolatedIds = state.isolated ? expressIdsOf(state.isolated) : null;
-    const selected = state.selection?.expressId ?? null;
-    const result = model.assembler.replaceProducts([data.expressId], chunk);
-    if (!result.changed) {
-      setStatus("Edited, geometry unchanged", "busy");
-      return;
-    }
-
-    const pack = model.assembler.pack();
-    const index = buildIndex(pack);
-    state.hiddenRecords = recordsOf(hiddenIds, index);
-    state.shownRecords = recordsOf(shownIds, index);
-    state.isolated = isolatedIds ? recordsOf(isolatedIds, index) : null;
-    state.model = { ...model, pack, index };
-    const rebuilt = renderer.applyDelta(pack, result, isRecordVisible);
-    state.model = { ...state.model, ...rebuilt };
-    requestContestedTriangles();
-    tree.build(pack, model.hierarchy, index);
-    tree.syncVisibility(isRecordVisible);
-    syncHelperControls(pack);
-    scheduleVisibilityStats();
-    if (selected !== null) selectExpressId(selected, true);
-    inspector.setGeometryFacts({ pack, model: state.model });
-    describeModel({ info: model.info, summary: model.summary }, pack, null);
-    setStatus(`Edited, #${data.expressId} redrawn in ${duration(data.elapsedMs ?? 0)}`, "busy");
-    scheduleRender(true);
-  } catch (error) {
-    shell.toast(`The edited element could not be redrawn: ${errorText(error)}`, "error");
-  }
-}
-
 function expressIdsOf(records) {
   const ids = new Set();
   const expressIds = state.model?.pack.instances.expressIds;
@@ -1449,28 +1409,6 @@ function recordsOf(expressIds, index) {
   const records = new Set();
   for (const id of expressIds) for (const record of index.recordsByExpressId.get(id) ?? []) records.add(record);
   return records;
-}
-
-function receiveEditResult(data) {
-  if (data.modelId === state.model?.modelId) {
-    state.dirty = true;
-    setDirty(true);
-    finishRevision();
-  }
-  if (!state.selection || data.requestId !== state.selection.editRequestId) return;
-  if (data.expressId !== state.selection.expressId) return;
-  state.selection.info = data.info;
-  state.selection.infoState = "ready";
-  state.dirty = true;
-  setDirty(true);
-  inspector.setEditResult(data.info, data.changed);
-  setStatus("Edited, export pending", "busy");
-}
-
-function receiveEditError(data) {
-  if (data.requestId === state.revisionPending?.requestId) finishRevision(new Error(data.message));
-  if (!state.selection || data.requestId !== state.selection.editRequestId) return;
-  inspector.setEditError(data.message);
 }
 
 function revisionOptions() {
@@ -1520,25 +1458,44 @@ function finishRevision(error = null, result = null) {
   else pending?.resolve?.(result);
 }
 
-function productIdentities(model, ids) {
-  const nodes = new Map((model.hierarchy?.nodes ?? []).map((node) => [node.expressId, node]));
-  return [...ids].map((id) => ({ id, guid: nodes.get(id)?.globalId ?? null }));
+/** GlobalId of every product in a hierarchy, by express id. */
+function hierarchyGuids(hierarchy) {
+  const guids = new Map();
+  for (const node of hierarchy?.nodes ?? []) if (node.globalId) guids.set(node.expressId, node.globalId);
+  return guids;
 }
 
-function restoreIdentities(identities, hierarchy, fullRebuild) {
-  const guidIds = new Map();
+/** Express id of every GlobalId in a hierarchy; null marks one that several products share. */
+function hierarchyIds(hierarchy) {
+  const ids = new Map();
   for (const node of hierarchy?.nodes ?? []) {
     if (!node.globalId) continue;
-    guidIds.set(node.globalId, guidIds.has(node.globalId) ? null : node.expressId);
+    ids.set(node.globalId, ids.has(node.globalId) ? null : node.expressId);
   }
-  return identities.map(({ id, guid }) => guid ? guidIds.get(guid) : fullRebuild ? null : id)
-    .filter((id) => Number.isInteger(id));
+  return ids;
+}
+
+function productIdentities(guids, ids) {
+  return [...ids].map((id) => ({ id, guid: guids.get(id) ?? null }));
+}
+
+function restoreIdentities(identities, ids, fullRebuild) {
+  return identities.map(({ id, guid }) => {
+    if (!guid) return fullRebuild ? null : id;
+    const found = ids.get(guid);
+    if (Number.isInteger(found)) return found;
+    // A GlobalId several products share cannot pick one, but in a selective update the express id still does.
+    return found === null && !fullRebuild ? id : null;
+  }).filter((id) => Number.isInteger(id));
 }
 
 function receiveRevision(data) {
   const model = state.model;
   if (!model || data.modelId !== model.modelId) return;
-  if (data.revision === model.revision) return;
+  if (data.revision === model.revision) {
+    if (data.requestId === state.revisionPending?.requestId) finishRevision(new Error("The IFC update reported no new revision."));
+    return;
+  }
   if (data.requestId !== state.revisionPending?.requestId || data.baseRevision !== model.revision) {
     model.stale = true;
     setStatus("IFC revision mismatch; reopen the model", "err");
@@ -1546,14 +1503,26 @@ function receiveRevision(data) {
     return;
   }
   const pending = state.revisionPending;
+  const started = performance.now();
+  // Main-thread cost by stage, kept beside the kernel and worker figures in lastUpdate.
+  const stages = {};
+  let mark = started;
+  const stage = (name) => {
+    const now = performance.now();
+    stages[name] = (stages[name] ?? 0) + now - mark;
+    mark = now;
+  };
   try {
     const impact = data.impact;
     const chunk = data.buffer ? readIgp(data.buffer) : null;
     if (!chunk) throw new Error("The IFC update is missing its geometry payload.");
-    const hidden = productIdentities(model, expressIdsOf(state.hiddenRecords));
-    const shown = productIdentities(model, expressIdsOf(state.shownRecords));
-    const isolated = state.isolated ? productIdentities(model, expressIdsOf(state.isolated)) : null;
-    const selected = productIdentities(model, state.selection ? [state.selection.expressId] : []);
+    stage("readIgpMs");
+    const guids = hierarchyGuids(model.hierarchy);
+    const hidden = productIdentities(guids, expressIdsOf(state.hiddenRecords));
+    const shown = productIdentities(guids, expressIdsOf(state.shownRecords));
+    const isolated = state.isolated ? productIdentities(guids, expressIdsOf(state.isolated)) : null;
+    const selected = productIdentities(guids, state.selection ? [state.selection.expressId] : []);
+    stage("identityMs");
     let assembler = model.assembler;
     let result;
     if (impact.fullRebuild) {
@@ -1565,28 +1534,34 @@ function receiveRevision(data) {
     }
     const pack = assembler.pack();
     pack.index.georef = chunk.index.georef;
+    stage("assembleMs");
     const index = buildIndex(pack);
-    const restore = (items) => recordsOf(restoreIdentities(items, data.hierarchy, impact.fullRebuild), index);
+    stage("indexMs");
+    const newIds = hierarchyIds(data.hierarchy);
+    const restore = (items) => recordsOf(restoreIdentities(items, newIds, impact.fullRebuild), index);
     state.hiddenRecords = restore(hidden);
     state.shownRecords = restore(shown);
     state.isolated = isolated ? restore(isolated) : null;
+    stage("identityMs");
     const summary = { ...model.summary, products: index.recordsByExpressId.size,
       triangles: index.triangles.reduce((sum, value) => sum + value, 0) };
-    state.model = { ...model, assembler, pack, index, revision: data.revision, info: data.info,
+    state.model = { ...model, assembler, pack, index, revision: data.revision, info: data.info, facts: data.facts ?? model.facts ?? null,
       hierarchy: data.hierarchy, summary, stale: false, file: pending.file ?? model.file };
     let rendered = {};
     if (result.changed) {
       rendered = impact.fullRebuild ? renderer.reload(pack, isRecordVisible) : renderer.applyDelta(pack, result, isRecordVisible);
       tools.clearMeasurement();
     }
+    stage("rendererMs");
     state.model = { ...state.model, ...rendered,
-      lastUpdate: { ...impact, ...data.timings, revision: data.revision, renderer: rendered.patchStats ?? null } };
+      lastUpdate: { ...impact, ...data.timings, revision: data.revision, renderer: rendered.patchStats ?? null, stages } };
     if (result.changed) requestContestedTriangles();
     tree.build(pack, data.hierarchy, index);
     tree.syncVisibility(isRecordVisible);
+    stage("treeMs");
     syncHelperControls(pack);
     scheduleVisibilityStats();
-    const selectedId = restoreIdentities(selected, data.hierarchy, impact.fullRebuild)[0];
+    const selectedId = restoreIdentities(selected, newIds, impact.fullRebuild)[0];
     if (selectedId != null && index.recordsByExpressId.has(selectedId)) selectExpressId(selectedId, true);
     else clearSelection();
     if (data.entityInfo && state.selection?.expressId === (data.infoId ?? data.expressId)) {
@@ -1613,6 +1588,8 @@ function receiveRevision(data) {
     $("status-text").title = (impact.reasons ?? []).slice(0, 30).map((item) => `#${item.expressId}: ${item.reason}`).join("\n");
     scheduleRender(true);
     sessionPanel.refresh();
+    stage("panelsMs");
+    stages.totalMs = performance.now() - started;
     finishRevision(null, pending.script
       ? { ...data.script, impact: state.model.lastUpdate, history: data.history ?? null }
       : state.model.lastUpdate);

@@ -4,6 +4,8 @@
 //! inside the geometry worker. Edits become a new IFC snapshot for the
 //! revision path, so the kernel decides which products to rebuild.
 
+import { createHelpers } from "./script-helpers.js";
+
 const ENTITY = Symbol("entity");
 const DERIVED = Symbol("derived");
 const GUID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
@@ -62,8 +64,17 @@ export const API_REFERENCE = `JavaScript with these names defined:
   select values need ifc.typed("IFCLABEL", "x"). Returns the new entity.
 - ifc.remove(entity) deletes it and detaches every reference to it; a relationship left empty is removed too.
 - ifc.inverses(entity, "IfcRelVoidsElement") -> entities referencing it; ifc.container(product) -> its storey or null.
-- ifc.addBox(className, name, { at: [x, y, z], size: [width, depth, height], relativeTo: entity }) creates a placed
-  rectangular extrusion (centred on x/y at its placement, rising from z) with a Body representation.
+- ifc.addBox(className, name, { at: [x, y, z], size: [width, depth, height], relativeTo: entity, rotation: degrees }) creates
+  a placed rectangular extrusion (centred on x/y at its placement, rising from z) with a Body representation.
+- Building helpers (lengths in the model unit, z up, all contained in a storey and returned as entities):
+  ifc.addStorey({ name, elevation }); ifc.storeys() lowest first; ifc.byName("IfcWall", "Name").
+  ifc.addWall({ from: [x, y], to: [x, y], height, thickness, storey, name }) along the line between the points.
+  ifc.addSlab({ polygon: [[x, y], ...] or size: [w, d], at: [x, y, z], thickness, type: "FLOOR" | "ROOF" | "BASESLAB", storey }).
+  ifc.addDoor({ in: wall, at: [x, 0, 0], size: [width, height] }) and ifc.addWindow({ in: wall, at: [x, 0, sill], size })
+  cut their own opening; x runs along the wall from its centre, so use half the length for the ends.
+  ifc.addColumn({ at: [x, y], size: [w, d], height, storey }); ifc.addBeam({ from: [x, y, z], to: [x, y, z], size: [depth, width] }).
+  ifc.addProperties(entity, "Pset_WallCommon", { IsExternal: true, FireRating: "REI60" }) creates or extends the set.
+  ifc.setColor(entity, [r, g, b, a]) with components 0..1; ifc.describe() -> schema, unit, product counts, storeys.
 - ifc.contain(product, storey), ifc.void(host, opening), ifc.fill(opening, element), ifc.aggregate(parent, child).
 - ifc.newGuid(), ifc.enum("AREA"), ifc.typed(type, value), ifc.int(n), ifc.context(), ifc.schema.
 - selected (the viewer selection or null), selection (array), print(...values).
@@ -199,6 +210,108 @@ export function splitArguments(text) {
   return parts;
 }
 
+/** Whether a parsed STEP value references `#id` anywhere inside it. */
+export function containsRef(value, id) {
+  if (value instanceof Ref) return value.id === id;
+  if (Array.isArray(value)) return value.some((item) => containsRef(item, id));
+  if (value instanceof Typed) return containsRef(value.value, id);
+  return false;
+}
+
+const isSpace = (char) => char === " " || char === "\t" || char === "\r" || char === "\n";
+const isNameChar = (char) => /[A-Za-z0-9_]/.test(char);
+
+/**
+ * Scan STEP text once, outside string literals and comments. Returns every
+ * `#id=` record with its spans (`records`, by id) and, for every referenced
+ * entity, the ids of the records that reference it (`users`).
+ */
+export function indexRecords(source) {
+  const records = new Map();
+  const users = new Map();
+  const length = source.length;
+  let current = null;
+  let depth = 0;
+  let i = 0;
+  while (i < length) {
+    const char = source[i];
+    if (char === "'") {
+      i += 1;
+      while (i < length) {
+        if (source[i] === "'") {
+          if (source[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          break;
+        }
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    if (char === "/" && source[i + 1] === "*") {
+      const close = source.indexOf("*/", i + 2);
+      i = close < 0 ? length : close + 2;
+      continue;
+    }
+    if (char === "#") {
+      let j = i + 1;
+      while (j < length && source[j] >= "0" && source[j] <= "9") j += 1;
+      if (j === i + 1) {
+        i += 1;
+        continue;
+      }
+      const id = Number(source.slice(i + 1, j));
+      if (current) {
+        let set = users.get(id);
+        if (!set) users.set(id, (set = new Set()));
+        set.add(current.id);
+        i = j;
+        continue;
+      }
+      let k = j;
+      while (k < length && isSpace(source[k])) k += 1;
+      if (source[k] !== "=") {
+        i = j;
+        continue;
+      }
+      let lineStart = i;
+      while (lineStart > 0 && source[lineStart - 1] !== "\n") lineStart -= 1;
+      let m = k + 1;
+      while (m < length && isSpace(source[m])) m += 1;
+      let n = m;
+      while (n < length && isNameChar(source[n])) n += 1;
+      let p = n;
+      while (p < length && isSpace(source[p])) p += 1;
+      // A complex instance has no class name and its arguments are the outer list.
+      const className = source.slice(m, n);
+      current = { id, className, start: i, argsStart: p + 1, argsEnd: -1, end: -1, lineStart, lineEnd: -1 };
+      depth = 0;
+      i = p;
+      continue;
+    }
+    if (current) {
+      if (char === "(") depth += 1;
+      else if (char === ")") {
+        depth -= 1;
+        if (depth === 0 && current.argsEnd < 0) current.argsEnd = i;
+      } else if (char === ";" && depth <= 0) {
+        current.end = i + 1;
+        let lineEnd = i + 1;
+        if (source[lineEnd] === "\r") lineEnd += 1;
+        if (source[lineEnd] === "\n") lineEnd += 1;
+        current.lineEnd = lineEnd;
+        if (current.argsEnd < 0) current.argsEnd = i;
+        records.set(current.id, current);
+        current = null;
+      }
+    }
+    i += 1;
+  }
+  return { records, users };
+}
+
 function formatReal(value) {
   if (!Number.isFinite(value)) throw new Error(`${value} is not a finite number`);
   if (Number.isInteger(value)) return `${value}.`;
@@ -256,6 +369,7 @@ export function newGuid(random = crypto) {
 export function createScriptEngine(kernel, modelId) {
   const infoCache = new Map();
   const classCache = new Map();
+  const supertypeCache = new Map();
   const typeCache = new Map();
   const edits = new Map();
   const added = new Map();
@@ -264,7 +378,7 @@ export function createScriptEngine(kernel, modelId) {
   let outputChars = 0;
   let dropped = 0;
   let sourceText = null;
-  let recordStarts = null;
+  let recordIndex = null;
   let nextId = null;
   let contextRef = null;
   const schema = JSON.parse(kernel.getModelInfo(modelId)).schema;
@@ -278,21 +392,16 @@ export function createScriptEngine(kernel, modelId) {
     return sourceText;
   }
 
-  function starts() {
-    if (recordStarts === null) {
-      recordStarts = [];
-      const pattern = /(?<![0-9A-Za-z_])#(\d+)\s*=/g;
-      let match;
-      const source = text();
-      while ((match = pattern.exec(source))) recordStarts.push({ id: Number(match[1]), index: match.index });
-    }
-    return recordStarts;
+  /** Record spans and reference users of the source, scanned once outside strings and comments. */
+  function index() {
+    if (recordIndex === null) recordIndex = indexRecords(text());
+    return recordIndex;
   }
 
   function allocateId() {
     if (nextId === null) {
       let max = 0;
-      for (const record of starts()) if (record.id > max) max = record.id;
+      for (const id of index().records.keys()) if (id > max) max = id;
       nextId = max + 1;
     }
     const id = nextId;
@@ -332,26 +441,19 @@ export function createScriptEngine(kernel, modelId) {
   }
 
   function isA(id, name) {
-    if (added.has(id)) return added.get(id).info.class.toUpperCase() === String(name).toUpperCase() || ancestors(added.get(id).info.class).has(String(name).toUpperCase());
+    if (added.has(id)) return supertypes(added.get(id).info.class).has(String(name).toUpperCase());
     return idsOfType(name).has(id);
   }
 
-  /** Superclass names of a class, found through the kernel's instance queries. */
-  function ancestors(name) {
-    const set = new Set();
-    for (const candidate of ["IfcRoot", "IfcObject", "IfcProduct", "IfcElement", "IfcBuildingElement", "IfcBuiltElement",
-      "IfcSpatialElement", "IfcSpatialStructureElement", "IfcRelationship", "IfcRepresentationItem", "IfcGeometricRepresentationItem"]) {
-      const definition = classCache.get(candidate.toUpperCase()) ?? (kernel.getClassAttributes(modelId, candidate) ? JSON.parse(kernel.getClassAttributes(modelId, candidate)) : null);
-      if (definition && String(name).toUpperCase() !== candidate.toUpperCase()) {
-        const target = classDefinition(name);
-        // A subtype repeats its supertype's attributes as a prefix.
-        if (target.attributes.length >= definition.attributes.length &&
-          definition.attributes.every((attribute, index) => attribute.name === target.attributes[index]?.name)) {
-          set.add(candidate.toUpperCase());
-        }
-      }
+  /** The class and its supertypes, upper-cased, from the kernel's schema tables. */
+  function supertypes(name) {
+    const key = String(name).toUpperCase();
+    if (!supertypeCache.has(key)) {
+      const json = typeof kernel.getClassSupertypes === "function" ? kernel.getClassSupertypes(modelId, String(name)) : null;
+      const names = json ? JSON.parse(json) : [String(name)];
+      supertypeCache.set(key, new Set(names.map((item) => item.toUpperCase())));
     }
-    return set;
+    return supertypeCache.get(key);
   }
 
   function decode(raw) {
@@ -467,7 +569,18 @@ export function createScriptEngine(kernel, modelId) {
         missing.push(attribute.name);
       }
     });
-    if (missing.length) throw new Error(`${definition.class} needs ${missing.join(", ")}`);
+    // IFC2X3 requires an owner history on every rooted entity; reuse the file's first one.
+    if (missing.includes("OwnerHistory")) {
+      const history = ownerHistory();
+      if (history !== null) {
+        args[definition.attributes.findIndex((attribute) => attribute.name === "OwnerHistory")] = `#${history}`;
+        missing.splice(missing.indexOf("OwnerHistory"), 1);
+      }
+    }
+    if (missing.length) {
+      const hint = missing.includes("OwnerHistory") ? "; this schema needs an IfcOwnerHistory and the model has none (createModel writes one)" : "";
+      throw new Error(`${definition.class} needs ${missing.join(", ")}${hint}`);
+    }
     const id = allocateId();
     const fields = definition.attributes.map((attribute, index) => ({
       index, name: attribute.name, kind: attribute.base, type: attribute.type, optional: attribute.optional, raw: args[index], value: null,
@@ -477,57 +590,28 @@ export function createScriptEngine(kernel, modelId) {
     return entity(id);
   }
 
+  function ownerHistory() {
+    for (const [id, record] of added) if (record.className.toUpperCase() === "IFCOWNERHISTORY") return id;
+    const [first] = [...idsOfType("IfcOwnerHistory")].filter((id) => !removed.has(id));
+    return first ?? null;
+  }
+
   // ----------------------------------------------------------- records
 
   function locate(id) {
-    const source = text();
-    const pattern = new RegExp(`(?<![0-9A-Za-z_])#${id}\\s*=\\s*([A-Za-z0-9_]+)\\s*\\(`, "g");
-    const match = pattern.exec(source);
-    if (!match) return null;
-    let i = match.index + match[0].length;
-    let depth = 1;
-    let quoted = false;
-    const argsStart = i;
-    while (i < source.length && depth > 0) {
-      const char = source[i];
-      if (quoted) {
-        if (char === "'") quoted = false;
-      } else if (char === "'") quoted = true;
-      else if (char === "(") depth += 1;
-      else if (char === ")") depth -= 1;
-      i += 1;
-    }
-    const argsEnd = i - 1;
-    let end = i;
-    while (end < source.length && source[end] !== ";") end += 1;
-    let lineStart = match.index;
-    while (lineStart > 0 && source[lineStart - 1] !== "\n") lineStart -= 1;
-    let lineEnd = end + 1;
-    if (source[lineEnd] === "\r") lineEnd += 1;
-    if (source[lineEnd] === "\n") lineEnd += 1;
-    return { id, className: match[1], start: match.index, argsStart, argsEnd, end: end + 1, lineStart, lineEnd };
+    const record = index().records.get(id);
+    return record && record.className ? record : null;
   }
 
   function referencingRecords(id) {
-    const source = text();
-    const pattern = new RegExp(`(?<![0-9A-Za-z_])#${id}(?![0-9])`, "g");
-    const list = starts();
     const found = new Set();
-    let match;
-    while ((match = pattern.exec(source))) {
-      // The record containing this position is the last one starting before it.
-      let low = 0;
-      let high = list.length - 1;
-      while (low < high) {
-        const mid = (low + high + 1) >> 1;
-        if (list[mid].index <= match.index) low = mid;
-        else high = mid - 1;
-      }
-      const record = list[low];
-      if (record && record.index <= match.index && record.id !== id) found.add(record.id);
+    // Records with pending edits are judged by their current arguments, not the file.
+    for (const otherId of index().users.get(id) ?? []) if (otherId !== id && !edits.has(otherId)) found.add(otherId);
+    for (const otherId of edits.keys()) {
+      if (otherId !== id && (currentArguments(otherId) ?? []).some((arg) => containsRef(parseValue(arg).value, id))) found.add(otherId);
     }
     for (const [otherId, record] of added) {
-      if (otherId !== id && record.args.some((arg) => new RegExp(`#${id}(?![0-9])`).test(arg))) found.add(otherId);
+      if (otherId !== id && record.args.some((arg) => containsRef(parseValue(arg).value, id))) found.add(otherId);
     }
     for (const otherId of removed) found.delete(otherId);
     return [...found];
@@ -553,8 +637,8 @@ export function createScriptEngine(kernel, modelId) {
         let emptied = false;
         for (const item of other.fields) {
           const raw = edits.get(otherId)?.get(item.name) ?? item.raw;
-          if (!new RegExp(`#${id}(?![0-9])`).test(raw)) continue;
           const value = parseValue(raw).value;
+          if (!containsRef(value, id)) continue;
           if (Array.isArray(value)) {
             const kept = value.filter((element) => !(element instanceof Ref && element.id === id));
             if (kept.length === 0) emptied = true;
@@ -582,18 +666,21 @@ export function createScriptEngine(kernel, modelId) {
       if (record.args[0] === encodeStepString(guid)) return entity(id);
     }
     const literal = encodeStepString(guid).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = new RegExp(`(?<![0-9A-Za-z_])#(\\d+)\\s*=\\s*[A-Za-z0-9_]+\\s*\\(\\s*${literal}\\s*,`).exec(text());
-    if (!match) return null;
-    const id = Number(match[1]);
-    return removed.has(id) ? null : entity(id);
+    const pattern = new RegExp(`#(\\d+)\\s*=\\s*[A-Za-z0-9_]+\\s*\\(\\s*${literal}\\s*,`, "g");
+    const source = text();
+    let match;
+    while ((match = pattern.exec(source))) {
+      // Only a real record start counts; the same text inside a string or a comment does not.
+      const record = index().records.get(Number(match[1]));
+      if (record && record.start === match.index) return removed.has(record.id) ? null : entity(record.id);
+    }
+    return null;
   }
 
   function byType(name) {
-    const ids = [...idsOfType(name)].filter((id) => !removed.has(id));
-    for (const [id, record] of added) {
-      if (!ids.includes(id) && (record.className.toUpperCase() === String(name).toUpperCase())) ids.push(id);
-    }
-    return ids.map(entity);
+    const ids = new Set([...idsOfType(name)].filter((id) => !removed.has(id)));
+    for (const id of added.keys()) if (isA(id, name)) ids.add(id);
+    return [...ids].map(entity);
   }
 
   function inverses(target, filterClass = null) {
@@ -611,20 +698,6 @@ export function createScriptEngine(kernel, modelId) {
       if (!contextRef) throw new Error("The model has no geometric representation context");
     }
     return contextRef;
-  }
-
-  function addBox(name, label, { at = [0, 0, 0], size = [1, 1, 1], relativeTo = null, attributes = {} } = {}) {
-    const [x, y, z] = at;
-    const [width, depth, height] = size;
-    const point = add("IfcCartesianPoint", { Coordinates: [x, y, z] });
-    const axes = add("IfcAxis2Placement3D", { Location: point });
-    const placement = add("IfcLocalPlacement", { PlacementRelTo: relativeTo ? relativeTo.ObjectPlacement : null, RelativePlacement: axes });
-    const profile = add("IfcRectangleProfileDef", { ProfileType: "AREA", XDim: width, YDim: depth });
-    const direction = add("IfcDirection", { DirectionRatios: [0, 0, 1] });
-    const solid = add("IfcExtrudedAreaSolid", { SweptArea: profile, ExtrudedDirection: direction, Depth: height });
-    const shape = add("IfcShapeRepresentation", { ContextOfItems: context(), RepresentationIdentifier: "Body", RepresentationType: "SweptSolid", Items: [solid] });
-    const representation = add("IfcProductDefinitionShape", { Representations: [shape] });
-    return add(name, { Name: label, ObjectPlacement: placement, Representation: representation, ...attributes });
   }
 
   function contain(product, structure) {
@@ -737,6 +810,14 @@ export function createScriptEngine(kernel, modelId) {
     return dropped ? `${value}\n... ${dropped} more characters` : value;
   }
 
+  const voidRel = (host, opening) => add("IfcRelVoidsElement", { RelatingBuildingElement: host, RelatedOpeningElement: opening });
+  const fillRel = (opening, element) => add("IfcRelFillsElement", { RelatingOpeningElement: opening, RelatedBuildingElement: element });
+  const helpers = createHelpers({
+    add, byType, inverses, contain, aggregate, container, context, classDefinition, schema,
+    void: voidRel, fill: fillRel, typed: (type, value) => new Typed(type, value),
+    isTyped: (value) => value instanceof Typed, isInt: (value) => value instanceof Int,
+    modelInfo: () => JSON.parse(kernel.getModelInfo(modelId)),
+  });
   const api = Object.freeze({
     schema,
     byType, get: (id) => {
@@ -744,9 +825,8 @@ export function createScriptEngine(kernel, modelId) {
       if (!info(numeric)) throw new Error(`Entity #${numeric} does not exist`);
       return entity(numeric);
     },
-    byGuid, add, remove, inverses, container, contain, aggregate, context, addBox,
-    void: (host, opening) => add("IfcRelVoidsElement", { RelatingBuildingElement: host, RelatedOpeningElement: opening }),
-    fill: (opening, element) => add("IfcRelFillsElement", { RelatingOpeningElement: opening, RelatedBuildingElement: element }),
+    byGuid, add, remove, inverses, container, contain, aggregate, context, ...helpers,
+    void: voidRel, fill: fillRel,
     newGuid, enum: (value) => new Enum(value), typed: (type, value) => new Typed(type, value), int: (value) => new Int(value),
     ref: (id) => entity(resolveId(id)), derived: DERIVED, print,
   });

@@ -115,7 +115,9 @@ class SnapshotTests(SessionFixture):
     def test_describe_reports_capabilities(self):
         status = self.session.describe()
         self.assertEqual(status["name"], "fixture.ifc")
-        self.assertEqual(status["capabilities"]["authoring"], ifcopenshell is not None)
+        self.assertEqual(status["capabilities"]["authoring"], "python" if ifcopenshell is not None else False)
+        self.assertEqual(status["generation"], 1)
+        self.assertTrue(status["capabilities"]["selection"] and status["capabilities"]["applied"])
         self.assertIsNone(status["capabilities"]["assistant"])
 
 
@@ -224,6 +226,18 @@ class AssistantTests(SessionFixture):
         self.assertTrue(outcome["run"]["ok"] and outcome["run"]["changed"])
         self.assertEqual(self.session.revision, 1)
         self.assertIn(b"Assistant renamed wall", self.path.read_bytes())
+
+    def test_undo_tool_publishes_a_new_version(self):
+        from tessifc_session import UNDO_TOOL
+        self.assistant.respond({"mode": "edit", "prompt": "Rename it", "policy": "auto", "selection": {"guids": [WALL_GUID]}})
+        self.assertEqual(self.session.revision, 1)
+        content, is_error = self.assistant.execute_tool(UNDO_TOOL["name"], {})
+        self.assertFalse(is_error, content)
+        self.assertEqual(self.session.revision, 2)
+        self.assertNotIn(b"Assistant renamed wall", self.path.read_bytes())
+        content, is_error = self.assistant.execute_tool("undo_edit", {})
+        self.assertTrue(is_error)
+        self.assertIn("Nothing to undo", content)
 
     def test_history_is_bounded_and_alternating(self):
         history = [{"role": "assistant", "content": "orphan"}, {"role": "user", "content": "a"},

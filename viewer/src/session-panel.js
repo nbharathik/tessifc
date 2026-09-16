@@ -30,16 +30,22 @@ export function createSessionPanel({ shell, getSession, getSelection, browser, a
 
   // ------------------------------------------------------------ engines
 
-  /** The engine behind the panel: the Python session when connected, the browser otherwise. */
+  /** The engine behind the panel: the connected session (Python or JavaScript) when there is one, the browser otherwise. */
   function engine() {
     const session = getSession();
     if (session && status) {
       const capabilities = status.capabilities ?? {};
+      // Older hosts report a boolean; a string names the language the session runs.
+      const language = capabilities.authoring === "javascript" ? "javascript" : capabilities.authoring ? "python" : null;
+      const label = language === "javascript"
+        ? `JavaScript · ${capabilities.engine ?? "session"}`
+        : `Python · ${language ? `IfcOpenShell ${capabilities.ifcopenshell ?? ""}`.trim() : "scripts unavailable"}`;
       return {
-        kind: "python",
-        label: `Python · ${capabilities.authoring ? `IfcOpenShell ${capabilities.ifcopenshell ?? ""}`.trim() : "scripts unavailable"}`,
-        ready: Boolean(capabilities.authoring) && hasModel(),
-        note: capabilities.authoring ? "" : capabilities.authoringError ?? "Install IfcOpenShell in the session's Python environment.",
+        kind: "session",
+        language: language ?? "python",
+        label,
+        ready: Boolean(language) && hasModel(),
+        note: language ? "" : capabilities.authoringError ?? "Install IfcOpenShell in the session's Python environment.",
         undoCount: status.undo ?? 0,
         redoCount: status.redo ?? 0,
         run: (script, selection) => session.run(script, selection),
@@ -47,11 +53,12 @@ export function createSessionPanel({ shell, getSession, getSelection, browser, a
         redo: () => session.redo(),
         applied: (result) => session.whenApplied(result.version, result.marker),
         assistant: capabilities.assistant ? { describe: () => capabilities.assistant, respond: (request) => session.assistant(request) } : null,
-        examples: PYTHON_EXAMPLES,
+        examples: language === "javascript" ? (status.examples?.length ? status.examples : JAVASCRIPT_EXAMPLES) : PYTHON_EXAMPLES,
       };
     }
     return {
       kind: "javascript",
+      language: "javascript",
       label: "JavaScript · in this browser",
       ready: hasModel(),
       note: hasModel() ? "" : "Open a model to run scripts.",
@@ -80,17 +87,20 @@ export function createSessionPanel({ shell, getSession, getSelection, browser, a
     $("session-status").textContent = parts.join(" · ");
     $("session-dot").className = `dot ${busy || status?.busy ? "busy" : current.ready ? "on" : ""}`.trim();
     $("script-note").textContent = current.note;
-    $("session-python-hint").classList.toggle("hidden", current.kind === "python");
+    $("session-python-hint").classList.toggle("hidden", current.kind === "session");
     $("assistant-note").textContent = current.assistant
       ? ""
-      : current.kind === "python"
-        ? "Start the session with an assistant provider to ask questions or request edits."
+      : current.kind === "session"
+        ? current.language === "javascript"
+          ? "This session is driven by an MCP client; the browser assistant works on a locally opened file."
+          : "Start the session with an assistant provider to ask questions or request edits."
         : "Choose an assistant provider under Settings to ask questions or request edits.";
-    if (current.kind !== engineKind) {
-      engineKind = current.kind;
+    const engineId = `${current.kind}:${current.language}`;
+    if (engineId !== engineKind) {
+      engineKind = engineId;
       fillExamples(current.examples);
-      $("script-language").textContent = current.kind === "python" ? "Python" : "JavaScript";
-      editor.placeholder = current.kind === "python"
+      $("script-language").textContent = current.language === "python" ? "Python" : "JavaScript";
+      editor.placeholder = current.language === "python"
         ? "wall = selected or model.by_type('IfcWall')[0]\nprint(wall.Name)"
         : 'const wall = selected ?? ifc.byType("IfcWall")[0];\nprint(wall.Name);';
     }
@@ -270,7 +280,7 @@ export function createSessionPanel({ shell, getSession, getSelection, browser, a
   $("script-insert").addEventListener("click", () => {
     const selection = getSelection();
     if (!selection) return;
-    const python = engine().kind === "python";
+    const python = engine().language === "python";
     const target = selection.globalId
       ? `model.by_guid(${JSON.stringify(selection.globalId)})`
       : `model.by_id(${selection.expressId})`;
@@ -418,5 +428,5 @@ export function createSessionPanel({ shell, getSession, getSelection, browser, a
   setMode("ask");
   refresh();
 
-  return { open, setStatus, setSelection, refresh, runScript, tab: () => tab, mode: () => mode, setMode, engine: () => engine().kind };
+  return { open, setStatus, setSelection, refresh, runScript, tab: () => tab, mode: () => mode, setMode, engine: () => engine().kind, language: () => engine().language };
 }

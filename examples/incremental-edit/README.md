@@ -36,6 +36,10 @@ Anthropic or an OpenAI-compatible URL, enter the model and the key. Ask mode
 answers questions from the model; Edit mode proposes a script that you review
 and run from the card.
 
+To let an agent outside the browser edit the model, or to build one from
+nothing, see the [agent-building example](../agent-building/README.md): it
+runs the same scripts from Node, from Claude Code over MCP and from Python.
+
 ## With Python and IfcOpenShell
 
 Use a Python environment where IfcOpenShell is installed:
@@ -46,7 +50,7 @@ python examples/incremental-edit/edit.py demo.ifc init
 python scripts/serve-edit-session.py demo.ifc
 ```
 
-Open the local address printed by the server. The **Script** tab now runs
+Open the local address printed by the server. The **Session** panel now runs
 Python against the model held by the session, with its own examples:
 
 ```python

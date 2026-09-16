@@ -89,9 +89,12 @@ jobs:
         run: python -m pip install -r requirements-site.txt
 
       # IfcOpenShell is an optional authoring runtime, installed here only so
-      # the editing session tests can run scripts against a model.
+      # the editing session tests can run scripts against a model. The MCP
+      # package is the optional agent transport of the Python session.
       - name: install the optional authoring runtime
-        run: python -m pip install ifcopenshell
+        run: |
+          python -m pip install "mcp>=1.12,<2"
+          python -m pip install ifcopenshell || echo "IfcOpenShell is unavailable here; the adapter tests that need it will skip"
 
       - name: add the wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -126,6 +129,14 @@ jobs:
       - name: run the editing SDK tests
         run: npm --prefix bindings/edit test
 
+      - name: install and test the MCP server package
+        run: |
+          npm ci --prefix bindings/mcp
+          npm --prefix bindings/mcp test
+
+      - name: build the demo house deterministically
+        run: node examples/agent-building/build-house.test.mjs
+
       # The three.js adapter runs against the same package. Its batching is
       # what a viewer actually draws, so a break there is a break in the
       # product even though no Rust changed.
@@ -158,4 +169,5 @@ jobs:
           npm pack ./bindings/wasm --dry-run
           npm pack ./bindings/edit --dry-run
           npm pack ./bindings/viewer --dry-run
+          npm pack ./bindings/mcp --dry-run
           npm pack ./adapters/three --dry-run

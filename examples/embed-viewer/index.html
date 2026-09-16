@@ -48,6 +48,8 @@
     <h1>TessIFC · embedded viewer</h1>
     <p>Drop an <code>.ifc</code> file here, or click to choose one.</p>
     <p style="margin-top:1rem"><small>Everything runs in this tab. Nothing is uploaded.</small></p>
+    <p style="margin-top:1rem"><button id="follow" type="button">Follow the local session</button>
+      <small>when this page is served by <code>tessifc-mcp</code> or the Python session</small></p>
     <input type="file" id="file" accept=".ifc" hidden>
   </div>
 </div>
@@ -72,6 +74,7 @@
   "imports": {
     "@tessifc/core/web": "../../bindings/wasm/pkg/tessifc_wasm.js",
     "@tessifc/edit/igp": "../../bindings/edit/src/igp.js",
+    "@tessifc/edit/session": "../../bindings/edit/src/session.js",
     "@tessifc/viewer": "../../bindings/viewer/src/index.js"
   }
 }
@@ -100,6 +103,19 @@ viewer.on("select", (selection) => {
   const record = selection.records[0];
   status(`#${selection.expressIds[0]} ${pack.index.classes[pack.instances.classIds[record]]}`);
 });
+// A followed session publishes revisions; the kernel's counts say what changed.
+viewer.on("revision", ({ revision, affectedProducts, removedProducts, fullRebuild }) => {
+  status(fullRebuild ? `Revision ${revision}: full refresh` : `Revision ${revision}: ${affectedProducts.length} updated, ${removedProducts.length} removed`);
+});
+viewer.on("session", ({ error }) => { if (error) status(error); });
+
+function followSession() {
+  $("drop").classList.add("hidden");
+  status("Following the local session");
+  viewer.follow("");
+}
+$("follow").addEventListener("click", (event) => { event.stopPropagation(); followSession(); });
+if (new URLSearchParams(location.search).get("session") === "file") followSession();
 
 async function openFile(file) {
   $("drop").classList.add("hidden");

@@ -50,10 +50,12 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"
           version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           test "$tag" = "$version" || { echo "tag $tag != Cargo.toml $version"; exit 1; }
-          for manifest in bindings/wasm bindings/edit bindings/viewer adapters/three; do
+          for manifest in bindings/wasm bindings/edit bindings/viewer bindings/mcp adapters/three viewer; do
             found=$(grep -m1 '"version"' "$manifest/package.json" | sed 's/.*"version": *"\([^"]*\)".*/\1/')
             test "$found" = "$tag" || { echo "$manifest/package.json is $found, tag is $tag"; exit 1; }
           done
+          pyversion=$(grep -m1 '^version = ' adapters/ifcopenshell/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          test "$pyversion" = "$tag" || { echo "adapters/ifcopenshell/pyproject.toml is $pyversion, tag is $tag"; exit 1; }
 
   cli:
     name: cli (${{ matrix.target }})
@@ -147,11 +149,17 @@ jobs:
       - run: node viewer/test/igp.test.mjs
       - run: node adapters/three/test/build.test.mjs
       - run: npm --prefix bindings/edit test
+      - name: MCP server package and the demo house
+        run: |
+          npm ci --prefix bindings/mcp
+          npm --prefix bindings/mcp test
+          node examples/agent-building/build-house.test.mjs
       - name: browser and website checks
         run: |
           npm ci --prefix viewer
           (cd viewer && npx playwright install --with-deps chromium)
           npm --prefix viewer test
+          npm --prefix bindings/viewer test
           python -m unittest discover -s scripts -p 'test_*.py'
           python scripts/build-site.py
       - name: package the npm tarballs
@@ -160,6 +168,7 @@ jobs:
           (cd bindings/wasm && npm pack --pack-destination ../../dist)
           (cd bindings/edit && npm pack --pack-destination ../../dist)
           (cd bindings/viewer && npm pack --pack-destination ../../dist)
+          (cd bindings/mcp && npm pack --pack-destination ../../dist)
           (cd adapters/three && npm pack --pack-destination ../../dist)
       - uses: actions/upload-artifact@v4
         with:
@@ -177,6 +186,7 @@ jobs:
           (cd bindings/wasm && npm publish --access public --provenance --tag preview)
           (cd bindings/edit && npm publish --access public --provenance --tag preview)
           (cd bindings/viewer && npm publish --access public --provenance --tag preview)
+          (cd bindings/mcp && npm publish --access public --provenance --tag preview)
           (cd adapters/three && npm publish --access public --provenance --tag preview)
 
   crates:

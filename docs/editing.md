@@ -45,6 +45,8 @@ replace the original through the user's normal version-control workflow.
 
 `Kernel.getEntityInfo` exposes schema names, exact raw spelling and decoded text.
 `Kernel.setAttributes` applies a form save as one transaction and one reparse.
+These immediate edits advance the revision and discard a pending staged
+candidate, so a host that stages revisions should not mix them in.
 `Kernel.exportModel` returns the current source. The viewer keeps the model in a
 worker, edits scalar text fields, and downloads an `.edited.ifc` revision with
 **Save IFC** or `Ctrl+S`.
@@ -119,21 +121,42 @@ attributes by name using the model's schema, `ifc.remove(entity)` deletes one
 and detaches every reference, `ifc.addBox`, `ifc.contain`, `ifc.void`,
 `ifc.fill` and `ifc.aggregate` cover the common authoring steps, and
 `ifc.inverses`, `ifc.container` and `ifc.byGuid` answer the common queries.
-The [SDK](sdk.md) lists the whole API and [Agents and pipelines](agents.md)
-shows the same loop outside the viewer. A script that throws publishes
-nothing; a script that changes nothing publishes nothing. `Undo` and `Redo`
-republish the source as it was before or after the last script, as new
+Building helpers go one level up: `ifc.addWall`, `ifc.addSlab`,
+`ifc.addDoor`, `ifc.addWindow`, `ifc.addColumn`, `ifc.addBeam`,
+`ifc.addStorey`, `ifc.addProperties` and `ifc.setColor` write the profiles,
+placements, openings, relationships, property sets and styles a building
+needs in the model's schema, and **Examples > Build a small house** shows
+them together: it adds a house beside whatever model is open. The
+[SDK](sdk.md#browser-scripts) lists the whole API and [Agents and
+pipelines](agents.md) shows the same loop outside the viewer. A script that
+throws publishes nothing; a script that changes nothing publishes nothing.
+`Undo` and `Redo` republish the source as it was before or after the last
+change, whether a script, an attribute save or an update from a file, as new
 revisions. Browser scripts make the model dirty: the download icon in the top
 bar exports the result.
 
-**Python with IfcOpenShell** is the second engine. Start a local session,
+The viewer also opens a model that has no product geometry yet, such as one
+written by `createModel` or `tessifc-mcp --new`: the status line says so,
+the tree shows the storeys, and the first script that adds a product
+publishes an ordinary selective revision.
+
+**JavaScript from another process** is the same engine outside the browser.
+`node bindings/mcp/src/cli.js model.ifc` (or `--new house.ifc`) holds the
+model in a Node kernel, saves it after every accepted edit and serves the
+viewer at a loopback address; open the printed address and the Session panel
+runs its scripts on that host, whose undo and redo the panel shares, while an
+agent connected over MCP edits the same model. The viewer follows every
+revision with the kernel's affected-product report.
+
+**Python with IfcOpenShell** is the third engine. Start a local session,
 `python scripts/serve-edit-session.py model.ifc`, and open the address it
 prints. The session process owns the file, parses it once with an installed
 IfcOpenShell, runs scripts with `model`, `ifcopenshell`, `api`, `element`,
 `guid`, `selection` and `selected` defined inside a transaction, and publishes
 each accepted change by writing the file atomically. The viewer follows the
 file, so any other process may save it too. The panel switches its examples
-and its language when the session is connected.
+and its language when the session is connected. `--new` creates the file
+first and `--mcp` puts the same tools on stdio for an agent.
 
 ## The assistant
 
@@ -150,6 +173,9 @@ OpenRouter, Anthropic, or any OpenAI-compatible chat-completions URL such as
 Ollama or LM Studio on your machine. The key is stored in this browser only
 and sent only to that provider. With a Python session the assistant runs on
 the session process instead (`--assistant anthropic` with `ANTHROPIC_API_KEY`).
+An agent of your own, Claude Code or Claude Desktop connects through the MCP
+servers described in [Agents and pipelines](agents.md) and the viewer shows
+its work the same way.
 
 Scripts, whether typed or generated, run with your user's permissions and
 without a sandbox: in the page's worker for JavaScript, in the session

@@ -4,15 +4,14 @@
 //! Streams IGP chunks for progressive display; older kernels get one pack.
 
 import init, { Kernel, version } from "../../bindings/wasm/pkg/tessifc_wasm.js";
-import { createScriptEngine, runScript as runModelScript } from "../../bindings/edit/src/script-engine.js";
+import { createEditingSession } from "../../bindings/edit/src/session.js";
+import { lengthUnitOf, storeysOf } from "../../bindings/edit/src/describe.js";
 import { findContestedTriangles } from "../../bindings/viewer/src/depth-planes.js";
 
 let kernel;
 let activeModelId;
-// Committed source snapshots around browser scripts, for undo and redo.
-const history = { undo: [], redo: [] };
-const HISTORY_LIMIT = 10;
-const HISTORY_BYTES = 256 << 20;
+// The editing session over the active model: every revision, undo and redo goes through it.
+let session = null;
 const GEOMETRY_SETTINGS = {
   includeSpaces: true,
   includeOpenings: true,
@@ -80,14 +79,15 @@ function convert({ jobId, buffer }) {
     // The model stays open for inspection and edits.
     if (previousModelId !== undefined) kernel.closeModel(previousModelId);
     activeModelId = modelId;
-    history.undo.length = 0;
-    history.redo.length = 0;
+    session?.close();
+    session = createEditingSession(kernel, modelId, { settings: GEOMETRY_SETTINGS });
     const message = {
       type: "result",
       jobId,
       modelId,
       revision: kernel.getModelRevision?.(modelId) ?? "0",
       info,
+      facts: modelFacts(),
       summary: outcome.summary,
       hierarchy,
       streamed: outcome.streamed,
@@ -205,146 +205,93 @@ function inspectEntity({ requestId, modelId, expressId }) {
 }
 
 function editEntity({ requestId, modelId, expressId, changes, patch }) {
-  if (typeof kernel.prepareAttributeEdits === "function") {
-    return updateRevision({ requestId, modelId, expressId, changes, patch, attributeEdit: true });
-  }
-  try {
-    ensureActive(modelId);
-    const info = JSON.parse(kernel.setAttributes(modelId, expressId, JSON.stringify(changes)));
-    self.postMessage({ type: "edit-result", requestId, modelId, expressId, info, changed: changes.length });
-    // Only the edited product is re-evaluated and redrawn.
-    if (patch && typeof kernel.evaluateProducts === "function") {
-      const started = performance.now();
-      const chunk = kernel.evaluateProducts(
-        modelId,
-        Uint32Array.from([expressId]),
-        JSON.stringify({
-          includeSpaces: true,
-          includeOpenings: true,
-          includeAnnotations: true,
-          includeReferences: true,
-          modelOffset: patch.modelOffset,
-          firstGeometryId: patch.firstGeometryId,
-        }),
-      );
-      if (chunk) {
-        self.postMessage(
-          { type: "product-geometry", requestId, modelId, expressId, buffer: chunk.buffer, elapsedMs: performance.now() - started },
-          [chunk.buffer],
-        );
-      }
-    }
-  } catch (error) {
-    self.postMessage({ type: "edit-error", requestId, expressId, message: readableError(error) });
-  }
+  const edits = (changes ?? []).map((change) => ({ ...change, expressId }));
+  publishRequest({ requestId, modelId, patch, expressId, changed: edits.length, attributeEdit: true, run: (s) => ({ delta: s.setAttributes(edits) }) });
 }
 
-function updateRevision({ requestId, modelId, expressId, changes, patch, buffer, attributeEdit = false, script = null, before = null }) {
-  const started = performance.now();
-  let committed = false;
-  let prepared = false;
-  let candidate;
-  try {
-    ensureActive(modelId);
-    if (!patch || typeof kernel.prepareRevision !== "function") {
-      throw new Error("Build the current geometry kernel to enable revision updates.");
-    }
-    const baseRevision = patch.baseRevision;
-    if (typeof baseRevision !== "string") throw new Error("The update needs its base revision.");
-    if (attributeEdit) {
-      const edits = changes.map((change) => ({ ...change, expressId }));
-      candidate = JSON.parse(kernel.prepareAttributeEdits(modelId, JSON.stringify(edits), baseRevision));
-    } else {
-      candidate = JSON.parse(kernel.prepareRevision(modelId, new Uint8Array(buffer), baseRevision));
-    }
-    prepared = true;
-    const preparedMs = performance.now() - started;
-    const geometryStarted = performance.now();
-    const chunk = kernel.evaluatePreparedRevision(modelId, candidate.candidateToken, JSON.stringify({
-      ...GEOMETRY_SETTINGS,
-      modelOffset: patch.modelOffset,
-      firstGeometryId: patch.firstGeometryId,
-    }));
-    const geometryMs = performance.now() - geometryStarted;
-    const impact = JSON.parse(kernel.getPreparedRevisionInfo(modelId));
-    const revision = kernel.commitRevision(modelId, baseRevision, candidate.candidateToken);
-    committed = true;
-    if (before) {
-      pushHistory(history.undo, before);
-      history.redo.length = 0;
-    }
-    const info = JSON.parse(kernel.getModelInfo(modelId));
-    const hierarchy = JSON.parse(kernel.getSpatialHierarchy(modelId) ?? '{"nodes":[]}');
-    // The selected element's attributes ride along so the inspector never shows a loading gap.
-    const infoId = expressId ?? patch.selectedExpressId ?? null;
-    const entityInfo = infoId == null ? null : JSON.parse(kernel.getEntityInfo(modelId, infoId) ?? "null");
-    const message = {
-      type: "revision-result", requestId, modelId, baseRevision, revision, impact, info, hierarchy,
-      expressId, entityInfo, infoId, changed: changes?.length ?? 0, attributeEdit, script, history: historyCounts(),
-      timings: { preparedMs, geometryMs, workerMs: performance.now() - started },
-    };
-    if (chunk) {
-      message.buffer = chunk.buffer;
-      self.postMessage(message, [chunk.buffer]);
-    } else self.postMessage(message);
-    return true;
-  } catch (error) {
-    if (prepared && !committed) kernel.discardRevision(modelId, candidate.candidateToken);
-    self.postMessage({ type: "revision-error", requestId, modelId, expressId, committed, script, history: historyCounts(),
-      revision: kernel.getModelRevision?.(modelId), message: readableError(error) });
-    return false;
-  }
+function updateRevision({ requestId, modelId, patch, buffer }) {
+  publishRequest({ requestId, modelId, patch, run: (s) => ({ delta: s.applySnapshot(new Uint8Array(buffer)) }) });
 }
 
 /** Run a browser script; its edits become one snapshot revision. */
 function runScript({ requestId, modelId, source, selection, patch, commit = true }) {
   const started = performance.now();
-  try {
-    ensureActive(modelId);
-    const engine = createScriptEngine(kernel, modelId);
-    const result = runModelScript(engine, String(source ?? ""), selection);
-    result.elapsedMs = performance.now() - started;
-    if (!result.ok || !result.changed || !commit) {
-      if (!commit) result.changed = false;
-      self.postMessage({ type: "script-result", requestId, modelId, result, history: historyCounts() });
-      return;
-    }
-    const before = kernel.exportModel(modelId);
-    const bytes = engine.snapshotBytes();
-    updateRevision({ requestId, modelId, patch, buffer: bytes.buffer, script: result, before });
-  } catch (error) {
-    self.postMessage({ type: "script-error", requestId, modelId, message: readableError(error), history: historyCounts() });
-  }
+  publishRequest({ requestId, modelId, patch, run: (s) => {
+    const { report, delta } = s.runScript(String(source ?? ""), selection, { commit });
+    report.elapsedMs = performance.now() - started;
+    return { delta, script: report };
+  } });
 }
 
-/** Undo or redo the last browser script by publishing the stored source as a new revision. */
+/** Undo or redo the last change by publishing the stored source as a new revision. */
 function scriptHistory({ requestId, modelId, action, patch }) {
-  try {
-    ensureActive(modelId);
-    const source = action === "redo" ? history.redo : history.undo;
-    const target = action === "redo" ? history.undo : history.redo;
-    if (!source.length) throw new Error(`Nothing to ${action}.`);
-    const bytes = source.pop();
-    // The counterpart entry goes in first so the result message reports the new counts.
-    pushHistory(target, kernel.exportModel(modelId));
-    const script = { ok: true, stdout: "", changed: true, operations: { created: 0, modified: 0, deleted: 0 }, label: action, elapsedMs: 0 };
-    if (!updateRevision({ requestId, modelId, patch, buffer: bytes.slice().buffer, script })) {
-      target.pop();
-      source.push(bytes);
-    }
-  } catch (error) {
-    self.postMessage({ type: "script-error", requestId, modelId, message: readableError(error), history: historyCounts() });
+  const started = performance.now();
+  const available = action === "redo" ? session?.history.redo : session?.history.undo;
+  if (!available) {
+    self.postMessage({ type: "script-error", requestId, modelId, message: `Nothing to ${action}.`, history: historyCounts() });
+    return;
   }
+  publishRequest({ requestId, modelId, patch, run: (s) => {
+    const delta = action === "redo" ? s.redo() : s.undo();
+    const script = { ok: true, stdout: "", changed: true, operations: { created: 0, modified: 0, deleted: 0 }, label: action, elapsedMs: performance.now() - started };
+    return { delta, script };
+  } });
 }
 
-function pushHistory(stack, bytes) {
-  stack.push(bytes);
-  let total = stack.reduce((sum, item) => sum + item.byteLength, 0);
-  while (stack.length > 1 && (stack.length > HISTORY_LIMIT || total > HISTORY_BYTES)) total -= stack.shift().byteLength;
+/**
+ * Publish one change through the session and report it. `run` returns the
+ * delta (null when a script changed nothing) and, for scripts, the report.
+ */
+function publishRequest({ requestId, modelId, patch, run, expressId = null, changed = 0, attributeEdit = false }) {
+  const started = performance.now();
+  let script = null;
+  try {
+    ensureActive(modelId);
+    if (!patch || typeof patch.baseRevision !== "string") throw new Error("The update needs its base revision.");
+    if (patch.baseRevision !== session.revision) {
+      throw new Error(`The update is based on revision ${patch.baseRevision}, but the model is at ${session.revision}.`);
+    }
+    // The main thread's assembler allocates geometry ids; the session works in its frame.
+    session.adopt({ modelOffset: patch.modelOffset, nextGeometryId: patch.firstGeometryId });
+    const outcome = run(session);
+    script = outcome.script ?? null;
+    if (!outcome.delta) {
+      self.postMessage({ type: "script-result", requestId, modelId, result: script, history: historyCounts() });
+      return true;
+    }
+    const delta = outcome.delta;
+    const infoStarted = performance.now();
+    const info = JSON.parse(kernel.getModelInfo(modelId));
+    // The selected element's attributes ride along so the inspector never shows a loading gap.
+    const infoId = expressId ?? patch.selectedExpressId ?? null;
+    const entityInfo = infoId == null ? null : JSON.parse(kernel.getEntityInfo(modelId, infoId) ?? "null");
+    const message = {
+      type: "revision-result", requestId, modelId, baseRevision: delta.baseRevision, revision: delta.revision, impact: delta.impact, info,
+      facts: modelFacts(), hierarchy: delta.hierarchy, expressId, entityInfo, infoId, changed, attributeEdit, script, history: historyCounts(),
+      timings: { ...delta.timings, preparedMs: delta.timings.prepareMs, infoMs: performance.now() - infoStarted, workerMs: performance.now() - started },
+      buffer: delta.chunk.buffer,
+    };
+    self.postMessage(message, [delta.chunk.buffer]);
+    return true;
+  } catch (error) {
+    self.postMessage({ type: "revision-error", requestId, modelId, expressId, committed: Boolean(error?.committed), script, history: historyCounts(),
+      revision: error?.revision ?? kernel.getModelRevision?.(modelId), message: readableError(error) });
+    return false;
+  }
 }
 
 function historyCounts() {
-  return { undo: history.undo.length, redo: history.redo.length };
+  return session?.history ?? { undo: 0, redo: 0 };
+}
+
+/** Storeys by class and the length unit, for the assistant's context; the hierarchy is empty until geometry exists. */
+function modelFacts() {
+  if (!session) return { storeys: [], lengthUnit: null };
+  try {
+    return { storeys: storeysOf(session), lengthUnit: lengthUnitOf(session) };
+  } catch {
+    return { storeys: [], lengthUnit: null };
+  }
 }
 
 function exportModel({ requestId, modelId }) {
@@ -363,10 +310,10 @@ function ensureActive(modelId) {
 }
 
 function closeActiveModel() {
+  session?.close();
+  session = null;
   if (activeModelId !== undefined) kernel.closeModel(activeModelId);
   activeModelId = undefined;
-  history.undo.length = 0;
-  history.redo.length = 0;
 }
 
 function postPhase(jobId, phase, detail, progress = null) {

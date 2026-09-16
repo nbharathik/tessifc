@@ -26,3 +26,21 @@ Streaming progress while the kernel works, the selected element's class and
 id, and one button per API call: fit, focus, top and 3D views, display style,
 hide, isolate, show all and a horizontal section. Click an element to select
 it; the orbit and zoom centre move to the point you clicked.
+
+## Following a session
+
+Start a session host instead of the static server, for example an MCP server
+with a new model:
+
+```sh
+npm ci --prefix bindings/mcp
+node bindings/mcp/src/cli.js house.ifc --new
+```
+
+Open <http://127.0.0.1:8000/examples/embed-viewer/?session=file>, or press
+**Follow the local session** on the page. The viewer opens the host's model
+(empty at first) and applies every revision the host publishes as a delta;
+the status line reports the kernel's affected-product count after each one.
+Edit through an MCP client, or run `node examples/agent-building/build-house.mjs
+house.ifc --serve` and watch the house grow. The Python session server
+(`python scripts/serve-edit-session.py model.ifc`) is followed the same way.

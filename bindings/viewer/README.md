@@ -33,8 +33,8 @@ CLI.
 
 | Call | What it does |
 |---|---|
-| `createViewer(container, options)` | Creates the canvas inside `container`. Options: `kernel`, `hiddenFlags`, `lodPixels`, `theme`, `background`, `selectOnClick`, `focusOnDoubleClick`, `coincidence` (`false` skips the worker that refines the coincident-surface overlay). |
-| `open(source, { settings, modelSettings })` | Parses the IFC with the kernel and streams its geometry. Resolves with `modelId`, `info`, `summary` and `hierarchy`, or `null` when a later `open`, `loadPack`, `close` or `dispose` superseded it. |
+| `createViewer(container, options)` | Creates the canvas inside `container`. Options: `kernel`, `hiddenFlags`, `lodPixels`, `theme`, `background`, `selectOnClick`, `focusOnDoubleClick`, `coincidence` (`false` skips the worker that refines the coincident-surface overlay), `requireGeometry` (`true` refuses a model without drawable geometry). |
+| `open(source, { settings, modelSettings })` | Parses the IFC with the kernel and streams its geometry. Resolves with `modelId`, `info`, `summary` and `hierarchy`, or `null` when a later `open`, `loadPack`, `close` or `dispose` superseded it. A model with no product geometry yet opens empty; the `load` event says `empty: true`. |
 | `loadPack(bytes)` | Shows an IGP pack directly, without a kernel. |
 | `close()` | Drops the model from the view and the kernel. |
 | `select(ids)`, `selection()` | Selects express ids (`null` clears); every part of a product is selected together. |
@@ -44,7 +44,10 @@ CLI.
 | `setSection({ axis, value or fraction, flipped, cap })`, `setSection(null)` | A cut along one axis, in IFC coordinates or as a fraction of the bounds. |
 | `pick(clientX, clientY)` | The product and surface point under a pointer. |
 | `setPivot(point)`, `zoom(factor)` | The orbit and zoom centre, and a programmatic zoom step. |
-| `on(event, listener)` | `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`; returns the unsubscribe function. |
+| `on(event, listener)` | `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`, `revision`, `session`; returns the unsubscribe function. |
+| `session()` | The `@tessifc/edit` editing session over the open model, adopted to the streamed scene: `runScript`, `setAttributes`, `applySnapshot`, `undo`, `redo`, `export`. |
+| `applyDelta(delta)` | Applies a session delta: retires the affected and removed products, adds their replacements (or rebuilds everything for a `full` delta), keeps selection and visibility by GlobalId, flashes the changed products and emits `revision`. |
+| `follow(baseUrl)`, `unfollow()` | Follows a local session host (`tessifc-mcp` or the Python session server) at `baseUrl` (`""` is the page's own origin): every published version is opened or applied as a delta; `session` events carry the host's status. `follow` returns the client, with `run`, `undo`, `redo` and `reportSelection`. |
 | `pack()`, `hierarchy()`, `modelId()`, `overlayState()`, `renderer` | The assembled pack, the kernel's spatial tree, the model id, whether the coincident-surface overlay has been refined (`pending`, `ready`, `exhausted` when the model was too large for the analysis budget and whole products stay in the overlay, `failed`, `off`) and the renderer itself for anything not covered above. |
 | `dispose()` | Releases the GPU resources and removes the canvas. |
 
@@ -61,14 +64,27 @@ fixed order so one always wins. Finding those triangles runs in a worker
 bundlers pick it up) after the model is on screen; until it answers, whole
 products near each other are redrawn instead.
 
+## Editing and following a session
+
+```js
+const session = viewer.session();
+const { delta } = session.runScript(`ifc.addWall({ from: [0, 0], to: [6, 0], height: 3, thickness: 0.3 })`);
+viewer.applyDelta(delta);                    // only the wall is tessellated and uploaded
+viewer.on("revision", ({ revision, affectedProducts }) => console.log(revision, affectedProducts.length));
+
+viewer.follow("");                           // a tessifc-mcp or Python session serving this page
+```
+
 `@tessifc/viewer/renderer` exports the `IfcRenderer` class for hosts that want
 to drive the renderer directly, `@tessifc/viewer/stream` the pack assembler
-that applies incremental deltas from `@tessifc/edit`, and
-`@tessifc/viewer/depth-planes` the plane analysis on its own.
+that applies incremental deltas from `@tessifc/edit`,
+`@tessifc/viewer/session-client` the client of a local session host on its
+own, and `@tessifc/viewer/depth-planes` the plane analysis on its own.
 
 ## Example
 
 `examples/embed-viewer/index.html` is a complete page that uses the package
 through an import map; serve the checkout and open
-`/examples/embed-viewer/`. `bindings/viewer/test/embed.test.mjs` drives the
-same page in a browser.
+`/examples/embed-viewer/`. Its "Follow the local session" button (or
+`?session=file`) shows a `tessifc-mcp` or Python session at work.
+`bindings/viewer/test/embed.test.mjs` drives the same page in a browser.

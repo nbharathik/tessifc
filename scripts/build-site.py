@@ -45,8 +45,8 @@ PAGES = [
     ("architecture.md", "Architecture", "How a file becomes triangles, crate by crate, with diagrams."),
     ("igp-format.md", "IGP format", "The mesh container the kernel writes and how to read it."),
     ("coverage.md", "IFC coverage", "Which classes and representations are supported today."),
-    ("editing.md", "Editing", "Changing attributes without rewriting the rest of the file."),
-    ("agents.md", "Agents and pipelines", "Scripts, sessions, deltas and the tools an agent needs."),
+    ("editing.md", "Editing", "Attribute edits, revisions, scripts and the assistant in the viewer."),
+    ("agents.md", "Agents and pipelines", "MCP servers, the Node and Python loops, deltas and verification."),
 ]
 
 SITE_MARKER = ".tessifc-site"

@@ -47,14 +47,66 @@ pub struct ImpactReason {
 /// Caller settings and parse policy must agree; changing them requires a full evaluation.
 /// Renumbered product identities and exhausted graph budgets conservatively rebuild the scene.
 pub fn compare_revisions(old: &Model, new: &Model) -> ChangeImpact {
-    compare_with_limits(old, new, MAX_DEPENDENCY_EDGES, MAX_DEPENDENCY_VISITS)
+    compare_with_limits(old, new, None, MAX_DEPENDENCY_EDGES, MAX_DEPENDENCY_VISITS)
+}
+
+/// [`compare_revisions`] with the two source files: a record whose bytes are
+/// identical in both is unchanged without decoding it.
+pub fn compare_revisions_with_sources(
+    old: &Model,
+    old_source: &[u8],
+    new: &Model,
+    new_source: &[u8],
+) -> ChangeImpact {
+    compare_with_limits(
+        old,
+        new,
+        Some((old_source, new_source)),
+        MAX_DEPENDENCY_EDGES,
+        MAX_DEPENDENCY_VISITS,
+    )
 }
 
 fn compare_with_limits(
     old: &Model,
     new: &Model,
+    sources: Option<(&[u8], &[u8])>,
     edge_limit: usize,
     visit_limit: usize,
+) -> ChangeImpact {
+    compare_with_graph(old, new, sources, edge_limit, visit_limit, false)
+}
+
+/// The record's bytes in both files, when both sources are known and the spans are sound.
+fn same_source_bytes(
+    sources: Option<(&[u8], &[u8])>,
+    before: &tessifc_step::image::IndexEntry,
+    after: &tessifc_step::image::IndexEntry,
+) -> bool {
+    let Some((old_source, new_source)) = sources else {
+        return false;
+    };
+    if before.source_len != after.source_len || before.class_id != after.class_id {
+        return false;
+    }
+    fn span<'a>(source: &'a [u8], entry: &tessifc_step::image::IndexEntry) -> Option<&'a [u8]> {
+        let start = entry.source_off as usize;
+        let end = start.checked_add(entry.source_len as usize)?;
+        source.get(start..end)
+    }
+    match (span(old_source, before), span(new_source, after)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn compare_with_graph(
+    old: &Model,
+    new: &Model,
+    sources: Option<(&[u8], &[u8])>,
+    edge_limit: usize,
+    visit_limit: usize,
+    whole_old_graph: bool,
 ) -> ChangeImpact {
     let mut impact = ChangeImpact::default();
     let mut geometry_seeds = BTreeSet::new();
@@ -66,7 +118,11 @@ fn compare_with_limits(
         let new_id = after.peek().map(|entry| entry.express_id);
         match (old_id, new_id) {
             (Some(a), Some(b)) if a == b => {
-                if let Some(metadata_only) = record_change(old, new, a) {
+                let unchanged = match (before.peek(), after.peek()) {
+                    (Some(x), Some(y)) => same_source_bytes(sources, x, y),
+                    _ => false,
+                };
+                if !unchanged && let Some(metadata_only) = record_change(old, new, a) {
                     impact.modified_entities.push(a);
                     all_seeds.insert(a);
                     if !metadata_only {
@@ -121,13 +177,28 @@ fn compare_with_limits(
             "schema interpretation changed",
         );
     }
-    if product_identity_changed(old, new) {
+    if product_identity_changed(old, new, &impact) {
         impact.removed_products = old_products.into_iter().collect();
         return full_impact(impact, &new_products, origin, "product identity changed");
     }
 
+    // An unchanged entity references the same entities in both snapshots, so the
+    // candidate graph already holds its edges; only the old versions of changed
+    // and deleted entities add what the candidate no longer says.
+    let mut kinds = Kinds::default();
     let mut graph = Dependencies::default();
-    if !graph.add_model(old, edge_limit) || !graph.add_model(new, edge_limit) {
+    let old_changed: Vec<u32> = impact
+        .deleted_entities
+        .iter()
+        .chain(&impact.modified_entities)
+        .copied()
+        .collect();
+    let old_added = if whole_old_graph {
+        graph.add_model(old, &mut kinds, edge_limit)
+    } else {
+        graph.add_entities(old, &old_changed, &mut kinds, edge_limit)
+    };
+    if !graph.add_model(new, &mut kinds, edge_limit) || !old_added {
         return full_impact(
             impact,
             &new_products,
@@ -203,34 +274,52 @@ fn full_impact(
     impact
 }
 
-fn product_identity_changed(old: &Model, new: &Model) -> bool {
-    let mut old_guids = BTreeMap::new();
-    let mut new_guids = BTreeMap::new();
-    for (model, ids) in [(old, &mut old_guids), (new, &mut new_guids)] {
-        for product in model.entities_of_type("IfcProduct") {
-            if let Some(guid) = product
-                .attr("GlobalId")
-                .as_string()
-                .filter(|g| !g.is_empty())
-                && ids.insert(guid, product.id()).is_some()
-            {
-                return true;
-            }
+/// An identity event is a product whose GlobalId changed in place, or a GlobalId that left
+/// one Express ID and appeared at another. GlobalIds duplicated alike in both snapshots are
+/// not events, so files that already carry duplicates still update selectively.
+fn product_identity_changed(old: &Model, new: &Model, impact: &ChangeImpact) -> bool {
+    fn product(model: &Model, id: u32) -> Option<Entity<'_>> {
+        model.entity(id).filter(|e| e.is_a("IfcProduct"))
+    }
+    fn guid(entity: Entity<'_>) -> Option<String> {
+        entity
+            .attr("GlobalId")
+            .as_string()
+            .filter(|g| !g.is_empty())
+    }
+    let mut lost = BTreeSet::new();
+    let mut gained = BTreeSet::new();
+    for &id in &impact.deleted_entities {
+        if let Some(g) = product(old, id).and_then(guid) {
+            lost.insert(g);
         }
     }
-    if old_guids
-        .iter()
-        .any(|(guid, id)| new_guids.get(guid).is_some_and(|new_id| id != new_id))
-    {
-        return true;
+    for &id in &impact.created_entities {
+        if let Some(g) = product(new, id).and_then(guid) {
+            gained.insert(g);
+        }
     }
-    old.entities_of_type("IfcProduct").any(|product| {
-        new.entity(product.id())
-            .filter(|entity| entity.is_a("IfcProduct"))
-            .is_some_and(|next| {
-                product.attr("GlobalId").as_string() != next.attr("GlobalId").as_string()
-            })
-    })
+    for &id in &impact.modified_entities {
+        match (product(old, id), product(new, id)) {
+            (Some(before), Some(after)) => {
+                if guid(before) != guid(after) {
+                    return true;
+                }
+            }
+            (Some(before), None) => {
+                if let Some(g) = guid(before) {
+                    lost.insert(g);
+                }
+            }
+            (None, Some(after)) => {
+                if let Some(g) = guid(after) {
+                    gained.insert(g);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    lost.iter().any(|g| gained.contains(g))
 }
 
 fn metadata_entity(entity: Entity<'_>) -> bool {
@@ -250,11 +339,14 @@ fn metadata_entity(entity: Entity<'_>) -> bool {
 }
 
 fn metadata_attribute(entity: Entity<'_>, name: Option<&str>) -> bool {
-    entity.is_a("IfcRoot")
-        && matches!(
-            name,
-            Some("Name" | "Description" | "OwnerHistory" | "ObjectType" | "Tag")
-        )
+    entity.is_a("IfcRoot") && metadata_attribute_name(name)
+}
+
+fn metadata_attribute_name(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("Name" | "Description" | "OwnerHistory" | "ObjectType" | "Tag")
+    )
 }
 
 fn global_entity(entity: Entity<'_>) -> bool {
@@ -351,103 +443,248 @@ fn integer_equals_real(integer: i64, real: f64) -> bool {
         && real as i64 == integer
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    None,
+    Voids,
+    Material,
+    Type,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inverse {
+    None,
+    StyledItem,
+    ColourMap,
+    MaterialRepresentation,
+    Grid,
+}
+
+/// What the graph needs to know about an entity's class.
+#[derive(Clone, Copy)]
+struct ClassKind {
+    global: bool,
+    metadata: bool,
+    relationship: bool,
+    root: bool,
+    relation: Relation,
+    inverse: Inverse,
+}
+
+impl ClassKind {
+    fn of(entity: Entity<'_>) -> Self {
+        let relation = if entity.is_a("IfcRelVoidsElement") {
+            Relation::Voids
+        } else if entity.is_a("IfcRelAssociatesMaterial") {
+            Relation::Material
+        } else if entity.is_a("IfcRelDefinesByType") {
+            Relation::Type
+        } else {
+            Relation::None
+        };
+        let inverse = if entity.is_a("IfcStyledItem") {
+            Inverse::StyledItem
+        } else if entity.is_a("IfcIndexedColourMap") {
+            Inverse::ColourMap
+        } else if entity.is_a("IfcMaterialDefinitionRepresentation") {
+            Inverse::MaterialRepresentation
+        } else if entity.is_a("IfcGrid") {
+            Inverse::Grid
+        } else {
+            Inverse::None
+        };
+        ClassKind {
+            global: global_entity(entity),
+            metadata: metadata_entity(entity),
+            relationship: entity.is_a("IfcRelationship"),
+            root: entity.is_a("IfcRoot"),
+            relation,
+            inverse,
+        }
+    }
+}
+
+/// Class facts resolved once per class id rather than by name for every reference.
+/// Both snapshots share one schema, so one cache serves both.
+#[derive(Default)]
+struct Kinds {
+    cache: Vec<Option<ClassKind>>,
+}
+
+impl Kinds {
+    fn of(&mut self, entity: Entity<'_>) -> ClassKind {
+        if entity.is_complex() {
+            return ClassKind::of(entity);
+        }
+        let index = usize::from(entity.class());
+        if index >= self.cache.len() {
+            self.cache.resize(index + 1, None);
+        }
+        match self.cache[index] {
+            Some(kind) => kind,
+            None => {
+                let kind = ClassKind::of(entity);
+                self.cache[index] = Some(kind);
+                kind
+            }
+        }
+    }
+}
+
+/// Directed edges `from -> to` packed as one integer each, sorted once by `finish`.
+#[derive(Default)]
+struct EdgeList {
+    edges: Vec<u64>,
+}
+
+impl EdgeList {
+    fn push(&mut self, from: u32, to: u32) {
+        self.edges.push((u64::from(from) << 32) | u64::from(to));
+    }
+
+    fn finish(&mut self) {
+        self.edges.sort_unstable();
+        self.edges.dedup();
+    }
+
+    /// The entities `from` points at, after `finish`.
+    fn users(&self, from: u32) -> impl Iterator<Item = u32> + '_ {
+        let start = self
+            .edges
+            .partition_point(|&edge| edge >> 32 < u64::from(from));
+        self.edges[start..]
+            .iter()
+            .take_while(move |&&edge| edge >> 32 == u64::from(from))
+            .map(|&edge| edge as u32)
+    }
+}
+
 #[derive(Default)]
 struct Dependencies {
-    geometry: BTreeMap<u32, Vec<u32>>,
-    metadata: BTreeMap<u32, Vec<u32>>,
+    geometry: EdgeList,
+    metadata: EdgeList,
     global: BTreeSet<u32>,
     edges: usize,
 }
 
 impl Dependencies {
-    fn add_model(&mut self, model: &Model, limit: usize) -> bool {
+    fn add_model(&mut self, model: &Model, kinds: &mut Kinds, limit: usize) -> bool {
         for entry in &model.image().index {
-            let entity = model.entity_ref(entry.express_id);
-            if global_entity(entity) {
-                self.global.insert(entity.id());
-            }
-            let mut arguments = model.image().args_of(entry);
-            let mut index = 0;
-            while !arguments.is_empty() {
-                let mut cursor = arguments;
-                if !arguments.skip_value() {
-                    return false;
-                }
-                let name = if entity.is_complex() {
-                    None
-                } else {
-                    model.schema().attr_name(entity.class(), index)
-                };
-                while cursor.pos() < arguments.pos() {
-                    if let Some(RawValue::Ref(target)) = cursor.read() {
-                        self.reference(entity, name, target);
-                        if self.edges > limit {
-                            return false;
-                        }
-                    }
-                }
-                index += 1;
+            if !self.add_entry(model, entry, kinds, limit) {
+                return false;
             }
         }
         true
     }
 
-    fn reference(&mut self, entity: Entity<'_>, name: Option<&str>, target: u32) {
-        let id = entity.id();
-        self.metadata.entry(target).or_default().push(id);
+    fn add_entities(
+        &mut self,
+        model: &Model,
+        ids: &[u32],
+        kinds: &mut Kinds,
+        limit: usize,
+    ) -> bool {
+        for &id in ids {
+            if let Some(entry) = model.image().entry(id)
+                && !self.add_entry(model, entry, kinds, limit)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn add_entry(
+        &mut self,
+        model: &Model,
+        entry: &tessifc_step::image::IndexEntry,
+        kinds: &mut Kinds,
+        limit: usize,
+    ) -> bool {
+        let entity = model.entity_ref(entry.express_id);
+        let kind = kinds.of(entity);
+        if kind.global {
+            self.global.insert(entity.id());
+        }
+        let complex = entity.is_complex();
+        let class = entity.class();
+        let mut arguments = model.image().args_of(entry);
+        let mut index = 0;
+        while !arguments.is_empty() {
+            let mut cursor = arguments;
+            if !arguments.skip_value() {
+                return false;
+            }
+            let name = if complex {
+                None
+            } else {
+                model.schema().attr_name(class, index)
+            };
+            while cursor.pos() < arguments.pos() {
+                if let Some(RawValue::Ref(target)) = cursor.read() {
+                    self.reference(kind, entity.id(), name, target);
+                    if self.edges > limit {
+                        return false;
+                    }
+                }
+            }
+            index += 1;
+        }
+        true
+    }
+
+    fn reference(&mut self, kind: ClassKind, id: u32, name: Option<&str>, target: u32) {
+        self.metadata.push(target, id);
         self.edges += 1;
-        if entity.is_a("IfcRelationship") {
+        if kind.relationship {
             if !matches!(name, Some("OwnerHistory")) {
-                self.metadata.entry(id).or_default().push(target);
+                self.metadata.push(id, target);
                 self.edges += 1;
             }
-            let (input, output) = if entity.is_a("IfcRelVoidsElement") {
-                (
+            let (input, output) = match kind.relation {
+                Relation::Voids => (
                     Some("RelatedOpeningElement"),
                     Some("RelatingBuildingElement"),
-                )
-            } else if entity.is_a("IfcRelAssociatesMaterial") {
-                (Some("RelatingMaterial"), Some("RelatedObjects"))
-            } else if entity.is_a("IfcRelDefinesByType") {
-                (Some("RelatingType"), Some("RelatedObjects"))
-            } else {
-                return;
+                ),
+                Relation::Material => (Some("RelatingMaterial"), Some("RelatedObjects")),
+                Relation::Type => (Some("RelatingType"), Some("RelatedObjects")),
+                Relation::None => return,
             };
             if name == input {
-                self.geometry.entry(target).or_default().push(id);
+                self.geometry.push(target, id);
                 self.edges += 1;
             } else if name == output {
-                self.geometry.entry(id).or_default().push(target);
+                self.geometry.push(id, target);
                 self.edges += 1;
             }
             return;
         }
-        if metadata_entity(entity) || metadata_attribute(entity, name) {
+        if kind.metadata || (kind.root && metadata_attribute_name(name)) {
             return;
         }
-        self.geometry.entry(target).or_default().push(id);
+        self.geometry.push(target, id);
         self.edges += 1;
-        let inverse = (entity.is_a("IfcStyledItem") && name == Some("Item"))
-            || (entity.is_a("IfcIndexedColourMap") && name == Some("MappedTo"))
-            || (entity.is_a("IfcMaterialDefinitionRepresentation")
-                && name == Some("RepresentedMaterial"))
-            || (entity.is_a("IfcGrid") && matches!(name, Some("UAxes" | "VAxes" | "WAxes")));
+        let inverse = match kind.inverse {
+            Inverse::StyledItem => name == Some("Item"),
+            Inverse::ColourMap => name == Some("MappedTo"),
+            Inverse::MaterialRepresentation => name == Some("RepresentedMaterial"),
+            Inverse::Grid => matches!(name, Some("UAxes" | "VAxes" | "WAxes")),
+            Inverse::None => false,
+        };
         if inverse {
-            self.geometry.entry(id).or_default().push(target);
+            self.geometry.push(id, target);
             self.edges += 1;
         }
     }
 
     fn finish(&mut self) {
-        for users in self.geometry.values_mut().chain(self.metadata.values_mut()) {
-            users.sort_unstable();
-            users.dedup();
-        }
+        self.geometry.finish();
+        self.metadata.finish();
     }
 }
 
 fn affected(
-    graph: &BTreeMap<u32, Vec<u32>>,
+    graph: &EdgeList,
     seeds: &BTreeSet<u32>,
     products: &BTreeSet<u32>,
     globals: &BTreeSet<u32>,
@@ -476,14 +713,12 @@ fn affected(
                 continue;
             }
         }
-        if let Some(users) = graph.get(&id) {
-            for &user in users {
-                if visited.insert(user) {
-                    if visited.len() > limit {
-                        return Err((origin, "dependency traversal budget exceeded"));
-                    }
-                    queue.push_back((user, origin));
+        for user in graph.users(id) {
+            if visited.insert(user) {
+                if visited.len() > limit {
+                    return Err((origin, "dependency traversal budget exceeded"));
                 }
+                queue.push_back((user, origin));
             }
         }
     }
@@ -496,11 +731,15 @@ mod tests {
     use crate::Engine;
     use tessifc_step::{ParseOptions, parse};
 
-    fn model(records: &str) -> Model {
-        let source = format!(
+    fn source(records: &str) -> Vec<u8> {
+        format!(
             "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{records}\nENDSEC;\nEND-ISO-10303-21;"
-        );
-        Model::new(parse(source.as_bytes(), &ParseOptions::default()))
+        )
+        .into_bytes()
+    }
+
+    fn model(records: &str) -> Model {
+        Model::new(parse(&source(records), &ParseOptions::default()))
     }
 
     const WALLS: &str = "
@@ -639,6 +878,112 @@ mod tests {
         assert_eq!(impact.removed_products, [10, 11, 12]);
     }
 
+    const DUPLICATED: &str = "
+        #1=IFCCARTESIANPOINT((0.,0.,0.));
+        #2=IFCAXIS2PLACEMENT3D(#1,$,$);
+        #3=IFCDIRECTION((0.,0.,1.));
+        #4=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,4.,0.3);
+        #5=IFCEXTRUDEDAREASOLID(#4,#2,#3,3.);
+        #6=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#5));
+        #7=IFCPRODUCTDEFINITIONSHAPE($,$,(#6));
+        #8=IFCLOCALPLACEMENT($,#2);
+        #10=IFCWALL('wall-a',$,'A',$,$,#8,#7,$,$);
+        #11=IFCWALL('wall-a',$,'B',$,$,#8,#7,$,$);
+        #12=IFCWALL('independent',$,'C',$,$,$,$,$,$);
+    ";
+
+    #[test]
+    fn duplicated_guids_kept_in_place_update_selectively() {
+        let old = model(DUPLICATED);
+        let renamed = compare_revisions(&old, &model(&DUPLICATED.replace("'A'", "'Renamed'")));
+        assert!(!renamed.full_rebuild);
+        assert!(renamed.affected_products.is_empty());
+        assert_eq!(renamed.metadata_products, [10]);
+
+        let resized = compare_revisions(&old, &model(&DUPLICATED.replace("4.,0.3", "5.,0.3")));
+        assert!(!resized.full_rebuild);
+        assert_eq!(resized.affected_products, [10, 11]);
+
+        let deleted = compare_revisions(
+            &old,
+            &model(&DUPLICATED.replace("#11=IFCWALL('wall-a',$,'B',$,$,#8,#7,$,$);", "")),
+        );
+        assert!(!deleted.full_rebuild);
+        assert_eq!(deleted.removed_products, [11]);
+        assert!(deleted.affected_products.is_empty());
+
+        let created = compare_revisions(
+            &old,
+            &model(&format!(
+                "{DUPLICATED}\n#13=IFCWALL('wall-a',$,'D',$,$,#8,#7,$,$);"
+            )),
+        );
+        assert!(!created.full_rebuild);
+        assert_eq!(created.affected_products, [13]);
+    }
+
+    #[test]
+    fn a_changed_or_swapped_guid_is_an_identity_event() {
+        let old = model(WALLS);
+        let changed = compare_revisions(&old, &model(&WALLS.replace("'wall-a'", "'other'")));
+        assert!(changed.full_rebuild);
+        assert_eq!(changed.removed_products, [10, 11, 12]);
+
+        let swapped = model(
+            &WALLS
+                .replace("#10=IFCWALL('wall-a'", "#10=IFCWALL('wall-b'")
+                .replace("#11=IFCWALL('wall-b'", "#11=IFCWALL('wall-a'"),
+        );
+        assert!(compare_revisions(&old, &swapped).full_rebuild);
+    }
+
+    #[test]
+    fn the_changed_entity_graph_matches_the_whole_old_graph() {
+        let pairs: Vec<(String, String)> = vec![
+            (WALLS.into(), WALLS.replace("4.,0.3", "5.,0.3")),
+            (WALLS.into(), WALLS.replace("'A'", "'Renamed'")),
+            (WALLS.into(), format!("{WALLS}{}", opening(10))),
+            (format!("{WALLS}{}", opening(10)), WALLS.into()),
+            (
+                format!("{WALLS}{}", opening(10)),
+                format!("{WALLS}{}", opening(11)),
+            ),
+            (
+                WALLS.into(),
+                WALLS.replace(
+                    "#12=IFCWALL('independent',$,'C',$,$,$,$,$,$);",
+                    "#13=IFCWALL('new',$,'D',$,$,#8,#7,$,$);",
+                ),
+            ),
+            (
+                WALLS.replace("#5=IFCEXTRUDEDAREASOLID(#4,#2,#3,3.);", ""),
+                WALLS.into(),
+            ),
+            (DUPLICATED.into(), DUPLICATED.replace("4.,0.3", "5.,0.3")),
+        ];
+        for (before, after) in pairs {
+            let (old, new) = (model(&before), model(&after));
+            let sources = (source(&before), source(&after));
+            let reduced = compare_with_graph(
+                &old,
+                &new,
+                Some((&sources.0, &sources.1)),
+                MAX_DEPENDENCY_EDGES,
+                MAX_DEPENDENCY_VISITS,
+                false,
+            );
+            let whole = compare_with_graph(
+                &old,
+                &new,
+                None,
+                MAX_DEPENDENCY_EDGES,
+                MAX_DEPENDENCY_VISITS,
+                true,
+            );
+            assert_eq!(reduced, whole, "{before} -> {after}");
+        }
+    }
+
     #[test]
     fn cycles_terminate_and_budget_exhaustion_falls_back() {
         let old = model(&format!(
@@ -650,8 +995,8 @@ mod tests {
         let impact = compare_revisions(&old, &new);
         assert!(impact.affected_products.is_empty());
         assert!(!impact.full_rebuild);
-        assert!(compare_with_limits(&old, &new, 1, 10).full_rebuild);
-        assert!(compare_with_limits(&old, &new, MAX_DEPENDENCY_EDGES, 1).full_rebuild);
+        assert!(compare_with_limits(&old, &new, None, 1, 10).full_rebuild);
+        assert!(compare_with_limits(&old, &new, None, MAX_DEPENDENCY_EDGES, 1).full_rebuild);
     }
 
     #[test]

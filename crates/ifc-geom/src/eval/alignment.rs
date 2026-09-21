@@ -1857,7 +1857,7 @@ pub fn register(registry: &mut Registry) {
     registry.register_curve(Box::new(SpiralOrPolynomial));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "schema-ifc4x3"))]
 mod tests {
     use super::*;
     use crate::context::{DiagnosticSink, Settings, Tolerances};

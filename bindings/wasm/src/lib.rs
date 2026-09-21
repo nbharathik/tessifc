@@ -599,6 +599,7 @@ mod tests {
     use super::*;
     use tessifc_engine::pack::instance_flags;
     use tessifc_pack::{INSTANCE_OPENING, INSTANCE_SPACE, INSTANCE_TRANSPARENT};
+    #[cfg(feature = "edit")]
     use tessifc_step::SchemaId;
 
     const TINY: &[u8] = b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\

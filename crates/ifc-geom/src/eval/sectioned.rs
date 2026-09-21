@@ -426,7 +426,7 @@ pub fn register(registry: &mut Registry) {
     registry.register_solid(Box::new(SectionedSurface));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "schema-ifc4x3"))]
 mod tests {
     use super::*;
     use crate::eval::tests::{eval_solid, eval_solid_with_diagnostics, model_of_schema};

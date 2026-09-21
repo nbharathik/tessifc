@@ -1245,8 +1245,11 @@ pub fn register(registry: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::tests::{eval_profile, model_of, model_of_schema};
+    #[cfg(feature = "schema-ifc4x3")]
+    use crate::eval::tests::model_of_schema;
+    use crate::eval::tests::{eval_profile, model_of};
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn an_open_cross_profile_with_horizontal_widths_rises_by_the_slope() {
         let model = model_of_schema(
@@ -1262,6 +1265,7 @@ mod tests {
         assert!((profile.outer[2] - DVec2::new(4.0, 0.0)).length() < 1e-12);
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn an_open_cross_profile_measured_along_its_slopes_starts_at_its_offset_point() {
         let model = model_of_schema(
@@ -1282,6 +1286,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn an_open_cross_profile_takes_its_slopes_in_the_file_unit() {
         let model = model_of_schema(
@@ -1305,6 +1310,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn an_open_cross_profile_with_mismatched_lists_or_a_vertical_horizontal_width_is_refused() {
         let model = model_of_schema(

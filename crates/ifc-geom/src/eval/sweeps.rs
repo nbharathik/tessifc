@@ -1365,6 +1365,7 @@ mod tests {
         assert!((mesh.signed_volume().abs() - 0.36).abs() < 1e-9);
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_directrix_derived_sweep_on_a_plain_curve_is_a_fixed_reference_sweep() {
         let model = crate::eval::tests::model_of_schema(
@@ -1385,6 +1386,7 @@ mod tests {
 
     /// A straight ten metre base with cant rising from nothing to `angle` at its
     /// end, as `#1..#15`; `#15` is the segmented reference curve.
+    #[cfg(feature = "schema-ifc4x3")]
     fn canted_directrix(angle: f64) -> String {
         let (sin, cos) = angle.sin_cos();
         [
@@ -1411,6 +1413,7 @@ mod tests {
     }
 
     /// The largest z among the vertices near `x`.
+    #[cfg(feature = "schema-ifc4x3")]
     fn top_at(mesh: &Mesh64, x: f64) -> f64 {
         mesh.positions
             .iter()
@@ -1419,6 +1422,7 @@ mod tests {
             .fold(f64::NEG_INFINITY, f64::max)
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_directrix_derived_sweep_turns_its_reference_with_the_cant() {
         let angle: f64 = 0.2;
@@ -1444,6 +1448,7 @@ mod tests {
         assert!((fixed.signed_volume().abs() - 0.8).abs() < 1e-9);
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_disk_along_a_gradient_curve_is_trimmed_by_distance_along() {
         // A ten metre straight base with a gradient of a half; the disk runs

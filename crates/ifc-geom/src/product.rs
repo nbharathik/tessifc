@@ -1750,6 +1750,7 @@ mod tests {
 
     /// A wall on an IFC4X3 linear placement three units along a straight
     /// alignment, itself placed ten units along x.
+    #[cfg(feature = "schema-ifc4x3")]
     fn linear_placement_model(cartesian_position: &str) -> tessifc_model::Model {
         crate::eval::tests::model_of_schema(
             "IFC4X3_ADD2",
@@ -1788,6 +1789,7 @@ mod tests {
         (world, sink.take())
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_linear_placement_with_cartesian_position_uses_it() {
         let model = linear_placement_model("#11");
@@ -1800,6 +1802,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_linear_placement_without_cartesian_position_is_resolved_along_its_curve() {
         let model = linear_placement_model("$");
@@ -1812,6 +1815,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_cached_position_that_disagrees_with_the_curve_is_reported() {
         // The cached position says one along; the curve says three, and wins.
@@ -1842,6 +1846,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_linear_placement_on_an_unreadable_curve_warns_and_uses_its_cache() {
         // No basis curve at all: the cached position is the only answer.

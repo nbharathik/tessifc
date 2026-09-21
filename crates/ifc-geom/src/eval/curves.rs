@@ -1555,7 +1555,9 @@ mod tests {
         );
     }
     use super::*;
-    use crate::eval::tests::{eval_curve, model_of, model_of_schema};
+    #[cfg(feature = "schema-ifc4x3")]
+    use crate::eval::tests::model_of_schema;
+    use crate::eval::tests::{eval_curve, model_of};
 
     #[test]
     fn a_polyline_reads_its_points() {
@@ -1950,6 +1952,7 @@ mod tests {
     }
 
     /// One straight IFC4X3 alignment segment, ten units along x.
+    #[cfg(feature = "schema-ifc4x3")]
     const CURVE_SEGMENT_4X3: &str = concat!(
         "#1=IFCCARTESIANPOINT((0.,0.));\n",
         "#2=IFCDIRECTION((1.,0.));\n",
@@ -1959,6 +1962,7 @@ mod tests {
         "#6=IFCCURVESEGMENT(.CONTINUOUS.,#3,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#5);\n",
     );
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_4x3_curve_segment_composite_is_stationed_along_its_segments() {
         let model = model_of_schema(
@@ -1975,6 +1979,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "schema-ifc4x3")]
     #[test]
     fn a_gradient_curve_over_a_straight_base_is_drawn_in_space() {
         // The same straight segment as the vertical profile: ten along, ten up.

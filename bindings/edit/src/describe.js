@@ -6,7 +6,13 @@
 
 const LIMITS = { classes: 40, storeys: 20, fields: 40 };
 
-/** The length unit of a session's model, read from its unit assignment. */
+/** @typedef {import("./session.js").Session} Session */
+
+/**
+ * The length unit of a session's model, read from its unit assignment.
+ * @param {Session} session
+ * @returns {string | null}
+ */
 export function lengthUnitOf(session) {
   const named = (id) => session.entity(id)?.fields ?? [];
   const field = (fields, name) => fields.find((item) => item.name === name)?.value ?? null;
@@ -25,7 +31,11 @@ export function lengthUnitOf(session) {
   return "unknown";
 }
 
-/** The storeys of a session's model by class, lowest first; the hierarchy is empty until geometry exists. */
+/**
+ * The storeys of a session's model by class, lowest first; the hierarchy is empty until geometry exists.
+ * @param {Session} session
+ * @returns {Array<{ expressId: number, name: string | null, elevation: number | null }>}
+ */
 export function storeysOf(session) {
   return session.idsOfType("IfcBuildingStorey").map((id) => {
     const fields = session.entity(id)?.fields ?? [];
@@ -34,7 +44,11 @@ export function storeysOf(session) {
   }).sort((a, b) => (a.elevation ?? Number.POSITIVE_INFINITY) - (b.elevation ?? Number.POSITIVE_INFINITY));
 }
 
-/** The selected entity of a session as `{ expressId, className, fields }`, or null. */
+/**
+ * The selected entity of a session as `{ expressId, className, fields }`, or null.
+ * @param {Session} session
+ * @param {import("./types.js").Selection | null} selection
+ */
 export function describeSelection(session, selection) {
   const id = Number(selection?.ids?.[0]);
   if (!Number.isInteger(id)) return null;
@@ -68,7 +82,11 @@ export function describeModelInfo({ name = "model.ifc", schema = null, revision 
   return lines.join("\n");
 }
 
-/** The context of an editing session: its model, revision, storeys and the given selection. */
+/**
+ * The context of an editing session: its model, revision, storeys and the given selection.
+ * @param {Session} session
+ * @param {{ selection?: import("./types.js").Selection | null, limits?: Record<string, number> }} [options]
+ */
 export function describeModel(session, { selection = null, limits = {} } = {}) {
   const info = session.info();
   return describeModelInfo({

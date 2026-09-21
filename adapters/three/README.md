@@ -87,6 +87,19 @@ Meshes carry `userData.expressId`, `class` and `flags`; helper geometry
 (openings, spaces, references) starts invisible. This scene favours
 correctness over draw-call count; `loadModel` stays the merged static path.
 
+A pack evaluated with the `textures` setting carries materials, textures and
+texture coordinates. `createRetainedModel(THREE, pack, { textures: true })`
+gives each instance with a material row a `MeshStandardMaterial` (diffuse
+colour, roughness from the style's roughness or shininess, metal and mirror
+reflectance as metal) with the texture as its colour map, and puts the pack's
+`uv` on the geometry. Pixel textures become `DataTexture`s, embedded images
+decode through `createImageBitmap`, and image paths load through
+`TextureLoader` only from the page's own origin or `textureBaseUrl` unless
+`allowRemoteTextures` is set; `onTexture(id)` fires when an image arrives so
+a host that renders on demand can draw again. `materialParameters(row,
+texture)` is the pure mapping for a host that builds its own materials.
+Without the option every mesh keeps its flat `MeshLambertMaterial`.
+
 Intersecting transparent surfaces still have normal object-sorting limits.
 The adapter does not repair unsupported IFC geometry. See the
 [coverage guide](https://github.com/nbharathik/tessifc/blob/main/docs/coverage.md).
@@ -95,6 +108,7 @@ The adapter does not repair unsupported IFC geometry. See the
 
 ```sh
 node adapters/three/test/build.test.mjs
+node adapters/three/test/retained.test.mjs
 ```
 
 Tests use first-party synthetic inputs. Build the Node WASM package to also

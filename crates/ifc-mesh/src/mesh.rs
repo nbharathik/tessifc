@@ -16,6 +16,8 @@ pub struct Mesh64 {
     pub indices: Vec<u32>,
     /// Whether the producer believes this is a closed solid; `None` when nobody checked.
     pub closed: Option<bool>,
+    /// Texture coordinates, one pair per vertex, or empty when the mesh has none.
+    pub uvs: Vec<[f32; 2]>,
 }
 
 impl Mesh64 {
@@ -30,7 +32,19 @@ impl Mesh64 {
             positions: Vec::with_capacity(vertices),
             indices: Vec::with_capacity(indices),
             closed: None,
+            uvs: Vec::new(),
         }
+    }
+
+    /// True when every vertex carries a texture coordinate.
+    pub fn has_uvs(&self) -> bool {
+        !self.positions.is_empty() && self.uvs.len() == self.positions.len()
+    }
+
+    /// Forget the texture coordinates, which an operation that makes new
+    /// vertices cannot carry.
+    pub fn drop_uvs(&mut self) {
+        self.uvs.clear();
     }
 
     /// Number of triangles.
@@ -57,8 +71,21 @@ impl Mesh64 {
     }
 
     /// Append another mesh, offsetting its indices.
+    ///
+    /// Texture coordinates survive when either side has them; the side without
+    /// gets `[0, 0]` for each of its vertices.
     pub fn append(&mut self, other: &Mesh64) {
         let offset = self.positions.len() as u32;
+        let mine = self.has_uvs() || self.positions.is_empty() && !self.uvs.is_empty();
+        if mine || other.has_uvs() {
+            self.uvs.resize(self.positions.len(), [0.0, 0.0]);
+            if other.has_uvs() {
+                self.uvs.extend_from_slice(&other.uvs);
+            } else {
+                self.uvs
+                    .extend(std::iter::repeat_n([0.0, 0.0], other.positions.len()));
+            }
+        }
         self.positions.extend_from_slice(&other.positions);
         self.indices
             .extend(other.indices.iter().map(|i| i + offset));
@@ -189,6 +216,11 @@ impl Mesh64 {
             for (index, &vertex) in [a, b, c].iter().enumerate() {
                 if remap[vertex as usize] == u32::MAX {
                     remap[vertex as usize] = mesh.push_vertex(self.positions[vertex as usize]);
+                    if let Some(uv) = self.uvs.get(vertex as usize)
+                        && self.has_uvs()
+                    {
+                        mesh.uvs.push(*uv);
+                    }
                 }
                 local[index] = remap[vertex as usize];
             }
@@ -283,8 +315,10 @@ impl Mesh64 {
 
     /// Remove vertices no triangle refers to, renumbering the rest.
     pub fn drop_unused_vertices(&mut self) {
+        let carry = self.has_uvs();
         let mut remap = vec![u32::MAX; self.positions.len()];
         let mut kept = Vec::new();
+        let mut kept_uvs = Vec::new();
         for index in &mut self.indices {
             let old = *index as usize;
             if old >= remap.len() {
@@ -293,10 +327,14 @@ impl Mesh64 {
             if remap[old] == u32::MAX {
                 remap[old] = kept.len() as u32;
                 kept.push(self.positions[old]);
+                if carry {
+                    kept_uvs.push(self.uvs[old]);
+                }
             }
             *index = remap[old];
         }
         self.positions = kept;
+        self.uvs = kept_uvs;
     }
 }
 

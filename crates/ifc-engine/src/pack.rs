@@ -5,10 +5,11 @@
 use crate::{ProductCategory, Shape, ShapePart, codes};
 use glam::{DMat4, DVec3};
 use std::collections::HashMap;
+use tessifc_geom::TextureSource;
 use tessifc_geom::{PartGeometry, SharedKey};
 use tessifc_pack::{
     DiagnosticRecord, INSTANCE_OPENING, INSTANCE_REFERENCE, INSTANCE_SPACE, INSTANCE_TRANSPARENT,
-    IgpWriter, Instance, StreamPosition, StreamState,
+    IgpWriter, Instance, MaterialRecord, StreamPosition, StreamState, TextureData, TextureRecord,
 };
 use tessifc_schema::{Schema, SchemaId};
 use tessifc_step::Diagnostic;
@@ -16,6 +17,10 @@ use tessifc_step::Diagnostic;
 /// A shared mesh whose own coordinates reach further than this from its
 /// origin is baked into world space instead, because f32 would lose it.
 const MAX_SHARED_EXTENT_M: f64 = 1.0e4;
+
+/// Texture bytes one pack may embed; past it a texture is written without
+/// its pixels and said so.
+const MAX_EMBEDDED_TEXTURE_BYTES: usize = 64 << 20;
 
 /// The `INSTANCE_*` bits a product's record carries, from its class name.
 ///
@@ -89,6 +94,9 @@ pub struct Packer {
     offset: DVec3,
     triangles: usize,
     shared_instances: usize,
+    embedded_texture_bytes: usize,
+    /// Coarse levels to write per large mesh, and the chord tolerance they start from.
+    lod: Option<(u8, f64)>,
 }
 
 impl Packer {
@@ -125,6 +133,27 @@ impl Packer {
             offset,
             triangles: 0,
             shared_instances: 0,
+            embedded_texture_bytes: 0,
+            lod: None,
+        }
+    }
+
+    /// Write `levels` coarse levels (0 to 2) for every mesh large enough,
+    /// with tolerances derived from `chord_tolerance_m` and the mesh's size.
+    pub fn set_lod_levels(&mut self, levels: u8, chord_tolerance_m: f64) {
+        self.lod = (levels > 0).then_some((levels.min(2), chord_tolerance_m));
+    }
+
+    /// Add the coarse levels of a geometry this pack just stored.
+    fn add_levels(&mut self, id: u32) {
+        let Some((levels, chord)) = self.lod else {
+            return;
+        };
+        let Some(mut indices) = lod_indices(&self.writer, id, chord, levels) else {
+            return;
+        };
+        for (level, coarse) in indices.drain(..).enumerate() {
+            self.writer.add_geometry_lod(id, coarse, level as u8 + 1);
         }
     }
 
@@ -172,9 +201,78 @@ impl Packer {
                     geometry,
                     color: part.color,
                     provenance: part.provenance.clone(),
+                    material: part.material.clone(),
                 },
             );
         }
+    }
+
+    /// The pack's material index for a part's material, writing its texture
+    /// once per stream.
+    fn material_id(&mut self, express_id: u32, material: &tessifc_geom::Material) -> u32 {
+        let texture = material.texture.as_ref().map(|texture| {
+            if !self.writer.has_texture(texture.id) {
+                let (mime, data) = match &texture.source {
+                    TextureSource::Url(url) => (mime_of(url), TextureData::Uri(url.clone())),
+                    TextureSource::Blob { format, bytes } => {
+                        (mime_of(format), TextureData::Blob(bytes.clone()))
+                    }
+                    TextureSource::Pixels {
+                        width,
+                        height,
+                        components,
+                        bytes,
+                    } => (
+                        None,
+                        TextureData::Pixels {
+                            width: *width,
+                            height: *height,
+                            components: *components,
+                            bytes: bytes.clone(),
+                        },
+                    ),
+                };
+                let size = match &data {
+                    TextureData::Blob(bytes) => bytes.len(),
+                    TextureData::Pixels { bytes, .. } => bytes.len(),
+                    _ => 0,
+                };
+                let data = if self.embedded_texture_bytes + size > MAX_EMBEDDED_TEXTURE_BYTES {
+                    self.writer.add_diagnostic(DiagnosticRecord {
+                        express_id: Some(express_id),
+                        line: 0,
+                        severity: "warn".to_string(),
+                        code: codes::TEXTURE_OMITTED.as_str().to_string(),
+                        message: format!(
+                            "texture #{} left out: the pack's embedded textures would exceed their limit",
+                            texture.id
+                        ),
+                    });
+                    TextureData::Omitted
+                } else {
+                    self.embedded_texture_bytes += size;
+                    data
+                };
+                self.writer.add_texture(TextureRecord {
+                    id: texture.id,
+                    mime,
+                    repeat: texture.repeat,
+                    transform: texture.transform,
+                    data,
+                });
+            }
+            texture.id
+        });
+        self.writer.add_material(MaterialRecord {
+            color: material.colour.0,
+            diffuse: material.diffuse,
+            specular: material.specular,
+            shininess: material.shininess,
+            roughness: material.roughness,
+            reflectance: material.reflectance.clone(),
+            texture,
+            source: material.style,
+        })
     }
 
     fn add_part(
@@ -185,6 +283,10 @@ impl Packer {
         part: ShapePart,
     ) {
         let flags = instance_flags_for_category(category, part.color);
+        let material = part
+            .material
+            .as_ref()
+            .map(|material| self.material_id(express_id, material));
         let (geometry_id, transform) = match part.geometry {
             PartGeometry::Shared {
                 key,
@@ -212,11 +314,26 @@ impl Packer {
                             return;
                         }
                         let closed = Some(mesh.closed.unwrap_or_else(|| mesh.is_edge_manifold()));
-                        let (positions, indices) =
-                            tessifc_mesh::optimize_vertex_locality_f32(&positions, &mesh.indices);
-                        let id = self
-                            .writer
-                            .add_geometry_owned_closed(positions, indices, closed);
+                        // The locality pass permutes vertices, so the shared
+                        // mesh is reordered once as a whole and narrowed after.
+                        let mut ordered = (*mesh).clone();
+                        tessifc_mesh::optimize_vertex_locality(&mut ordered);
+                        let positions: Vec<f32> = ordered
+                            .positions
+                            .iter()
+                            .flat_map(|point| [point.x as f32, point.y as f32, point.z as f32])
+                            .collect();
+                        let uvs = flat_uvs(&ordered);
+                        let before = self.writer.geometry_count();
+                        let id = self.writer.add_geometry_owned_closed_uv(
+                            positions,
+                            ordered.indices,
+                            closed,
+                            uvs,
+                        );
+                        if self.writer.geometry_count() > before {
+                            self.add_levels(id);
+                        }
                         self.shared.insert(key, id);
                         id
                     }
@@ -242,9 +359,14 @@ impl Packer {
                 }
                 self.triangles += mesh.triangle_count();
                 let closed = Some(mesh.closed.unwrap_or_else(|| mesh.is_edge_manifold()));
-                let id = self
-                    .writer
-                    .add_geometry_owned_closed(positions, mesh.indices, closed);
+                let uvs = flat_uvs(&mesh);
+                let before = self.writer.geometry_count();
+                let id =
+                    self.writer
+                        .add_geometry_owned_closed_uv(positions, mesh.indices, closed, uvs);
+                if self.writer.geometry_count() > before {
+                    self.add_levels(id);
+                }
                 (id, IDENTITY)
             }
         };
@@ -261,6 +383,7 @@ impl Packer {
                 evaluator: part.provenance.evaluator.clone(),
                 boolean: part.provenance.boolean.name(),
             },
+            material,
         });
     }
 
@@ -326,6 +449,78 @@ impl Packer {
     }
 }
 
+/// The coarse index lists of a stored geometry, one per level, or `None`
+/// when the mesh is too small, refused, or when the first level would not
+/// remove a quarter of its triangles. Level 2 simplifies level 1 again at
+/// four times the tolerance.
+pub fn lod_indices(
+    writer: &IgpWriter,
+    id: u32,
+    chord_tolerance_m: f64,
+    levels: u8,
+) -> Option<Vec<Vec<u32>>> {
+    let (positions, indices) = writer.geometry_data(id)?;
+    if indices.len() < tessifc_mesh::LOD_MIN_TRIANGLES * 3 {
+        return None;
+    }
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for vertex in positions.chunks_exact(3) {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(vertex[axis]);
+            hi[axis] = hi[axis].max(vertex[axis]);
+        }
+    }
+    let diagonal = (0..3)
+        .map(|axis| ((hi[axis] - lo[axis]) as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let tolerance = (2.0 * chord_tolerance_m).max(diagonal / 256.0);
+    if tolerance.is_nan() || tolerance <= 0.0 || !tolerance.is_finite() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut current: Vec<u32> = indices.to_vec();
+    for level in 0..levels.min(2) {
+        let options = tessifc_mesh::DecimateOptions {
+            target_ratio: tessifc_mesh::LOD_TARGET_RATIO,
+            tolerance: tolerance * if level == 0 { 1.0 } else { 4.0 },
+            max_triangles: tessifc_mesh::MAX_DECIMATE_TRIANGLES,
+        };
+        let Some(coarse) = tessifc_mesh::decimate_f32(positions, &current, &options) else {
+            break;
+        };
+        current = coarse.clone();
+        out.push(coarse);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// A mesh's texture coordinates as the writer takes them: two floats per
+/// vertex, or nothing.
+fn flat_uvs(mesh: &tessifc_mesh::Mesh64) -> Vec<f32> {
+    if !mesh.has_uvs() {
+        return Vec::new();
+    }
+    mesh.uvs.iter().flat_map(|uv| [uv[0], uv[1]]).collect()
+}
+
+/// The media type an image format name or file name implies, when it does.
+fn mime_of(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let extension = lower.rsplit('.').next().unwrap_or(&lower);
+    let mime = match extension.trim() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "tif" | "tiff" => "image/tiff",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
 /// Column-major identity, the transform of a mesh already in world space.
 const IDENTITY: [f32; 16] = [
     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -388,6 +583,123 @@ mod tests {
     fn parse_json(bytes: &[u8]) -> serde_json::Value {
         let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         serde_json::from_str(std::str::from_utf8(&bytes[24..24 + json_len]).unwrap()).unwrap()
+    }
+
+    /// A quad styled with a rendering and a pixel texture, mapped by an
+    /// indexed triangle texture map, as a wall's body.
+    const TEXTURED_WALL: &str = "#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(1.,1.,0.),(0.,1.,0.)));
+         #2=IFCTRIANGULATEDFACESET(#1,$,.F.,((1,2,3),(1,3,4)),$);
+         #3=IFCTEXTUREVERTEXLIST(((0.,0.),(1.,0.),(1.,1.),(0.,1.)));
+         #4=IFCINDEXEDTRIANGLETEXTUREMAP((#10),#2,#3,((1,2,3),(1,3,4)));
+         #10=IFCPIXELTEXTURE(.T.,.T.,$,$,$,2,1,3,(\"0FF0000\",\"00000FF\"));
+         #13=IFCCOLOURRGB($,0.8,0.2,0.1);
+         #14=IFCSURFACESTYLERENDERING(#13,0.,IFCNORMALISEDRATIOMEASURE(0.5),$,$,$,$,IFCSPECULAREXPONENT(32.),.BLINN.);
+         #16=IFCSURFACESTYLEWITHTEXTURES((#10));
+         #17=IFCSURFACESTYLE('brick',.BOTH.,(#14,#16));
+         #18=IFCSTYLEDITEM(#2,(#17),$);
+         #20=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#2));
+         #21=IFCPRODUCTDEFINITIONSHAPE($,$,(#20));
+         #22=IFCWALL('w',$,$,$,$,$,#21,$,$);
+";
+
+    fn pack_of(model: &Model, textures: bool) -> Vec<u8> {
+        let settings = tessifc_geom::Settings {
+            textures,
+            ..tessifc_geom::Settings::default()
+        };
+        let result = Engine::with_settings(settings).evaluate(model);
+        let mut packer = Packer::new("IFC4", 1.0, result.model_offset);
+        for shape in result.shapes {
+            packer.add_shape(shape);
+        }
+        packer.finish()
+    }
+
+    #[test]
+    fn a_textured_wall_writes_its_material_texture_and_coordinates() {
+        let model = model_of(TEXTURED_WALL);
+        let bytes = pack_of(&model, true);
+        let json = parse_json(&bytes);
+        let geometry = &json["geometries"][0];
+        assert_eq!(geometry["uv"]["count"], 4);
+        assert_eq!(json["instances"]["material"]["type"], "u32");
+        let material = &json["materials"][0];
+        assert_eq!(material["color"], serde_json::json!([204, 51, 26, 255]));
+        assert_eq!(material["shininess"], 32.0);
+        assert_eq!(material["reflectance"], "BLINN");
+        assert_eq!(material["texture"], 10);
+        assert_eq!(material["source"], 17);
+        let texture = &json["textures"][0];
+        assert_eq!(texture["id"], 10);
+        assert_eq!(texture["pixels"]["width"], 2);
+        assert_eq!(texture["pixels"]["components"], 3);
+        assert_eq!(texture["repeat"], serde_json::json!([true, true]));
+        // The sections sit on eight-byte boundaries inside the binary chunk.
+        let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let binary_start = 24 + json_len.div_ceil(8) * 8;
+        let uv_at = geometry["uv"]["off"].as_u64().unwrap() as usize;
+        let pixels_at = texture["pixels"]["off"].as_u64().unwrap() as usize;
+        assert_eq!(uv_at % 8, 0);
+        assert_eq!(pixels_at % 8, 0);
+        assert_eq!(
+            &bytes[binary_start + pixels_at..binary_start + pixels_at + 6],
+            &[255, 0, 0, 0, 0, 255]
+        );
+        let material_at = json["instances"]["material"]["off"].as_u64().unwrap() as usize;
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[binary_start + material_at..binary_start + material_at + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn a_pack_without_textures_has_none_of_the_new_members() {
+        let model = model_of(TEXTURED_WALL);
+        let json = parse_json(&pack_of(&model, false));
+        assert!(json["geometries"][0].get("uv").is_none());
+        assert!(json["instances"].get("material").is_none());
+        assert!(json.get("materials").is_none());
+        assert!(json.get("textures").is_none());
+    }
+
+    #[test]
+    fn a_streamed_texture_is_written_once() {
+        let model = model_of(TEXTURED_WALL);
+        let settings = tessifc_geom::Settings {
+            textures: true,
+            ..tessifc_geom::Settings::default()
+        };
+        let engine = Engine::with_settings(settings);
+        let mut session = engine.session(&model);
+        let first = session.next(&model, |_| true);
+        let mut packer = Packer::new("IFC4", 1.0, session.model_offset());
+        for shape in first.shapes {
+            packer.add_shape(shape);
+        }
+        let (bytes, state) = packer.finish_chunk();
+        assert_eq!(parse_json(&bytes)["textures"].as_array().unwrap().len(), 1);
+        let mut next = Packer::continue_stream("IFC4", 1.0, session.model_offset(), state);
+        let result = Engine::with_settings(tessifc_geom::Settings {
+            textures: true,
+            ..tessifc_geom::Settings::default()
+        })
+        .evaluate(&model);
+        for shape in result.shapes {
+            next.add_shape(shape);
+        }
+        let json = parse_json(&next.finish());
+        assert!(
+            json.get("textures").is_none(),
+            "already written by the first chunk"
+        );
+        assert_eq!(
+            json["materials"][0]["texture"], 10,
+            "and still referred to by id"
+        );
     }
 
     #[test]
@@ -511,6 +823,7 @@ mod tests {
                 geometry: PartGeometry::Unique(mesh),
                 color,
                 provenance: Default::default(),
+                material: None,
             }],
             color,
         });
@@ -520,5 +833,72 @@ mod tests {
         let json = parse_json(&packer.finish());
         assert_eq!(json["diagnostics"][0]["id"], 7);
         assert_eq!(json["diagnostics"][0]["code"], "W_NON_FINITE_GEOMETRY");
+    }
+
+    /// A column: an extruded circle, whose fine tessellation has thousands of triangles.
+    const COLUMN: &str = "#1=IFCCIRCLEPROFILEDEF(.AREA.,$,$,1.);
+         #2=IFCDIRECTION((0.,0.,1.));
+         #3=IFCEXTRUDEDAREASOLID(#1,$,#2,3.);
+         #4=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#3));
+         #5=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));
+         #6=IFCCOLUMN('c',$,$,$,$,$,#5,$,$);
+";
+
+    fn column_pack(levels: u8) -> serde_json::Value {
+        let model = model_of(COLUMN);
+        let settings = tessifc_geom::Settings {
+            circle_segments: Some(512),
+            lod_levels: levels,
+            ..tessifc_geom::Settings::default()
+        };
+        let result = Engine::with_settings(settings).evaluate(&model);
+        parse_json(&crate::report::pack_evaluation("IFC4", &result))
+    }
+
+    #[test]
+    fn coarse_levels_are_written_only_when_asked_and_count_no_triangles() {
+        let plain = column_pack(0);
+        assert_eq!(plain["geometries"].as_array().unwrap().len(), 1);
+        assert!(plain["geometries"][0].get("lod").is_none());
+        let fine_triangles = plain["geometries"][0]["indices"]["count"].as_u64().unwrap() / 3;
+        assert!(
+            fine_triangles >= 1024,
+            "the column is large enough for a level ({fine_triangles})"
+        );
+
+        let levelled = column_pack(2);
+        let entries = levelled["geometries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3, "the base and two levels");
+        let base = entries[0]["id"].as_u64().unwrap();
+        assert_eq!(
+            entries[1]["lod"],
+            serde_json::json!({ "of": base, "level": 1 })
+        );
+        assert_eq!(
+            entries[2]["lod"],
+            serde_json::json!({ "of": base, "level": 2 })
+        );
+        let first = entries[1]["indices"]["count"].as_u64().unwrap() / 3;
+        let second = entries[2]["indices"]["count"].as_u64().unwrap() / 3;
+        assert!(
+            first * 4 <= fine_triangles * 3,
+            "level 1 removes at least a quarter ({first} of {fine_triangles})"
+        );
+        assert!(
+            second < first,
+            "level 2 is coarser than level 1 ({second} of {first})"
+        );
+        assert_eq!(
+            entries[1]["positions"], entries[0]["positions"],
+            "levels share the base positions"
+        );
+        assert_eq!(
+            levelled["instances"]["count"], 1,
+            "no instance places a level"
+        );
+        assert_eq!(
+            levelled["stats"]["triangles"], plain["stats"]["triangles"],
+            "the stats count base triangles only"
+        );
     }
 }

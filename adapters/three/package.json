@@ -6,13 +6,24 @@
   "author": "Bharathi Kannan",
   "type": "module",
   "main": "src/index.js",
+  "types": "./types/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
-    "./build": "./src/build.js",
-    "./retained": "./src/retained.js"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./build": {
+      "types": "./types/build.d.ts",
+      "default": "./src/build.js"
+    },
+    "./retained": {
+      "types": "./types/retained.d.ts",
+      "default": "./src/retained.js"
+    }
   },
   "files": [
     "src/",
+    "types/",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -37,7 +48,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/build.test.mjs"
+    "test": "node test/build.test.mjs && node test/retained.test.mjs",
+    "types": "node ../../scripts/build-types.mjs .",
+    "typecheck": "node ../../scripts/build-types.mjs --check .",
+    "prepack": "npm run types"
   },
   "peerDependencies": {
     "three": ">=0.150.0"

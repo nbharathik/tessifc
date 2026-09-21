@@ -44,6 +44,7 @@ const PASSES: usize = 3;
 /// assert_eq!(mesh.triangle_count(), 2);
 /// ```
 pub fn merge_coplanar(mesh: &mut Mesh64, tolerance: f64) -> usize {
+    mesh.drop_uvs();
     let tol = if tolerance.is_finite() && tolerance > 0.0 {
         tolerance
     } else {

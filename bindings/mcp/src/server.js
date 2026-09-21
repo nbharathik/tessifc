@@ -6,7 +6,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { API_REFERENCE } from "../../edit/src/script-engine.js";
+import { API_REFERENCE } from "@tessifc/edit/script-engine";
 import { SessionBusy } from "./session-host.js";
 
 const OUTPUT_LIMIT = 12_000;
@@ -17,14 +17,23 @@ function clip(text, limit = OUTPUT_LIMIT) {
   return value.length > limit ? `${value.slice(0, limit)}\n... ${value.length - limit} more characters` : value;
 }
 
+/**
+ * @param {any} payload
+ * @param {{ isError?: boolean, structured?: boolean }} [options]
+ */
 function result(payload, { isError = false, structured = true } = {}) {
+  /** @type {{ content: Array<{ type: "text", text: string }>, isError: boolean, structuredContent?: any }} */
   const response = { content: [{ type: "text", text: clip(JSON.stringify(payload, null, 2)) }], isError };
   if (structured) response.structuredContent = payload;
   return response;
 }
 
-/** An error result: text only, so it never has to fit a tool's output schema. */
+/**
+ * An error result: text only, so it never has to fit a tool's output schema.
+ * @param {any} error
+ */
 function failure(error) {
+  /** @type {Record<string, any>} */
   const payload = { error: error?.message ?? String(error) };
   if (error?.impact) payload.impact = { diagnostics: (error.impact.diagnostics ?? []).slice(0, 20), productOutcomes: (error.impact.productOutcomes ?? []).slice(0, 20) };
   if (error?.committed) payload.committed = true;
@@ -32,12 +41,17 @@ function failure(error) {
   return result(payload, { isError: true, structured: false });
 }
 
-/** The record a run returns: the kernel's numbers about the revision, never the script's claims. */
+/**
+ * The record a run returns: the kernel's numbers about the revision, never the script's claims.
+ * @param {Awaited<ReturnType<import("./session-host.js").ModelHost["run"]>>} outcome
+ * @param {import("./session-host.js").ModelHost} host
+ */
 export function runRecord(outcome, host) {
   const { report, delta } = outcome;
   const impact = delta?.impact ?? null;
   return {
     ok: report.ok,
+    timedOut: Boolean(report.timedOut),
     changed: Boolean(delta),
     revision: outcome.revision ?? host.session?.revision ?? null,
     version: outcome.version ?? host.version ?? null,
@@ -60,7 +74,7 @@ export function runRecord(outcome, host) {
 }
 
 const RUN_SHAPE = {
-  ok: z.boolean(), changed: z.boolean(), revision: z.string().nullable(), version: z.string().nullable(), stdout: z.string(),
+  ok: z.boolean(), timedOut: z.boolean(), changed: z.boolean(), revision: z.string().nullable(), version: z.string().nullable(), stdout: z.string(),
   error: z.string().nullable(), traceback: z.string().nullable(), operations: z.object({ created: z.number(), modified: z.number(), deleted: z.number() }),
   affectedProducts: z.array(z.number()), removedProducts: z.array(z.number()), metadataProducts: z.array(z.number()), fullRebuild: z.boolean(),
   kind: z.string().nullable(), reasons: z.array(z.any()), diagnostics: z.array(z.any()), history: z.object({ undo: z.number(), redo: z.number() }),
@@ -75,6 +89,8 @@ Finish with verify_revision and, when it reports ok, the words BUILDING COMPLETE
 /**
  * Create the MCP server over a model host. `viewerUrl` is mentioned in the
  * instructions so an agent can tell the user where the model is shown.
+ * @param {import("./session-host.js").ModelHost} host
+ * @param {{ viewerUrl?: string | null, version?: string }} [options]
  */
 export function createTessifcServer(host, { viewerUrl = null, version = "0.0.0" } = {}) {
   const instructions = [
@@ -157,18 +173,19 @@ export function createTessifcServer(host, { viewerUrl = null, version = "0.0.0" 
 
   server.registerTool("inspect_model", {
     title: "Inspect the model",
-    description: "Run read-only JavaScript against the model and return what it prints; every modification is discarded. Same names as edit_model scripts.",
+    description: "Run read-only JavaScript against the model and return what it prints; every modification is discarded. Same names and time limit as edit_model scripts.",
     inputSchema: { code: z.string().describe("JavaScript that prints what you need to know") },
   }, async ({ code }) => busyOr(async () => {
     const outcome = await host.run(code, null, { commit: false, label: "inspect" });
     const { report } = outcome;
-    if (!report.ok) return result({ ok: false, error: report.error, traceback: report.traceback ?? null, stdout: report.stdout ?? "" }, { isError: true, structured: false });
-    return result({ ok: true, stdout: report.stdout ?? "", error: null, traceback: null });
+    const timedOut = Boolean(report.timedOut);
+    if (!report.ok) return result({ ok: false, timedOut, error: report.error, traceback: report.traceback ?? null, stdout: report.stdout ?? "" }, { isError: true, structured: false });
+    return result({ ok: true, timedOut, stdout: report.stdout ?? "", error: null, traceback: null });
   }));
 
   server.registerTool("edit_model", {
     title: "Edit the model",
-    description: "Run a JavaScript script that changes the model; its edits become one revision and the viewer follows. The result carries the kernel's revision, affected and removed products, diagnostics and whether the file was saved.",
+    description: "Run a JavaScript script that changes the model; its edits become one revision and the viewer follows. The result carries the kernel's revision, affected and removed products, diagnostics and whether the file was saved. A script over the time limit is stopped, reports timedOut and changes nothing.",
     inputSchema: { script: z.string().describe("Complete script using ifc, selected, selection and print"), summary: z.string().optional().describe("One sentence about the change") },
     outputSchema: RUN_SHAPE,
   }, async ({ script, summary }) => busyOr(async () => {

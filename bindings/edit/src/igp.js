@@ -11,7 +11,11 @@ export const INSTANCE_SPACE = 1 << 2;
 export const INSTANCE_REFERENCE = 1 << 4;
 export const DEFAULT_HIDDEN_INSTANCE_FLAGS = INSTANCE_OPENING | INSTANCE_SPACE | INSTANCE_REFERENCE;
 
-/** Read an IGP v0 buffer; the returned typed arrays view the input without copying. */
+/**
+ * Read an IGP v0 buffer; the returned typed arrays view the input without copying.
+ * @param {Uint8Array | ArrayBuffer} input
+ * @returns {import("./types.js").Pack}
+ */
 export function readIgp(input) {
   const bytes = asBytes(input);
   if (bytes.byteLength < HEADER_BYTES) {
@@ -33,6 +37,7 @@ export function readIgp(input) {
     throw new Error("The geometry pack is truncated.");
   }
 
+  /** @type {import("./types.js").PackIndex} */
   let index;
   try {
     index = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(HEADER_BYTES, HEADER_BYTES + jsonLength)));
@@ -60,6 +65,14 @@ export function readIgp(input) {
     }
     const PositionArray = flags & 2 ? Float64Array : Float32Array;
     const IndexArray = entry.indices.type === "u32" ? Uint32Array : Uint16Array;
+    // Optional: texture coordinates, one pair per vertex.
+    const uv = entry.uv && safeCount(entry.uv.count) && entry.uv.count === entry.positions.count
+      ? typedView(bytes.buffer, absoluteBinaryStart, binaryLength, entry.uv, Float32Array, entry.uv.count * 2)
+      : null;
+    // Optional: a coarse level of another entry, over that entry's positions.
+    const lod = entry.lod && typeof entry.lod === "object" && safeCount(entry.lod.of) && safeCount(entry.lod.level)
+      ? { of: entry.lod.of, level: entry.lod.level }
+      : null;
     return {
       id: entry.id,
       primitive: entry.primitive ?? "triangles",
@@ -82,6 +95,8 @@ export function readIgp(input) {
         IndexArray,
         entry.indices.count,
       ),
+      uv,
+      lod,
     };
   });
 
@@ -114,10 +129,25 @@ export function readIgp(input) {
     provenance: columns.provenance
       ? typedView(bytes.buffer, absoluteBinaryStart, binaryLength, columns.provenance, Uint32Array, count)
       : null,
+    // Optional: only a pack written with textures on carries materials.
+    material: columns.material
+      ? typedView(bytes.buffer, absoluteBinaryStart, binaryLength, columns.material, Uint32Array, count)
+      : null,
   };
+  // Optional tables; a texture's bytes are viewed where the pack embeds them.
+  if (index.materials !== undefined && !Array.isArray(index.materials)) {
+    throw new Error("The IGP materials table is invalid.");
+  }
+  if (index.textures !== undefined) {
+    if (!Array.isArray(index.textures)) throw new Error("The IGP textures table is invalid.");
+    index.textures = index.textures.map((texture) => readTexture(texture, bytes.buffer, absoluteBinaryStart, binaryLength));
+  }
 
   let geometryBytes = 0;
-  for (const mesh of geometry) geometryBytes += mesh.positions.byteLength + mesh.indices.byteLength;
+  for (const mesh of geometry) {
+    // A level shares its base's positions and uv; only its indices are new bytes.
+    geometryBytes += mesh.indices.byteLength + (mesh.lod ? 0 : mesh.positions.byteLength + (mesh.uv ? mesh.uv.byteLength : 0));
+  }
   const instanceBytes =
     instances.geometryIds.byteLength +
     instances.expressIds.byteLength +
@@ -125,8 +155,9 @@ export function readIgp(input) {
     instances.transforms.byteLength +
     instances.colors.byteLength +
     instances.flags.byteLength +
-    (instances.provenance ? instances.provenance.byteLength : 0);
-  const normalsBytes = geometry.reduce((sum, mesh) => sum + mesh.positions.length * 4, 0);
+    (instances.provenance ? instances.provenance.byteLength : 0) +
+    (instances.material ? instances.material.byteLength : 0);
+  const normalsBytes = geometry.reduce((sum, mesh) => sum + (mesh.lod ? 0 : mesh.positions.length * 4), 0);
   const gpuBytes = geometryBytes + normalsBytes + count * (16 * 4 + 3 * 4);
 
   return {
@@ -140,7 +171,10 @@ export function readIgp(input) {
   };
 }
 
-/** Turn an IFC class into a short UI label without losing its exact name. */
+/**
+ * Turn an IFC class into a short UI label without losing its exact name.
+ * @param {string} name
+ */
 export function humanizeIfcClass(name) {
   return String(name ?? "Unknown")
     .replace(/^Ifc/, "")
@@ -181,6 +215,34 @@ export function defaultHiddenClassIds(pack) {
 
 function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+/** One `textures` entry with its blob or pixel bytes viewed, not copied. */
+function readTexture(texture, buffer, binaryStart, binaryLength) {
+  if (!texture || typeof texture !== "object" || !safeCount(texture.id)) {
+    throw new Error("An IGP texture entry is invalid.");
+  }
+  /** @type {import("./types.js").PackTexture} */
+  const out = {
+    id: texture.id,
+    mime: typeof texture.mime === "string" ? texture.mime : null,
+    repeat: Array.isArray(texture.repeat) ? texture.repeat.map(Boolean) : [true, true],
+    transform: Array.isArray(texture.transform) && texture.transform.length === 6 ? texture.transform : null,
+  };
+  const bytesOf = (section) => {
+    if (!section || !safeCount(section.len)) throw new Error("An IGP texture section is invalid.");
+    return typedView(buffer, binaryStart, binaryLength, section, Uint8Array, section.len);
+  };
+  if (typeof texture.uri === "string") out.uri = texture.uri;
+  else if (texture.blob) out.blob = bytesOf(texture.blob);
+  else if (texture.pixels) {
+    const { width, height, components } = texture.pixels;
+    if (!safeCount(width) || !safeCount(height) || !safeCount(components) || width * height * components !== texture.pixels.len) {
+      throw new Error("An IGP pixel texture does not match its size.");
+    }
+    out.pixels = { width, height, components, bytes: bytesOf(texture.pixels) };
+  } else out.omitted = true;
+  return out;
 }
 
 function asBytes(input) {

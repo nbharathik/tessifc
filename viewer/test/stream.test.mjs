@@ -73,6 +73,29 @@ assert.deepEqual([...assembler.pack().instances.active], [1, 0, 1, 0, 0, 1]);
 assert.equal(assembler.pack().instances.activeCount, 3);
 console.log("ok    streamed memory totals follow deduplication, patch replacement, and deletion");
 
+{
+  // Coarse levels: added over a base the assembler holds, counted by their indices, gone with the base.
+  const levelled = createPackAssembler();
+  const big = mesh(7);
+  const whole = chunk([big], [[7, 70]]);
+  whole.stream = { final: true };
+  levelled.append(whole);
+  const ids = levelled.addLodLevels([{ of: 7, level: 1, indices: Uint16Array.from([0, 1, 2]) }]);
+  assert.equal(ids.length, 1);
+  assert.equal(levelled.geometryCount, 2);
+  const level = levelled.pack().geometry.find((item) => item.id === ids[0]);
+  assert.deepEqual(level.lod, { of: 7, level: 1 });
+  assert.equal(level.positions, big.positions, "a level views the base's positions");
+  assert.equal(levelled.pack().memory.geometryBytes, big.positions.byteLength + big.indices.byteLength + 6);
+  assert.equal(levelled.nextGeometryId(), ids[0] + 1, "a level takes a fresh id above every issued one");
+  assert.deepEqual(levelled.addLodLevels([{ of: 7, level: 1, indices: Uint16Array.from([0, 1, 2]) }]), [], "the same level is not added twice");
+  const fresh = levelled.nextGeometryId();
+  levelled.replaceProducts([70], chunk([mesh(fresh, 2)], [[fresh, 70]]));
+  assert.deepEqual(levelled.pack().geometry.map((item) => item.id), [fresh], "the base's level is pruned with the base");
+  checkMemory(levelled.pack());
+  console.log("ok    coarse levels are added over their base and pruned with it");
+}
+
 const selective = createPackAssembler();
 const source = chunk([mesh(0), mesh(1)], [[0, 10], [1, 11]]);
 source.stream = { final: true };

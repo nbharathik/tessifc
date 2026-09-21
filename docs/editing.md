@@ -130,6 +130,10 @@ them together: it adds a house beside whatever model is open. The
 [SDK](sdk.md#browser-scripts) lists the whole API and [Agents and
 pipelines](agents.md) shows the same loop outside the viewer. A script that
 throws publishes nothing; a script that changes nothing publishes nothing.
+A script still running when the time limit passes (**Settings > Scripts**,
+30 seconds unless changed) is stopped with the worker that runs it: its edits
+are discarded, the model reopens at its last revision with the scene and the
+selection kept, and the undo history starts again.
 `Undo` and `Redo` republish the source as it was before or after the last
 change, whether a script, an attribute save or an update from a file, as new
 revisions. Browser scripts make the model dirty: the download icon in the top
@@ -178,5 +182,7 @@ servers described in [Agents and pipelines](agents.md) and the viewer shows
 its work the same way.
 
 Scripts, whether typed or generated, run with your user's permissions and
-without a sandbox: in the page's worker for JavaScript, in the session
-process for Python. Review generated code before running it.
+without a sandbox: in the page's worker for JavaScript, in a worker thread of
+the `tessifc-mcp` process, in the session process for Python. The JavaScript
+hosts stop a script at a time limit; the Python session does not. Review
+generated code before running it.

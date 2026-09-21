@@ -26,9 +26,26 @@ pub fn optimize_vertex_locality(mesh: &mut Mesh64) {
         return;
     }
     let ordered = reorder_triangles(&mesh.indices, vertex_count, VERTEX_CACHE_SIZE);
+    if mesh.has_uvs() {
+        let (_, uvs) = renumber_vertices(&ordered, &mesh.uvs);
+        mesh.uvs = uvs;
+    }
     let (indices, positions) = renumber_vertices(&ordered, &mesh.positions);
     mesh.indices = indices;
     mesh.positions = positions;
+}
+
+/// Reorder triangles for cache locality without renumbering any vertex: the
+/// same fanning order as [`optimize_vertex_locality`], returned as new
+/// indices over the same positions. Invalid input comes back as a copy.
+pub fn optimize_index_locality(indices: &[u32], vertex_count: usize) -> Vec<u32> {
+    if indices.len() < 6
+        || !indices.len().is_multiple_of(3)
+        || indices.iter().any(|&index| index as usize >= vertex_count)
+    {
+        return indices.to_vec();
+    }
+    reorder_triangles(indices, vertex_count, VERTEX_CACHE_SIZE)
 }
 
 /// Reorder the triangles of a `positions`, `indices` pair already narrowed to

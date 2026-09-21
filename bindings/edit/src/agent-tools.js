@@ -92,11 +92,22 @@ function describeRun(report, delta) {
 }
 
 /**
+ * What the agent tools run scripts against: a session, or a host with the same two calls.
+ * @typedef {object} ScriptHost
+ * @property {(source: string, selection?: import("./types.js").Selection | null, options?: { commit?: boolean }) => { report: import("./types.js").ScriptReport, delta: import("./types.js").Delta | null } | Promise<{ report: import("./types.js").ScriptReport, delta: any }>} runScript
+ * @property {(() => any) | undefined} [undo]
+ */
+
+/** @typedef {ReturnType<typeof createAgentTools>} AgentTools */
+
+/**
  * An executor over a session-like object: `runScript(source, selection, { commit })`
  * returning `{ report, delta }`, and `undo()` returning a delta. `policy` is
  * "review" (proposals are recorded for the user) or "auto" (they run at once).
  * `onDelta` sees every delta published through the tools. One proposal is
  * accepted per turn (`maxProposalsPerTurn`); `beginTurn()` resets the count.
+ * @param {ScriptHost} host
+ * @param {{ policy?: "review" | "auto", onDelta?: ((delta: import("./types.js").Delta) => void) | null, selection?: import("./types.js").Selection | null, maxProposalsPerTurn?: number }} [options]
  */
 export function createAgentTools(host, { policy = "review", onDelta = null, selection = null, maxProposalsPerTurn = 1 } = {}) {
   const proposals = [];
@@ -188,6 +199,7 @@ export function normalizeHistory(items, { max = 20 } = {}) {
  * loop feeds tool results back until the model answers. Messages are
  * provider-neutral; `@tessifc/edit/providers` has the two common wire formats.
  * `onEvent` reports rounds, tool calls, proposals, deltas and the answer.
+ * @param {{ complete: (request: { system: string | string[], tools: any[], messages: any[], signal?: AbortSignal | null }) => Promise<any>, tools: AgentTools, prompt: string, mode?: "ask" | "edit", context?: string, history?: any[], maxRounds?: number, signal?: AbortSignal | null, onEvent?: ((event: any) => void) | null }} options
  */
 export async function runAgentTurn({ complete, tools, prompt, mode = "ask", context = "", history = [], maxRounds = 8, signal = null, onEvent = null }) {
   const policy = tools.policy ?? "review";

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tessifc"
+# The version is the workspace's, read from Cargo.toml by maturin.
+dynamic = ["version"]
+description = "The TessIFC geometry kernel for Python: IFC in, render-ready IGP meshes out."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Bharathi Kannan" }]
+requires-python = ">=3.10"
+keywords = ["ifc", "bim", "geometry", "step", "mesh"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/nbharathik/tessifc"
+Documentation = "https://github.com/nbharathik/tessifc/blob/main/docs/sdk.md"
+Issues = "https://github.com/nbharathik/tessifc/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "tessifc._core"
+features = ["extension-module"]
+strip = true

@@ -41,6 +41,7 @@ export async function instrumentViewer(page) {
       streaming: () => Boolean(state.stream?.assembler),
       overlayState: () => state.model?.overlayAnalysis?.state ?? null,
       overlaySettled: () => Boolean(state.model?.overlayAnalysis) && state.model.overlayAnalysis.state !== "pending",
+      lodState: () => (state.model?.lodLevels ? { ...state.model.lodLevels, renderer: renderer.meshLevelState?.() ?? null } : null),
     };\n` });
   });
 }

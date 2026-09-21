@@ -989,6 +989,15 @@ fn append_advanced_face(
             .attr("Bound")
             .as_entity()
             .ok_or_else(|| GeomError::missing("Bound"))?;
+        if edge_loop.is_a("IfcVertexLoop") {
+            // A loop of no length bounds nothing on a plane.
+            ctx.diag.info(
+                codes::VERTEX_LOOP_IGNORED,
+                face.id(),
+                "a vertex loop on a planar face bounds no area; ignored",
+            );
+            continue;
+        }
         if !edge_loop.is_a("IfcEdgeLoop") {
             return Err(GeomError::Unsupported(format!(
                 "{} on an advanced face",
@@ -1380,8 +1389,11 @@ fn append_trimmed_surface_face(
         .attr("Bounds")
         .as_list()
         .ok_or_else(|| GeomError::missing("Bounds"))?;
-    let mut loops: Vec<(Vec<DVec3>, Vec<DVec2>, bool)> = Vec::new();
-    let mut all_explicit = true;
+    let same_sense = face.attr("SameSense").as_bool().unwrap_or(true);
+    let mut loops: Vec<FaceLoop> = Vec::new();
+    // Loops given in 3D only, inverted once the surface's frame is settled.
+    let mut raw: Vec<(Vec<DVec3>, bool)> = Vec::new();
+    let mut apexes: Vec<DVec3> = Vec::new();
     let face_surface_id = face
         .attr("FaceSurface")
         .as_entity()
@@ -1394,6 +1406,13 @@ fn append_trimmed_surface_face(
             .attr("Bound")
             .as_entity()
             .ok_or_else(|| GeomError::missing("Bound"))?;
+        if edge_loop.is_a("IfcVertexLoop") {
+            apexes.push(advanced_vertex_point(
+                ctx,
+                edge_loop.attr("LoopVertex").as_entity(),
+            )?);
+            continue;
+        }
         if !edge_loop.is_a("IfcEdgeLoop") {
             return Err(GeomError::Unsupported(format!(
                 "{} on an advanced face",
@@ -1441,10 +1460,14 @@ fn append_trimmed_surface_face(
                     "a parameter-space bound has fewer than three points".into(),
                 ));
             }
-            loops.push((points, parameters, bound.is_a("IfcFaceOuterBound")));
+            loops.push(FaceLoop {
+                points,
+                uv: parameters,
+                declared_outer: bound.is_a("IfcFaceOuterBound"),
+                wrap: None,
+            });
             continue;
         }
-        all_explicit = false;
         let mut points: Vec<DVec3> = Vec::new();
         for run in &runs {
             for point in &run.points {
@@ -1462,36 +1485,50 @@ fn append_trimmed_surface_face(
         if points.len() < 3 {
             continue;
         }
-        if face
-            .attr("Bounds")
-            .as_list()
-            .is_some_and(|bounds| bounds.count() == 1)
-            && let Some(patch) = super::surface_regions::spherical_cap(
-                surface,
-                ctx,
-                &points,
-                face.attr("SameSense").as_bool().unwrap_or(true),
-                face.id(),
-            )?
-        {
-            mesh.append(&patch);
-            return Ok(());
-        }
-        // A boundary through a pole cannot be trimmed in (u, v): every longitude
-        // meets there and either half of the surface fits the loop.
-        if points
-            .iter()
-            .any(|point| surface.is_singular(*point, ctx.tol.len))
-        {
-            return Err(GeomError::Unsupported(
-                "a face bounded through its surface's own pole".into(),
-            ));
-        }
-        let parameters = invert_loop(surface, &points, ctx.tol.len).ok_or_else(|| {
-            GeomError::Degenerate("an advanced face whose edges are not on its own surface".into())
-        })?;
-        loops.push((points, parameters, bound.is_a("IfcFaceOuterBound")));
+        raw.push((points, bound.is_a("IfcFaceOuterBound")));
     }
+    if loops.is_empty()
+        && raw.len() == 1
+        && apexes.is_empty()
+        && let Some(patch) =
+            super::surface_regions::spherical_cap(surface, ctx, &raw[0].0, same_sense, face.id())?
+    {
+        mesh.append(&patch);
+        return Ok(());
+    }
+    // A sphere's poles can be put wherever the loops are not.
+    let all_points: Vec<DVec3> = raw
+        .iter()
+        .flat_map(|(points, _)| points.iter().copied())
+        .collect();
+    let reparametrised = super::surface_regions::reparametrised_sphere(surface, &all_points);
+    let surface = reparametrised.as_ref().unwrap_or(surface);
+    let mut singular_apexes = Vec::new();
+    for apex in apexes {
+        if surface.is_singular(apex, ctx.tol.len) {
+            singular_apexes.push(apex);
+        } else {
+            ctx.diag.info(
+                codes::VERTEX_LOOP_IGNORED,
+                face.id(),
+                "a vertex loop away from any apex of its surface bounds no area; ignored",
+            );
+        }
+    }
+    let periods = surface.periods();
+    let single = loops.is_empty() && raw.len() == 1;
+    for (points, declared_outer) in raw {
+        let (points, uv) = invert_apex_loop(surface, &points, ctx.tol.len, single, same_sense)?;
+        let wrap = super::surface_regions::detect_wrap(&uv, periods);
+        loops.push(FaceLoop {
+            points,
+            uv,
+            declared_outer,
+            wrap,
+        });
+    }
+    let mut loops =
+        super::surface_regions::resolve_bands(ctx, surface, loops, &singular_apexes, same_sense)?;
     if loops.is_empty() {
         return Err(GeomError::Degenerate(
             "an advanced face with no usable bound".into(),
@@ -1500,9 +1537,9 @@ fn append_trimmed_surface_face(
 
     if loops.len() == 1
         && let Some(mut patch) =
-            rectangular_parameter_patch(surface, ctx, &loops[0].0, &loops[0].1, face.id())?
+            rectangular_parameter_patch(surface, ctx, &loops[0].points, &loops[0].uv, face.id())?
     {
-        if !face.attr("SameSense").as_bool().unwrap_or(true) {
+        if !same_sense {
             patch.flip_winding();
         }
         mesh.append(&patch);
@@ -1510,41 +1547,47 @@ fn append_trimmed_surface_face(
     }
 
     // The enclosing loop is the one of largest area, as in the planar path.
-    let areas: Vec<f64> = loops.iter().map(|(_, uv, _)| loop_area(uv).abs()).collect();
+    let areas: Vec<f64> = loops.iter().map(|item| loop_area(&item.uv).abs()).collect();
     let outer = areas
         .iter()
         .enumerate()
         .max_by(|left, right| left.1.total_cmp(right.1))
         .map(|(index, _)| index)
         .unwrap_or(0);
-    // A face wrapping a whole period is a seam face (an IfcSeamCurve used twice in
-    // one loop): the region is the entire band, which no (u, v) polygon can say.
-    let (u_period, v_period) = surface.periods();
-    for (_, parameters, _) in &loops {
-        if all_explicit {
-            break;
-        }
-        for (period, axis) in [(u_period, 0usize), (v_period, 1usize)] {
-            let Some(period) = period else { continue };
-            let span = parameters
-                .iter()
-                .map(|at| if axis == 0 { at.x } else { at.y })
-                .fold((f64::MAX, f64::MIN), |acc, at| {
-                    (acc.0.min(at), acc.1.max(at))
-                });
-            if span.1 - span.0 >= period - ctx.tol.angle.max(1e-9) {
-                return Err(GeomError::Unsupported(
-                    "a face that wraps the whole of its own surface".into(),
-                ));
-            }
-        }
-    }
     if areas[outer] <= ctx.tol.area {
         return Err(GeomError::Degenerate(
             "an advanced face with no area on its surface".into(),
         ));
     }
-    if loops[outer].2 != loops.iter().any(|(_, _, declared)| *declared) || !loops[outer].2 {
+    // A hole is inverted on its own; on a periodic axis it belongs in the
+    // same period as the outer loop.
+    let (u_period, v_period) = surface.periods();
+    for (axis, period) in [(0usize, u_period), (1usize, v_period)] {
+        let Some(period) = period else {
+            continue;
+        };
+        let (low, high) = loops[outer]
+            .uv
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), at| {
+                (low.min(at[axis]), high.max(at[axis]))
+            });
+        let centre = 0.5 * (low + high);
+        for (index, item) in loops.iter_mut().enumerate() {
+            if index == outer || item.uv.is_empty() {
+                continue;
+            }
+            let mean = item.uv.iter().map(|at| at[axis]).sum::<f64>() / item.uv.len() as f64;
+            let shift = ((centre - mean) / period).round() * period;
+            if shift != 0.0 {
+                for at in &mut item.uv {
+                    at[axis] += shift;
+                }
+            }
+        }
+    }
+    let outer_declared = loops[outer].declared_outer;
+    if outer_declared != loops.iter().any(|item| item.declared_outer) || !outer_declared {
         ctx.diag.warn(
             codes::FACE_BOUND_RECOVERED,
             face.id(),
@@ -1553,11 +1596,12 @@ fn append_trimmed_surface_face(
     }
 
     // Holes wind against the outer loop, which is what the triangulator wants.
-    let outward = loop_area(&loops[outer].1) > 0.0;
+    let outward = loop_area(&loops[outer].uv) > 0.0;
     let mut world: Vec<DVec3> = Vec::new();
     let mut uv: Vec<DVec2> = Vec::new();
     let mut rings: Vec<Vec<u32>> = Vec::new();
-    for (index, (points, parameters, _)) in loops.iter().enumerate() {
+    for (index, item) in loops.iter().enumerate() {
+        let (points, parameters) = (&item.points, &item.uv);
         let hole = index != outer;
         let forward = (loop_area(parameters) > 0.0) == outward;
         let keep = if hole { !forward } else { forward };
@@ -1606,6 +1650,29 @@ fn append_trimmed_surface_face(
     };
     let local = triangulate_polygon(&polygon)
         .map_err(|error| GeomError::Triangulation(format!("a face on its surface: {error}")))?;
+    // A boundary that crosses itself in (u, v) triangulates to the wrong area.
+    let covered: f64 = local
+        .chunks_exact(3)
+        .map(|triangle| {
+            let (a, b, c) = (
+                polygon_point(&polygon, triangle[0]),
+                polygon_point(&polygon, triangle[1]),
+                polygon_point(&polygon, triangle[2]),
+            );
+            ((b - a).perp_dot(c - a) * 0.5).abs()
+        })
+        .sum();
+    let expected = loop_area(&polygon.outer).abs()
+        - polygon
+            .holes
+            .iter()
+            .map(|hole| loop_area(hole).abs())
+            .sum::<f64>();
+    if (covered - expected).abs() > 1e-6 * expected.max(ctx.tol.area) {
+        return Err(GeomError::Degenerate(
+            "a face whose boundary crosses itself on its surface".into(),
+        ));
+    }
     let flat: Vec<u32> = corners.concat();
     let mut triangles: Vec<[u32; 3]> = Vec::with_capacity(local.len() / 3);
     for triangle in local.chunks_exact(3) {
@@ -1715,24 +1782,27 @@ fn rectangular_parameter_patch(
                 if !a.is_finite() || !b.is_finite() || !c.is_finite() || !d.is_finite() {
                     return Err(GeomError::Degenerate("non-finite surface grid".into()));
                 }
-                let error_u = surface
-                    .point(DVec2::new((u[0] + u[1]) * 0.5, v[0]))
-                    .distance((a + b) * 0.5)
-                    .max(
-                        surface
-                            .point(DVec2::new((u[0] + u[1]) * 0.5, v[1]))
-                            .distance((c + d) * 0.5),
-                    );
-                let error_v = surface
-                    .point(DVec2::new(u[0], (v[0] + v[1]) * 0.5))
-                    .distance((a + d) * 0.5)
-                    .max(
-                        surface
-                            .point(DVec2::new(u[1], (v[0] + v[1]) * 0.5))
-                            .distance((b + c) * 0.5),
-                    );
+                // Distances to the mesh itself: a parametric twin of the sample
+                // sits elsewhere on a chord where the parameterisation is uneven.
+                let error_u =
+                    distance_to_segment(surface.point(DVec2::new((u[0] + u[1]) * 0.5, v[0])), a, b)
+                        .max(distance_to_segment(
+                            surface.point(DVec2::new((u[0] + u[1]) * 0.5, v[1])),
+                            d,
+                            c,
+                        ));
+                let error_v =
+                    distance_to_segment(surface.point(DVec2::new(u[0], (v[0] + v[1]) * 0.5)), a, d)
+                        .max(distance_to_segment(
+                            surface.point(DVec2::new(u[1], (v[0] + v[1]) * 0.5)),
+                            b,
+                            c,
+                        ));
                 let centre = surface.point(DVec2::new((u[0] + u[1]) * 0.5, (v[0] + v[1]) * 0.5));
-                let error = centre.distance((a + c) * 0.5).max(error_u).max(error_v);
+                let error = distance_to_triangle(centre, a, b, c)
+                    .min(distance_to_triangle(centre, a, c, d))
+                    .max(error_u)
+                    .max(error_v);
                 if error > ctx.settings.chord_tolerance_m {
                     split_u[i] |= error_u >= error_v;
                     split_v[j] |= error_v >= error_u;
@@ -1843,45 +1913,163 @@ fn loop_area(points: &[DVec2]) -> f64 {
     area * 0.5
 }
 
-/// Invert a loop of points onto a surface, following it across any seam.
-///
-/// A periodic parameter is unwrapped as the loop is walked, so a patch that
-/// straddles the seam comes back as one region rather than two.
-fn invert_loop(surface: &Surface, points: &[DVec3], tol: f64) -> Option<Vec<DVec2>> {
-    let (u_period, v_period) = surface.periods();
-    let mut out: Vec<DVec2> = Vec::with_capacity(points.len());
-    for point in points {
-        let mut uv = surface.invert(*point, tol)?;
-        if let Some(previous) = out.last() {
-            uv.x = unwrap(previous.x, uv.x, u_period);
-            uv.y = unwrap(previous.y, uv.y, v_period);
-        }
-        out.push(uv);
+use super::surface_regions::FaceLoop;
+
+/// A point of a corner polygon by the triangulator's index: the outer loop first, then the holes.
+fn polygon_point(polygon: &Polygon2, index: u32) -> DVec2 {
+    let mut index = index as usize;
+    if index < polygon.outer.len() {
+        return polygon.outer[index];
     }
-    // A closed loop that came back a whole period away from where it started
-    // has been walked the wrong way round the seam.
-    if let (Some(first), Some(last)) = (out.first(), out.last()) {
-        let closing = *first - *last;
-        if let Some(period) = u_period
-            && closing.x.abs() > period * 0.75
-            && closing.x.abs() < period * 1.25
-        {
-            // The loop goes all the way round: that is a seam, not an error.
+    index -= polygon.outer.len();
+    for hole in &polygon.holes {
+        if index < hole.len() {
+            return hole[index];
         }
+        index -= hole.len();
     }
-    Some(out)
+    DVec2::ZERO
 }
 
-/// Move `value` by whole periods to sit nearest `previous`.
-fn unwrap(previous: f64, value: f64, period: Option<f64>) -> f64 {
-    let Some(period) = period else {
-        return value;
-    };
-    if period <= 0.0 || !period.is_finite() {
-        return value;
+/// Invert a loop, sending a loop through an apex the long way round the
+/// period when the short way winds against the face.
+fn invert_apex_loop(
+    surface: &Surface,
+    points: &[DVec3],
+    tol: f64,
+    single: bool,
+    same_sense: bool,
+) -> Result<(Vec<DVec3>, Vec<DVec2>), GeomError> {
+    let off_surface =
+        || GeomError::Degenerate("an advanced face whose edges are not on its own surface".into());
+    let (out_points, uv, has_apex) =
+        super::surface_regions::invert_loop(surface, points, tol, false).ok_or_else(off_surface)?;
+    if has_apex
+        && single
+        && (loop_area(&uv) > 0.0) != same_sense
+        && let Some((long_points, long_uv, _)) =
+            super::surface_regions::invert_loop(surface, points, tol, true)
+        && (loop_area(&long_uv) > 0.0) == same_sense
+    {
+        return Ok((long_points, long_uv));
     }
-    let steps = ((previous - value) / period).round();
-    value + steps * period
+    Ok((out_points, uv))
+}
+
+/// Flip interior edges until no vertex lies inside a neighbour's circumcircle
+/// in (u, v). Slivers left by ear clipping and by bisection have chords far
+/// from the surface for their size, and their area is mostly that gap.
+fn delaunay_flips(
+    uv: &[DVec2],
+    triangles: &mut [[u32; 3]],
+    boundary: &std::collections::HashSet<(u32, u32)>,
+    seeds: Option<&[bool]>,
+) {
+    const NONE: usize = usize::MAX;
+    let key = |a: u32, b: u32| (a.min(b), a.max(b));
+    let mut users: rustc_hash::FxHashMap<(u32, u32), [usize; 2]> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(
+            triangles.len() * 3 / 2 + 1,
+            Default::default(),
+        );
+    let mut queue: Vec<(u32, u32)> = Vec::new();
+    for (index, triangle) in triangles.iter().enumerate() {
+        let seeded = seeds.is_none_or(|flags| flags.get(index).copied().unwrap_or(true));
+        for step in 0..3 {
+            let edge = key(triangle[step], triangle[(step + 1) % 3]);
+            let slots = users.entry(edge).or_insert([NONE, NONE]);
+            if slots[0] == NONE {
+                slots[0] = index;
+            } else if slots[1] == NONE {
+                slots[1] = index;
+            }
+            if seeded && !boundary.contains(&edge) {
+                queue.push(edge);
+            }
+        }
+    }
+    queue.sort_unstable();
+    queue.dedup();
+    let inside_circumcircle = |a: DVec2, b: DVec2, c: DVec2, d: DVec2| {
+        let (ax, ay) = (a.x - d.x, a.y - d.y);
+        let (bx, by) = (b.x - d.x, b.y - d.y);
+        let (cx, cy) = (c.x - d.x, c.y - d.y);
+        let det = (ax * ax + ay * ay) * (bx * cy - cx * by)
+            - (bx * bx + by * by) * (ax * cy - cx * ay)
+            + (cx * cx + cy * cy) * (ax * by - bx * ay);
+        let orientation = (b - a).perp_dot(c - a);
+        det * orientation.signum() > 1e-12 * orientation.abs().max(1e-300)
+    };
+    let orient = |x: u32, y: u32, z: u32| {
+        (uv[y as usize] - uv[x as usize]).perp_dot(uv[z as usize] - uv[x as usize])
+    };
+    let move_user = |users: &mut rustc_hash::FxHashMap<(u32, u32), [usize; 2]>,
+                     edge: (u32, u32),
+                     from: usize,
+                     to: usize| {
+        if let Some(slots) = users.get_mut(&edge)
+            && let Some(slot) = slots.iter_mut().find(|slot| **slot == from)
+        {
+            *slot = to;
+        }
+    };
+    // Lawson's walk ends on its own; the budget is a guard, not a limit reached.
+    let mut budget = triangles.len().saturating_mul(4).max(64);
+    while let Some(edge) = queue.pop() {
+        if budget == 0 {
+            break;
+        }
+        let Some(&[first, second]) = users.get(&edge) else {
+            continue;
+        };
+        if first == NONE || second == NONE {
+            continue;
+        }
+        let t1 = triangles[first];
+        let Some(step) = (0..3).find(|&step| key(t1[step], t1[(step + 1) % 3]) == edge) else {
+            continue;
+        };
+        let (a, b, c1) = (t1[step], t1[(step + 1) % 3], t1[(step + 2) % 3]);
+        let t2 = triangles[second];
+        let Some(c2) = t2.iter().copied().find(|&v| v != a && v != b) else {
+            continue;
+        };
+        let (pa, pb, pc1, pc2) = (
+            uv[a as usize],
+            uv[b as usize],
+            uv[c1 as usize],
+            uv[c2 as usize],
+        );
+        // Only a convex quadrilateral can be flipped without folding.
+        let diagonal = pc2 - pc1;
+        if diagonal.perp_dot(pa - pc1) * diagonal.perp_dot(pb - pc1) >= 0.0
+            || (pb - pa).perp_dot(pc1 - pa) * (pb - pa).perp_dot(pc2 - pa) >= 0.0
+            || !inside_circumcircle(pa, pb, pc1, pc2)
+        {
+            continue;
+        }
+        let sign = orient(t1[0], t1[1], t1[2]);
+        let mut new1 = [a, c2, c1];
+        let mut new2 = [b, c1, c2];
+        if orient(new1[0], new1[1], new1[2]) * sign < 0.0 {
+            new1.swap(1, 2);
+        }
+        if orient(new2[0], new2[1], new2[2]) * sign < 0.0 {
+            new2.swap(1, 2);
+        }
+        triangles[first] = new1;
+        triangles[second] = new2;
+        users.remove(&edge);
+        users.insert(key(c1, c2), [first, second]);
+        move_user(&mut users, key(b, c1), first, second);
+        move_user(&mut users, key(a, c2), second, first);
+        for next in [key(a, c1), key(b, c1), key(a, c2), key(b, c2)] {
+            if !boundary.contains(&next) {
+                queue.push(next);
+            }
+        }
+        budget -= 1;
+    }
 }
 
 /// Add points inside a patch until it follows its surface within tolerance.
@@ -1912,7 +2100,11 @@ fn refine_patch(
             .collect()
     };
 
+    // Flips come before each round's check, so what a flip makes is measured
+    // and split before the patch is accepted.
+    let mut changed: Option<Vec<bool>> = None;
     for _ in 0..MAX_REFINEMENT_ROUNDS {
+        delaunay_flips(uv, triangles, &boundary, changed.as_deref());
         let mut marked: std::collections::HashSet<(u32, u32)> = Default::default();
         let mut centres: Vec<usize> = Vec::new();
         for (index, triangle) in triangles.iter().enumerate() {
@@ -1967,11 +2159,14 @@ fn refine_patch(
         }
 
         let mut next: Vec<[u32; 3]> = Vec::with_capacity(triangles.len() * 2);
+        // Which triangles this round made, so the next flip walk starts from them.
+        let mut made: Vec<bool> = Vec::with_capacity(triangles.len() * 2);
         for (index, triangle) in triangles.iter().enumerate() {
             if let Some(&centre) = centre_of.get(&index) {
                 for step in 0..3 {
                     next.push([triangle[step], triangle[(step + 1) % 3], centre]);
                 }
+                made.resize(next.len(), true);
                 continue;
             }
             let cut: Vec<Option<u32>> = (0..3)
@@ -1980,6 +2175,7 @@ fn refine_patch(
                     middle.get(&(a.min(b), a.max(b))).copied()
                 })
                 .collect();
+            let before = next.len();
             match cut.iter().filter(|entry| entry.is_some()).count() {
                 0 => next.push(*triangle),
                 1 => {
@@ -2015,8 +2211,10 @@ fn refine_patch(
                     next.push([ab, bc, ca]);
                 }
             }
+            made.resize(next.len(), next.len() > before + 1);
         }
         *triangles = next;
+        changed = Some(made);
     }
     if triangles
         .iter()
@@ -2062,12 +2260,51 @@ fn deviation(
             continue;
         }
         let middle = (parameters[step] + parameters[next]) * 0.5;
-        let chord = (corners[step] + corners[next]) * 0.5;
-        worst = worst.max((surface.point(middle) - chord).length());
+        worst = worst.max(distance_to_segment(
+            surface.point(middle),
+            corners[step],
+            corners[next],
+        ));
     }
     let centre = (parameters[0] + parameters[1] + parameters[2]) / 3.0;
-    let flat = (corners[0] + corners[1] + corners[2]) / 3.0;
-    worst.max((surface.point(centre) - flat).length())
+    worst.max(distance_to_triangle(
+        surface.point(centre),
+        corners[0],
+        corners[1],
+        corners[2],
+    ))
+}
+
+/// Distance from a point to a segment.
+fn distance_to_segment(point: DVec3, a: DVec3, b: DVec3) -> f64 {
+    let span = b - a;
+    let length = span.length_squared();
+    let t = if length > 0.0 {
+        ((point - a).dot(span) / length).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    point.distance(a + span * t)
+}
+
+/// Distance from a point to a triangle: to its plane inside it, else to its edges.
+fn distance_to_triangle(point: DVec3, a: DVec3, b: DVec3, c: DVec3) -> f64 {
+    let normal = (b - a).cross(c - a);
+    let area2 = normal.length();
+    if area2 > 1e-300 {
+        let normal = normal / area2;
+        let offset = (point - a).dot(normal);
+        let foot = point - normal * offset;
+        let inside = [(a, b), (b, c), (c, a)]
+            .iter()
+            .all(|(p, q)| (*q - *p).cross(foot - *p).dot(normal) >= 0.0);
+        if inside {
+            return offset.abs();
+        }
+    }
+    distance_to_segment(point, a, b)
+        .min(distance_to_segment(point, b, c))
+        .min(distance_to_segment(point, c, a))
 }
 
 /// Tessellate a ruled patch between two conic boundary edges.
@@ -2218,6 +2455,7 @@ fn append_face(ctx: &EvalCtx<'_>, face: Entity<'_>, mesh: &mut Mesh64) -> Result
         .ok_or_else(|| GeomError::missing("Bounds"))?;
     let mut outer: Vec<DVec3> = Vec::new();
     let mut holes: Vec<Vec<DVec3>> = Vec::new();
+    let mut outer_reversed = false;
 
     for value in bounds {
         let Some(bound) = value.as_entity() else {
@@ -2231,11 +2469,13 @@ fn append_face(ctx: &EvalCtx<'_>, face: Entity<'_>, mesh: &mut Mesh64) -> Result
             continue;
         }
         // Orientation false means the loop runs the other way round.
-        if !bound.attr("Orientation").as_bool().unwrap_or(true) {
+        let reversed = !bound.attr("Orientation").as_bool().unwrap_or(true);
+        if reversed {
             points.reverse();
         }
         if bound.is_a("IfcFaceOuterBound") || outer.is_empty() {
             outer = points;
+            outer_reversed = reversed;
         } else {
             holes.push(points);
         }
@@ -2247,16 +2487,56 @@ fn append_face(ctx: &EvalCtx<'_>, face: Entity<'_>, mesh: &mut Mesh64) -> Result
         ));
     }
 
+    // An IfcTextureMap lists a coordinate per corner of the outer loop.
+    let uvs = face_texture_uvs(ctx, face, outer.len(), outer_reversed);
     let indices = triangulate_face(&outer, &holes)?;
     let base = mesh.positions.len() as u32;
     mesh.positions.extend_from_slice(&outer);
     for hole in &holes {
         mesh.positions.extend_from_slice(hole);
     }
+    crate::eval::uv::push_face_uvs(mesh, base as usize, &outer, &holes, uvs.as_deref());
     for triangle in indices.chunks_exact(3) {
         mesh.push_triangle(base + triangle[0], base + triangle[1], base + triangle[2]);
     }
     Ok(())
+}
+
+/// The coordinates an `IfcTextureMap` gives a face's outer loop, in the
+/// loop's drawn order; a map of the wrong length is noted and ignored.
+fn face_texture_uvs(
+    ctx: &EvalCtx<'_>,
+    face: Entity<'_>,
+    corners: usize,
+    reversed: bool,
+) -> Option<Vec<[f32; 2]>> {
+    if !ctx.settings.textures {
+        return None;
+    }
+    let map = ctx.model.entity(ctx.face_texture_map_of(face.id())?)?;
+    let mut uvs: Vec<[f32; 2]> = map
+        .attr("Vertices")
+        .as_list()?
+        .filter_map(|value| {
+            let mut values = value.as_entity()?.attr("Coordinates").as_list()?.floats();
+            Some([values.next()? as f32, values.next()? as f32])
+        })
+        .collect();
+    if uvs.len() != corners {
+        ctx.diag.info(
+            codes::TEXTURE_MAP_IGNORED,
+            face.id(),
+            format!(
+                "the texture map lists {} coordinates for a loop of {corners} corners",
+                uvs.len()
+            ),
+        );
+        return None;
+    }
+    if reversed {
+        uvs.reverse();
+    }
+    Some(uvs)
 }
 
 /// Points of an `IfcPolyLoop`.
@@ -2461,9 +2741,9 @@ fn evaluate_boolean(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Mesh64, GeomE
     ctx.record_boolean(item.id(), inherited.merge(own));
     if let Some(reason) = complaint {
         ctx.diag.warn(
-            codes::BOOLEAN_UNSUPPORTED_IN_CLIP_MODE,
+            codes::BOOLEAN_REFUSED,
             item.id(),
-            format!("{operator} not performed in clip-only mode ({reason}); body emitted un-cut"),
+            format!("{operator} not performed ({reason}); body emitted un-cut"),
         );
     }
     Ok(mesh)
@@ -2523,7 +2803,7 @@ pub fn evaluate_difference(
         // A chain that comes back to an operand it already visited never ends.
         if !seen.insert(current.id()) {
             ctx.diag.warn(
-                codes::BOOLEAN_UNSUPPORTED_IN_CLIP_MODE,
+                codes::BOOLEAN_REFUSED,
                 item.id(),
                 "a boolean result whose first operand chain forms a cycle",
             );
@@ -2535,7 +2815,7 @@ pub fn evaluate_difference(
             operands.push(second);
         } else {
             ctx.diag.warn(
-                codes::BOOLEAN_UNSUPPORTED_IN_CLIP_MODE,
+                codes::BOOLEAN_REFUSED,
                 current.id(),
                 "boolean SecondOperand is missing",
             );
@@ -2705,6 +2985,42 @@ pub struct MappedPart {
     pub mesh: Arc<Mesh64>,
     /// The style on the item itself, if it has one.
     pub colour: Option<Rgba>,
+    /// The item's material, when textures are wanted and the file styles it.
+    pub material: Option<Arc<crate::style::Material>>,
+}
+
+/// The item's material, read only when textures are wanted, and the mesh's
+/// coordinates generated when its texture asks for them.
+fn mapped_material(
+    ctx: &EvalCtx<'_>,
+    item: Entity<'_>,
+    mesh: &mut Mesh64,
+) -> Option<Arc<crate::style::Material>> {
+    if !ctx.settings.textures {
+        return None;
+    }
+    let material = crate::style::item_material(ctx, item);
+    if let Some(texture) = material
+        .as_ref()
+        .and_then(|material| material.texture.as_ref())
+        && let Some(generator) = &texture.generator
+        && !mesh.has_uvs()
+        && !mesh.is_empty()
+    {
+        if generator.mode.eq_ignore_ascii_case("COORD") {
+            crate::eval::uv::generate_planar_uvs(mesh);
+        } else {
+            ctx.diag.info(
+                codes::TEXTURE_GENERATOR_UNSUPPORTED,
+                item.id(),
+                format!(
+                    "texture coordinates generated by {} are not computed; the texture is carried without them",
+                    generator.mode
+                ),
+            );
+        }
+    }
+    material
 }
 
 /// One use of a mapped representation: the shared source and where it goes.
@@ -2750,20 +3066,24 @@ pub fn mapped_item_use(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<MappedUse,
                 && let Some(groups) = crate::eval::tessellated::coloured_parts(ctx, entity)
             {
                 let own = crate::style::item_style(ctx, entity);
-                for (colour, mesh) in groups {
+                for (colour, mut mesh) in groups {
+                    let material = mapped_material(ctx, entity, &mut mesh);
                     source_parts.push(MappedPart {
                         mesh: Arc::new(mesh),
                         colour: colour.or(own),
+                        material,
                     });
                 }
                 continue;
             }
             match registry.solid(ctx, entity) {
-                Ok(mesh) => {
+                Ok(mut mesh) => {
                     if !mesh.is_empty() {
+                        let material = mapped_material(ctx, entity, &mut mesh);
                         source_parts.push(MappedPart {
                             mesh: Arc::new(mesh),
                             colour: crate::style::item_style(ctx, entity),
+                            material,
                         });
                     }
                 }
@@ -2809,6 +3129,7 @@ pub fn mapped_item_parts(
             MappedPart {
                 mesh: Arc::new(mesh),
                 colour: part.colour,
+                material: part.material.clone(),
             }
         })
         .collect())
@@ -3592,9 +3913,7 @@ mod tests {
             "the un-cut body comes through whole"
         );
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.code == codes::BOOLEAN_UNSUPPORTED_IN_CLIP_MODE),
+            diagnostics.iter().any(|d| d.code == codes::BOOLEAN_REFUSED),
             "the caller must be told the cut did not happen"
         );
     }

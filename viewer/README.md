@@ -20,8 +20,10 @@ npm or CDN dependencies.
   geometry and retaining unrelated GPU resources.
 - Run scripts against the model from the **Session** panel: JavaScript in the
   browser, on a local `tessifc-mcp` host, or Python with IfcOpenShell through
-  a local session. Ask an assistant to explain the model or propose edits, or
-  watch an agent connected over MCP build one from nothing.
+  a local session. A browser script that runs past the limit in **Settings**
+  is stopped and the model reopens at its last revision. Ask an assistant to
+  explain the model or propose edits, or watch an agent connected over MCP
+  build one from nothing.
 
 Reads IFC2X3, IFC4 and IFC4X3. Geometry support varies by representation; see
 [geometry coverage](../docs/coverage.md) and the [preview contract](../docs/preview.md).
@@ -65,6 +67,15 @@ Left-drag to orbit, right-drag or Shift-drag to pan, and scroll to zoom.
 Clicking an element selects it and moves the orbit and zoom centre to the
 surface you clicked, so scrolling afterwards takes you into that element
 however far the model's bounds extend. Double-click an element to frame it.
+While you move the view from inside a model, groups of products entirely
+behind its largest walls and slabs are left out of the frame and drawn again
+the moment you stop (**Skip hidden geometry while moving** in Settings).
+Large meshes are simplified in the background once a model is on screen and
+the simpler version is drawn while you move; the frame at rest always shows
+the full detail (**Coarser meshes while moving** in Settings).
+**Show textures** in Settings reads the file's surface textures for files
+opened afterwards and paints them on the products that carry texture
+coordinates; images referenced by path load only from the page's own origin.
 On touch screens, use one finger to orbit and two fingers to pan or pinch to
 zoom. The dock on the left of the viewport keeps zoom, fit, the standard
 views, measure, section, display style and **Show all** one click away; a dot
@@ -92,10 +103,9 @@ Requires Node 20+. From the repository root:
 
 ```sh
 python scripts/build-wasm.py --target both
-npm ci --prefix viewer
-cd viewer
+npm ci
 npx playwright install chromium
-npm test
+npm --prefix viewer test
 ```
 
 Runs unit tests and browser rendering checks. Set

@@ -20,17 +20,33 @@
 pub mod diag;
 pub mod edit;
 pub mod hash;
+#[cfg(feature = "ifczip")]
+pub mod ifczip;
 pub mod image;
 pub mod parse;
 pub mod strings;
 pub mod tape;
 
 pub use diag::{DiagCode, Diagnostic, Diagnostics, Severity};
-pub use edit::{
-    AttributeEdit, EditError, EditValue, apply_edits, argument_source, leaf_argument_source,
-};
+#[cfg(feature = "edit")]
+pub use edit::{AttributeEdit, EditValue, apply_edits};
+pub use edit::{EditError, argument_source, leaf_argument_source};
+#[cfg(feature = "ifczip")]
+pub use ifczip::{UnzipOptions, ZipError, is_ifczip, open, open_source, unzip_ifc};
 pub use image::{Header, IndexEntry, ModelImage};
 pub use parse::{ParseOptions, parse};
+
+/// Parse plain STEP; this build was made without the `ifczip` feature.
+#[cfg(not(feature = "ifczip"))]
+pub fn open(bytes: &[u8], opts: &ParseOptions) -> ModelImage {
+    parse(bytes, opts)
+}
+
+/// Parse plain STEP and hand the bytes back; this build reads no archives.
+#[cfg(not(feature = "ifczip"))]
+pub fn open_source(bytes: Vec<u8>, opts: &ParseOptions) -> (ModelImage, Vec<u8>) {
+    (parse(&bytes, opts), bytes)
+}
 pub use strings::{StrId, StringArena};
 pub use tape::{Cursor, RawValue};
 

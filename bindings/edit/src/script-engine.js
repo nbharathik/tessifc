@@ -124,7 +124,12 @@ export function encodeStepString(text) {
   return out + "'";
 }
 
-/** Parse one STEP value starting at `index`; returns the value and the index after it. */
+/**
+ * Parse one STEP value starting at `index`; returns the value and the index after it.
+ * @param {string} text
+ * @param {number} [index]
+ * @returns {{ value: unknown, end: number }}
+ */
 export function parseValue(text, index = 0) {
   let i = index;
   while (i < text.length && /\s/.test(text[i])) i += 1;
@@ -368,9 +373,13 @@ export function newGuid(random = crypto) {
 
 // ------------------------------------------------------------ the engine
 
+/** @typedef {ReturnType<typeof createScriptEngine>} ScriptEngine */
+
 /**
  * Create the script engine over an open model. `kernel` is the WASM kernel
  * holding `modelId`; the engine never changes it, it only builds a snapshot.
+ * @param {import("./types.js").Kernel} kernel
+ * @param {number} modelId
  */
 export function createScriptEngine(kernel, modelId) {
   const infoCache = new Map();
@@ -507,15 +516,19 @@ export function createScriptEngine(kernel, modelId) {
 
   function entity(id) {
     const target = { [ENTITY]: id };
+    /** @param {string | symbol} prop */
+    const read = (prop) => {
+      if (prop === ENTITY || prop === "id") return id;
+      if (prop === "type" || prop === "class") return className(id);
+      if (prop === "is") return (name) => isA(id, name);
+      if (prop === "attributes") return () => Object.fromEntries((info(id)?.fields ?? []).map((item) => [item.name, attributeValue(id, item.name)]));
+      if (prop === "toString" || prop === "toJSON" || prop === Symbol.toPrimitive) return () => `#${id}`;
+      if (prop === "inspect" || prop === Symbol.iterator || typeof prop !== "string") return undefined;
+      return attributeValue(id, prop);
+    };
     return new Proxy(target, {
       get(_, prop) {
-        if (prop === ENTITY || prop === "id") return id;
-        if (prop === "type" || prop === "class") return className(id);
-        if (prop === "is") return (name) => isA(id, name);
-        if (prop === "attributes") return () => Object.fromEntries((info(id)?.fields ?? []).map((item) => [item.name, attributeValue(id, item.name)]));
-        if (prop === "toString" || prop === "toJSON" || prop === Symbol.toPrimitive) return () => `#${id}`;
-        if (prop === "inspect" || prop === Symbol.iterator || typeof prop !== "string") return undefined;
-        return attributeValue(id, prop);
+        return read(prop);
       },
       set(_, prop, value) {
         if (typeof prop !== "string") return false;
@@ -529,7 +542,7 @@ export function createScriptEngine(kernel, modelId) {
         return ["id", "type", ...(info(id)?.fields ?? []).map((item) => item.name)];
       },
       getOwnPropertyDescriptor(_, prop) {
-        return { enumerable: true, configurable: true, value: this.get(_, prop) };
+        return { enumerable: true, configurable: true, value: read(prop) };
       },
     });
   }
@@ -851,7 +864,13 @@ export function createScriptEngine(kernel, modelId) {
   };
 }
 
-/** Run a script; returns `{ ok, stdout, error, line, changed, operations }` and leaves the snapshot in the engine. */
+/**
+ * Run a script; returns `{ ok, stdout, error, traceback, changed, operations }` and leaves the snapshot in the engine.
+ * @param {ScriptEngine} engine
+ * @param {string} source
+ * @param {import("./types.js").Selection | null} selection
+ * @returns {import("./types.js").ScriptReport}
+ */
 export function runScript(engine, source, selection) {
   const selected = engine.resolve(selection);
   let compiled;

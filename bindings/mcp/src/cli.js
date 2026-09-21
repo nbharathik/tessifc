@@ -6,7 +6,8 @@
 //!
 //!   tessifc-mcp [model.ifc] [--new] [--force] [--schema IFC4] [--units m]
 //!               [--storeys "Ground floor:0,Upper floor:3"] [--port 8000]
-//!               [--no-viewer] [--no-save] [--root <checkout>]
+//!               [--no-viewer] [--no-save] [--script-timeout-ms 30000]
+//!               [--root <checkout>]
 
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
@@ -34,24 +35,38 @@ const { values, positionals } = parseArgs({
     port: { type: "string", default: "8000" },
     "no-viewer": { type: "boolean", default: false },
     "no-save": { type: "boolean", default: false },
+    "script-timeout-ms": { type: "string", default: "30000" },
     root: { type: "string" },
     help: { type: "boolean", default: false },
   },
 });
 
 if (values.help) {
-  console.error(`usage: tessifc-mcp [model.ifc] [--new] [--force] [--schema IFC4] [--units m] [--storeys "Ground floor:0,Upper floor:3"] [--port 8000] [--no-viewer] [--no-save] [--root <checkout>]`);
+  console.error(`usage: tessifc-mcp [model.ifc] [--new] [--force] [--schema IFC4] [--units m] [--storeys "Ground floor:0,Upper floor:3"] [--port 8000] [--no-viewer] [--no-save] [--script-timeout-ms 30000] [--root <checkout>]`);
   process.exit(0);
+}
+const scriptTimeoutMs = Number(values["script-timeout-ms"]);
+if (!Number.isInteger(scriptTimeoutMs) || scriptTimeoutMs < 0) {
+  log("--script-timeout-ms takes a whole number of milliseconds; 0 disables the limit");
+  process.exit(1);
 }
 
 const root = resolve(values.root ?? resolve(here, "../../.."));
 const packageVersion = JSON.parse(readFileSync(resolve(here, "../package.json"), "utf8")).version;
-const kernelModule = resolve(root, "bindings/wasm/pkg-node/tessifc_wasm.js");
-if (!existsSync(kernelModule)) {
-  log(`The Node kernel is missing at ${kernelModule}; build it with: python scripts/build-wasm.py --target both`);
-  process.exit(1);
+const require = createRequire(import.meta.url);
+// The installed package first; a checkout that has not run npm ci falls back to the built files.
+const kernelModule = resolveKernel();
+function resolveKernel() {
+  try {
+    return require.resolve("@tessifc/core/node");
+  } catch {
+    const built = resolve(root, "bindings/wasm/pkg-node/tessifc_wasm.js");
+    if (existsSync(built)) return built;
+    log(`The Node kernel is missing: install @tessifc/core, or build it in a checkout with: python scripts/build-wasm.py --target both`);
+    process.exit(1);
+  }
 }
-const { Kernel } = createRequire(import.meta.url)(kernelModule);
+const { Kernel } = require(kernelModule);
 
 function parseStoreys(text) {
   if (!text) return undefined;
@@ -61,7 +76,7 @@ function parseStoreys(text) {
   });
 }
 
-const host = createModelHost({ Kernel, save: !values["no-save"], log, version: packageVersion });
+const host = createModelHost({ Kernel, save: !values["no-save"], log, version: packageVersion, scriptTimeoutMs, kernelModule });
 const file = positionals[0] ? resolve(positionals[0]) : null;
 if (file && (values.new || !existsSync(file))) {
   if (existsSync(file) && !values.force) {

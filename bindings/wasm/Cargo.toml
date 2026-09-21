@@ -24,6 +24,7 @@ tessifc-schema = { workspace = true }
 tessifc-model = { workspace = true }
 tessifc-geom = { workspace = true }
 tessifc-engine = { workspace = true }
+tessifc-mesh = { workspace = true }
 tessifc-pack = { workspace = true }
 glam = { workspace = true }
 wasm-bindgen = { workspace = true }
@@ -39,7 +40,11 @@ console_error_panic_hook = { workspace = true }
 # Schema features must forward down the dependency chain, or a
 # --no-default-features build still pulls in all three schemas.
 [features]
-default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3", "ifczip", "edit"]
+ifczip = ["tessifc-step/ifczip"]
+# Attribute edits, revisions and patches. A build without it reads and draws
+# only, and the editing session refuses to start on it.
+edit = ["tessifc-step/edit", "tessifc-engine/revision"]
 schema-ifc2x3 = ["tessifc-schema/schema-ifc2x3", "tessifc-step/schema-ifc2x3", "tessifc-model/schema-ifc2x3", "tessifc-geom/schema-ifc2x3", "tessifc-engine/schema-ifc2x3"]
 schema-ifc4 = ["tessifc-schema/schema-ifc4", "tessifc-step/schema-ifc4", "tessifc-model/schema-ifc4", "tessifc-geom/schema-ifc4", "tessifc-engine/schema-ifc4"]
 schema-ifc4x3 = ["tessifc-schema/schema-ifc4x3", "tessifc-step/schema-ifc4x3", "tessifc-model/schema-ifc4x3", "tessifc-geom/schema-ifc4x3", "tessifc-engine/schema-ifc4x3"]

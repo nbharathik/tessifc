@@ -85,11 +85,15 @@ function resultRecord(outcome) {
   };
 }
 
+/** @typedef {ReturnType<typeof createViewerServer>} ViewerServer */
+
 /**
  * Create the server over a model host. `root` is the checkout that holds the
  * viewer and the WASM package; `port` 0 picks a free one. Call `listen()`.
+ * @param {import("./session-host.js").ModelHost} host
+ * @param {{ root: string, port?: number, staticRoots?: string[], log?: (line: string) => void }} options
  */
-export function createViewerServer(host, { root, port = 8000, staticRoots = DEFAULT_ROOTS, log = () => {} } = {}) {
+export function createViewerServer(host, { root, port = 8000, staticRoots = DEFAULT_ROOTS, log = () => {} }) {
   if (!root) throw new Error("createViewerServer needs the checkout root.");
   const token = randomBytes(18).toString("base64url");
   const checkout = resolve(root);
@@ -167,6 +171,7 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
       return;
     }
     try {
+      /** @type {Record<string, any>} */
       let result;
       if (url.pathname === "/__tessifc/run") {
         result = resultRecord(await host.run(String(body.script ?? ""), body.selection ?? null));
@@ -221,7 +226,7 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
         server.once("error", fail);
         server.listen(port, "127.0.0.1", () => {
           server.off("error", fail);
-          boundPort = server.address().port;
+          boundPort = /** @type {import("node:net").AddressInfo} */ (server.address()).port;
           done(this.url);
         });
       });

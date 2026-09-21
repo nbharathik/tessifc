@@ -16,6 +16,8 @@ Usage:
     python scripts/build-wasm.py --target web         # browsers only
     python scripts/build-wasm.py --target nodejs      # what the smoke test uses
     python scripts/build-wasm.py --profile wasm-release   # smaller, slower
+    python scripts/build-wasm.py --sections           # what the bytes are spent on
+    python scripts/build-wasm.py --keep-names         # a module twiggy can read
 
 Exit codes:
 
@@ -58,6 +60,16 @@ WASM_OPT_FLAGS = [
     "--enable-reference-types",
     "--enable-multivalue",
 ]
+# A shipped module carries no symbol names and no toolchain telemetry; a
+# profiling build (--keep-names) keeps both so twiggy can attribute bytes.
+BINDGEN_STRIP_FLAGS = ["--remove-name-section", "--remove-producers-section"]
+WASM_OPT_STRIP_FLAGS = ["--strip-debug", "--strip-producers"]
+WASM_OPT_KEEP_FLAGS = ["-g"]
+
+SECTION_NAMES = {
+    0: "custom", 1: "type", 2: "import", 3: "function", 4: "table", 5: "memory", 6: "global",
+    7: "export", 8: "start", 9: "element", 10: "code", 11: "data", 12: "data count",
+}
 
 # Older binaryen releases rewrite the module's exported externref table to
 # point at the function table, and the glue then fails at start-up with
@@ -203,9 +215,14 @@ def check_wasm_bindgen(wanted: str) -> str:
     return tool
 
 
-def cargo_build(cargo: str, profile: str, features: str | None, no_default: bool) -> Path:
+def cargo_build(
+    cargo: str, profile: str, features: str | None, no_default: bool, keep_names: bool
+) -> Path:
     command = [cargo, "build", "--locked", "--target", WASM_TARGET, "-p", CRATE]
     command += ["--release"] if profile == "release" else ["--profile", profile]
+    # The profiles strip symbols; a profiling build keeps them for twiggy.
+    if keep_names:
+        command += ["--config", f"profile.{profile}.strip=false"]
     # Feature selection is how the single-schema build is
     # actually produced, and the only way to check that the claim is true:
     #   --no-default-features --features tessifc-schema/schema-ifc4
@@ -229,10 +246,13 @@ def cargo_build(cargo: str, profile: str, features: str | None, no_default: bool
     return artefact
 
 
-def run_bindgen(tool: str, flavour: str, artefact: Path) -> Path:
+def run_bindgen(tool: str, flavour: str, artefact: Path, keep_names: bool) -> Path:
     out_dir = OUT_DIRS[flavour]
     out_dir.mkdir(parents=True, exist_ok=True)
-    command = [tool, "--target", flavour, "--out-dir", str(out_dir), str(artefact)]
+    command = [tool, "--target", flavour, "--out-dir", str(out_dir)]
+    if not keep_names:
+        command += BINDGEN_STRIP_FLAGS
+    command.append(str(artefact))
     if run(command, REPO) != 0:
         say()
         say(f"ERROR: wasm-bindgen failed for --target {flavour}.")
@@ -342,7 +362,7 @@ def table_exports(data: bytes) -> dict[str, tuple[int, int | None]]:
     return {name: tables[index] for name, index in exports.items() if index < len(tables)}
 
 
-def run_wasm_opt(wasm: Path) -> bool:
+def run_wasm_opt(wasm: Path, keep_names: bool) -> bool:
     """Optimise in place. Returns False when it was skipped, which is not an error."""
     tool = find_tool("wasm-opt")
     if tool is None:
@@ -363,7 +383,8 @@ def run_wasm_opt(wasm: Path) -> bool:
 
     before = wasm.stat().st_size
     temporary = wasm.with_suffix(".opt.wasm")
-    command = [tool, *WASM_OPT_FLAGS, str(wasm), "-o", str(temporary)]
+    strip = WASM_OPT_KEEP_FLAGS if keep_names else WASM_OPT_STRIP_FLAGS
+    command = [tool, *WASM_OPT_FLAGS, *strip, str(wasm), "-o", str(temporary)]
     if run(command, REPO) != 0 or not temporary.is_file():
         temporary.unlink(missing_ok=True)
         say("    WARNING: wasm-opt failed, keeping the unoptimised module.")
@@ -391,20 +412,53 @@ def run_wasm_opt(wasm: Path) -> bool:
     return True
 
 
-def report_size(wasm: Path, ceiling: int | None) -> bool:
+def sections(data: bytes) -> list[tuple[str, int, int]]:
+    """Every section of a module as (name, raw bytes, gzipped bytes), largest first."""
+    rows: list[tuple[str, int, int]] = []
+    offset = 8
+    while offset < len(data):
+        section = data[offset]
+        size, offset = read_leb(data, offset + 1)
+        body = data[offset : offset + size]
+        offset += size
+        name = SECTION_NAMES.get(section, f"section {section}")
+        if section == 0:
+            length, at = read_leb(body, 0)
+            name = "custom " + body[at : at + length].decode("utf-8", errors="replace")
+        rows.append((name, size, len(gzip.compress(body, compresslevel=9, mtime=0))))
+    rows.sort(key=lambda row: -row[1])
+    return rows
+
+
+def report_sections(wasm: Path) -> None:
+    data = wasm.read_bytes()
+    say(f"        {'section':28} {'raw':>16} {'gzipped':>16}")
+    for name, raw, compressed in sections(data):
+        say(f"        {name:28} {raw:>16,} {compressed:>16,}")
+    say(f"        {'module':28} {len(data):>16,} {len(gzip.compress(data, compresslevel=9, mtime=0)):>16,}")
+
+
+def report_size(wasm: Path, ceiling: int | None, raw_ceiling: int | None, show_sections: bool) -> bool:
     raw = wasm.stat().st_size
     compressed = len(gzip.compress(wasm.read_bytes(), compresslevel=9, mtime=0))
 
     say(f"    {wasm.relative_to(REPO)}")
     say(f"        raw      {human(raw)}")
     say(f"        gzipped  {human(compressed)}")
-    if ceiling is None:
-        return True
-    say(f"        ceiling  {human(ceiling)}")
-    if compressed > ceiling:
-        say(f"        OVER by {human(compressed - ceiling)}")
-        return False
-    return True
+    if show_sections:
+        report_sections(wasm)
+    within = True
+    if ceiling is not None:
+        say(f"        ceiling  {human(ceiling)} gzipped")
+        if compressed > ceiling:
+            say(f"        OVER by {human(compressed - ceiling)}")
+            within = False
+    if raw_ceiling is not None:
+        say(f"        ceiling  {human(raw_ceiling)} raw")
+        if raw > raw_ceiling:
+            say(f"        OVER by {human(raw - raw_ceiling)}")
+            within = False
+    return within
 
 
 def main() -> int:
@@ -429,6 +483,20 @@ def main() -> int:
         type=int,
         default=None,
         help="fail if the gzipped wasm is larger than this many bytes",
+    )
+    parser.add_argument(
+        "--budget-raw-bytes",
+        type=int,
+        default=None,
+        help="fail if the wasm is larger than this many bytes before compression",
+    )
+    parser.add_argument(
+        "--sections", action="store_true", help="list every section with its raw and gzipped size"
+    )
+    parser.add_argument(
+        "--keep-names",
+        action="store_true",
+        help="keep symbol names and debug sections, for twiggy and other profilers",
     )
     parser.add_argument("--no-opt", action="store_true", help="skip wasm-opt even if it is present")
     parser.add_argument(
@@ -474,25 +542,30 @@ def main() -> int:
             return EXIT_FAILED
         say(f"    skipped, reusing {artefact.relative_to(REPO)}")
     else:
-        artefact = cargo_build(cargo, args.profile, args.features, args.no_default_features)
+        artefact = cargo_build(
+            cargo, args.profile, args.features, args.no_default_features, args.keep_names
+        )
 
     within_ceiling = True
     for flavour in flavours:
         step(f"wasm-bindgen --target {flavour}")
-        produced = run_bindgen(bindgen, flavour, artefact)
+        produced = run_bindgen(bindgen, flavour, artefact, args.keep_names)
 
         step(f"wasm-opt ({flavour})")
         if args.no_opt:
             say("    skipped (--no-opt)")
         else:
-            run_wasm_opt(produced)
+            run_wasm_opt(produced, args.keep_names)
 
         step(f"size ({flavour})")
-        within_ceiling = report_size(produced, args.budget_bytes) and within_ceiling
+        within_ceiling = (
+            report_size(produced, args.budget_bytes, args.budget_raw_bytes, args.sections)
+            and within_ceiling
+        )
 
     say()
     if not within_ceiling:
-        say("FAILED: the module is over the gzipped size you asked for.")
+        say("FAILED: the module is over the size you asked for.")
         say("        Options: build with --profile wasm-release, install binaryen so")
         say("        wasm-opt can run, or drop a schema feature for this build.")
         return EXIT_FAILED

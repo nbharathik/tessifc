@@ -7,12 +7,13 @@
 import { createHash } from "node:crypto";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { createEditingSession } from "../../edit/src/session.js";
-import { createModel } from "../../edit/src/create-model.js";
-import { createSceneMirror, verifyRevision } from "../../edit/src/verify.js";
-import { createScriptEngine } from "../../edit/src/script-engine.js";
-import { JAVASCRIPT_EXAMPLES } from "../../edit/src/examples.js";
-import { describeModel, describeSelection, lengthUnitOf, storeysOf } from "../../edit/src/describe.js";
+import { createEditingSession } from "@tessifc/edit/session";
+import { createModel } from "@tessifc/edit/create-model";
+import { createSceneMirror, verifyRevision } from "@tessifc/edit/verify";
+import { createScriptEngine } from "@tessifc/edit/script-engine";
+import { createScriptRunner } from "@tessifc/edit/script-runner";
+import { JAVASCRIPT_EXAMPLES } from "@tessifc/edit/examples";
+import { describeModel, describeSelection, lengthUnitOf, storeysOf } from "@tessifc/edit/describe";
 
 export const GEOMETRY_SETTINGS = { includeSpaces: true, includeOpenings: true, includeAnnotations: true, includeReferences: true };
 const RENAME_RETRIES = 3;
@@ -47,25 +48,44 @@ async function atomicWrite(target, bytes) {
   }
 }
 
+/** @typedef {ReturnType<typeof createModelHost>} ModelHost */
+
 /**
  * Create the host. `Kernel` is the Node kernel class; `save` writes the file
  * after every commit; `log` receives one line per event (stderr in the CLI).
+ * With `kernelModule` (the path of the Node kernel) scripts run in a worker
+ * thread and are stopped after `scriptTimeoutMs`; without it, or with a limit
+ * of 0, they run in this thread without a limit.
+ * @param {{ Kernel: typeof import("@tessifc/core").Kernel, settings?: Record<string, unknown>, save?: boolean, log?: (line: string) => void, version?: string, scriptTimeoutMs?: number, kernelModule?: string | null }} options
  */
-export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = true, log = () => {}, version: engineVersion = "" } = {}) {
+export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = true, log = () => {}, version: engineVersion = "",
+  scriptTimeoutMs = 30_000, kernelModule = null }) {
   if (!Kernel) throw new Error("createModelHost needs the kernel class.");
   const kernel = new Kernel();
+  const runner = kernelModule && scriptTimeoutMs > 0 ? createScriptRunner({ kernelModule, timeoutMs: scriptTimeoutMs }) : null;
+  /** @type {number | null} */
   let modelId = null;
+  /** @type {import("@tessifc/edit/session").Session | null} */
   let session = null;
+  /** @type {ReturnType<typeof createSceneMirror> | null} */
   let mirror = null;
+  /** @type {string | null} */
   let path = null;
+  /** @type {string | null} */
   let name = null;
+  /** @type {Uint8Array | null} */
   let bytes = null;
+  /** @type {string | null} */
   let version = null;
   let generation = 0;
   let busy = false;
+  /** @type {Record<string, any> | null} */
   let selection = null;
+  /** @type {Record<string, any> | null} */
   let applied = null;
+  /** @type {string | null} */
   let savedVersion = null;
+  /** @type {Set<() => void>} */
   const waiters = new Set();
 
   function requireSession() {
@@ -104,7 +124,11 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
     applied = null;
   }
 
-  /** Open model bytes; `label` names it and `file` is where commits are saved. */
+  /**
+   * Open model bytes; `label` names it and `file` is where commits are saved.
+   * @param {Uint8Array | ArrayBuffer} input
+   * @param {{ name?: string, path?: string | null }} [options]
+   */
   function openBytes(input, { name: label = "model.ifc", path: file = null } = {}) {
     const data = input instanceof Uint8Array ? input : new Uint8Array(input);
     const id = kernel.openModel(data);
@@ -134,7 +158,11 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
     return openBytes(new Uint8Array(data), { name: basename(target), path: target });
   }
 
-  /** A model from nothing (see `createModel`); `path` is where it will be saved. */
+  /**
+   * A model from nothing (see `createModel`); `path` is where it will be saved.
+   * @param {import("@tessifc/edit/create-model").ModelOptions} [options]
+   * @param {{ path?: string | null, force?: boolean }} [target]
+   */
   async function newModel(options = {}, { path: file = null, force = false } = {}) {
     if (session && !path && session.revision !== "0" && !force) {
       throw new Error("The current model is not saved to a file; pass force to drop its changes.");
@@ -164,14 +192,21 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
     return saved;
   }
 
-  /** Run a script; a failing or read-only script publishes nothing. */
+  /**
+   * Run a script; a failing or read-only script publishes nothing.
+   * @param {string} source
+   * @param {import("@tessifc/edit/types").Selection | null} [scriptSelection]
+   * @param {{ commit?: boolean, label?: string }} [options]
+   */
   async function run(source, scriptSelection = null, { commit = true, label = "script" } = {}) {
     requireSession();
     return guard(async () => {
       const started = performance.now();
       let outcome;
       try {
-        outcome = session.runScript(String(source ?? ""), scriptSelection ?? selectionFor(), { commit });
+        const text = String(source ?? "");
+        const target = scriptSelection ?? selectionFor();
+        outcome = runner ? await session.runScriptWith(runner, text, target, { commit }) : session.runScript(text, target, { commit });
       } catch (error) {
         if (error?.committed) {
           refreshSnapshot();
@@ -182,17 +217,20 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
       const { report, delta } = outcome;
       report.elapsedMs = performance.now() - started;
       report.label = label;
+      if (report.timedOut) log(`stopped a ${label} script after ${scriptTimeoutMs} ms`);
       const saved = delta ? await published(delta) : false;
       return { report, delta, saved, version, revision: session.revision };
     });
   }
 
+  /** @param {"undo" | "redo"} action */
   async function restore(action) {
     requireSession();
     return guard(async () => {
       const started = performance.now();
       const delta = action === "redo" ? session.redo() : session.undo();
       const saved = await published(delta);
+      /** @type {import("@tessifc/edit/types").ScriptReport} */
       const report = { ok: true, changed: true, stdout: "", operations: { created: 0, modified: 0, deleted: 0 }, label: action, elapsedMs: performance.now() - started };
       return { report, delta, saved, version, revision: session.revision };
     });
@@ -215,7 +253,11 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
     return { name, version, bytes, revision: session.revision, generation };
   }
 
-  /** Resolve with the current version once it differs from `after`, or after `timeoutMs`. */
+  /**
+   * Resolve with the current version once it differs from `after`, or after `timeoutMs`.
+   * @param {string | null} after
+   * @param {number} timeoutMs
+   */
   function waitForChange(after, timeoutMs) {
     if (!session || version !== after || timeoutMs <= 0) return Promise.resolve(version);
     return new Promise((done) => {
@@ -247,6 +289,7 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
         assistant: null,
         selection: true,
         applied: true,
+        scriptTimeoutMs: runner ? scriptTimeoutMs : 0,
       },
       examples: JAVASCRIPT_EXAMPLES.map((example) => ({ title: example.title, source: example.source })),
       path,
@@ -323,6 +366,7 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
     close,
     dispose() {
       close();
+      runner?.dispose();
       kernel.free();
     },
   };

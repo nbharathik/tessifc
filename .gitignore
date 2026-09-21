@@ -11,6 +11,15 @@ __pycache__/
 .pytest_cache/
 bindings/wasm/pkg/
 bindings/wasm/pkg-node/
+# The extension module maturin develop drops into the package, and wheels.
+bindings/python/python/tessifc/*.pyd
+bindings/python/python/tessifc/*.so
+*.whl
+# Generated from the JSDoc by scripts/build-types.mjs.
+bindings/edit/types/
+bindings/mcp/types/
+bindings/viewer/types/
+adapters/three/types/
 pkg/
 data/
 dev/

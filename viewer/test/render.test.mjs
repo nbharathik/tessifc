@@ -12,6 +12,7 @@ import { checkInteraction } from "./interaction.mjs";
 import { checkRenderWork } from "./render-work.mjs";
 import { checkPicking } from "./picking-render.mjs";
 import { checkDeltaRendering } from "./delta-render.mjs";
+import { checkTextureRendering } from "./texture-render.mjs";
 import { checkScheduling } from "./scheduling.mjs";
 import { checkGpuPacing } from "./gpu-pacing.mjs";
 import { checkSelectionUpdates } from "./selection-updates.mjs";
@@ -90,7 +91,8 @@ try {
   await page.waitForFunction(() => window.__tessifc.loadStatus?.().state === 'empty', null, { timeout:60_000 });
   check(await page.evaluate(() => window.__tessifc.loadStatus().finished), 'a model without geometry reaches an explicit terminal state');
   await page.setInputFiles("#file-input", model);
-  await page.waitForFunction(() => window.__tessifc.ready(), null, { timeout: 300_000 });
+  // The empty model above already counts as ready; wait for the drawable one to replace it.
+  await page.waitForFunction(() => window.__tessifc.ready() && window.__tessifc.loadStatus().state === "ready", null, { timeout: 300_000 });
   // The overlay assertions below measure the settled overlay, so wait for the plane analysis.
   await page.waitForFunction(() => window.__tessifc.overlaySettled(), null, { timeout: 120_000 });
   const overlay = await page.evaluate(() => ({
@@ -106,6 +108,7 @@ try {
   await checkRenderWork(page, check);
   await checkPicking(page, check);
   await checkDeltaRendering(page, check);
+  await checkTextureRendering(page, check);
   await checkScheduling(page, check);
   await checkGpuPacing(page, check);
   await checkSelectionUpdates(page, check);

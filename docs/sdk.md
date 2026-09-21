@@ -16,6 +16,7 @@ page; registry installation applies after publication.
 | `@tessifc/viewer` | npm | The WebGL2 renderer behind the reference viewer as an embeddable component: open, stream, select, hide, section, frame, apply deltas, follow a session. | preview |
 | `@tessifc/mcp` | npm | A Model Context Protocol server over the kernel for Claude Code, Claude Desktop and other MCP clients, with the loopback viewer server. | preview |
 | `@tessifc/three` | npm | Shape arrays to three.js meshes, a retained scene that applies deltas, camera fitting and cleanup. | preview |
+| `tessifc` | wheel on the Releases page | The kernel as a native Python extension: open, report, evaluate across every core, pack and stream, with a zero-copy IGP reader; NumPy optional. | preview |
 | `tessifc-session` | source only | The optional Python editing session behind the viewer's Session panel, with the same MCP tools over IfcOpenShell (`[mcp]` extra). | preview |
 | `tessifc-cli` | crates.io | The `tessifc` binary: `info`, `convert`, `edit`, `coverage`. | preview |
 | `tessifc-step`, `-schema`, `-model`, `-geom`, `-mesh`, `-pack`, `-engine` | crates.io | The kernel crates, for Rust hosts and for people writing evaluators. | preview |
@@ -83,7 +84,7 @@ crosses as typed arrays, which is the one place the cost is measurable.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `openModel(bytes, settings?)` | model id | Recoverable parse errors become diagnostics; check model info and diagnostics. Invalid settings can throw; resource failures may trap. Settings: `schemaOverride`, `maxEntities`. |
+| `openModel(bytes, settings?)` | model id | Plain IFC or an IFCZIP archive, which is inflated and kept as the plain text inside it (`E_IFCZIP_MALFORMED` and `E_IFCZIP_TOO_LARGE` refuse an archive; `W_IFCZIP_MULTIPLE_ENTRIES` says the first `.ifc` entry of several was taken). Recoverable parse errors become diagnostics; check model info and diagnostics. Invalid settings can throw; resource failures may trap. Settings: `schemaOverride`, `maxEntities`, `maxIfczipBytes`. |
 | `closeModel(id)` | boolean | Frees the model and its geometry. |
 | `closeAll()` | | |
 | `modelCount()` | number | |
@@ -126,6 +127,14 @@ Or per shape, for a host that wants arrays rather than a container:
 `shapeCount`, `shapeExpressId`, `shapeClass`, `shapePartCount`, `shapeColor`,
 `shapePositions`, `shapeIndices`. Positions are f32 in metres with the model
 offset removed; add `summary.modelOffset` back in f64 for world coordinates.
+With the `textures` setting on, `shapeUv(id, index, part)` returns two f32
+per vertex of that part, or nothing when the part carries no texture
+coordinates; the summary counts `materials` and `textures`. The module-level
+`simplifyMesh(positions, indices, settings)` returns a coarser index array
+over the same vertices (`{ chordToleranceM, level }`), or nothing when the
+mesh is small, open in a way that pins every vertex, or cannot lose a
+quarter of its triangles within the tolerance; it is what `lodLevels` runs
+inside the kernel, offered so a host can compute levels after a load.
 
 Geometry settings use the same JSON field names and defaults as Rust `Settings`
 and CLI `convert --settings '<json>'`. Known fields with the wrong type or out-of-range
@@ -148,6 +157,12 @@ Evaluation and stream summaries return `effectiveSettings`.
 | `includeOpenings` | `false` | Include opening and voiding-feature geometry |
 | `includeAnnotations` | `false` | Include available annotation and grid geometry |
 | `includeReferences` | `false` | Include available port, positioning and analysis geometry |
+| `maxTotalTriangles` | `null` | Stop evaluating once the model holds this many triangles; positive, or unset for no limit |
+| `maxTotalVertices` | `null` | Stop evaluating once the model holds this many vertices; positive, or unset for no limit |
+| `maxGeometryMs` | `null` | Stop evaluating after this much wall time in milliseconds; positive, or unset for no limit |
+| `textures` | `false` | Read surface materials and textures and carry texture coordinates into the pack |
+| `maxTextureBytes` | `16777216` | Largest embedded or pixel texture read; larger ones are left out with a diagnostic |
+| `lodLevels` | `0` | Coarse levels (`1` or `2`) written for large meshes as extra `lod` geometry entries that share the base vertices; viewers draw them while the camera moves |
 
 A segment count or refinement budget can prevent the requested tolerance from being
 met. Such output carries `W_TESSELLATION_TOLERANCE_UNMET`; it is not an accuracy
@@ -169,6 +184,34 @@ exactly. Strict conversion rejects all of these repairs.
 Increasing `maxSurfaceVertices` can admit more detailed patches but increases
 memory and work per face. It does not repair invalid topology or guarantee that
 the chord tolerance can be met. This is a per-patch limit, not a model-wide budget.
+
+The model-wide budgets are `maxTotalTriangles`, `maxTotalVertices` and
+`maxGeometryMs`. They are unset by default, because a tripped budget changes the
+output. They are checked between products, never inside one, so the tally can
+overshoot by one product, or by a few on a multi-threaded run, where which
+products are skipped depends on scheduling. A tripped budget ends the run: the
+summary and the stream progress carry `limitReached` (`which`, `limit`,
+`reached`, `productsSkipped`), the final chunk's `stats` carry `limit_reached`
+and `products_skipped`, one model-level `E_GEOMETRY_LIMIT_REACHED` diagnostic
+is emitted, every unevaluated product has the outcome `skipped_by_limit`, and
+`convert --strict` refuses the output. A browser host that wants a first
+picture within a few seconds sets `maxGeometryMs` for a first pass and
+evaluates the skipped products in a second session.
+
+`textures: true` reads `IfcSurfaceStyleRendering` beyond its colour (diffuse
+and specular colours, shininess or roughness, the reflectance method) and the
+first layer of `IfcSurfaceStyleWithTextures`, carries `IfcIndexedTextureMap`
+and `IfcTextureMap` coordinates on tessellated and BRep faces, and computes
+the `COORD` texture coordinate generator; other generators are noted with
+`I_TEXTURE_GENERATOR_UNSUPPORTED` and the texture is carried without
+coordinates. Image textures keep their path or their embedded bytes; nothing
+is fetched. A map that does not fit its faces is noted with
+`I_TEXTURE_MAP_IGNORED`, further texture layers with `I_TEXTURE_LAYERS_IGNORED`,
+a textured body that a boolean operation rebuilt loses its coordinates with
+`W_TEXTURE_DROPPED_BY_BOOLEAN`, and a texture past the pack's embedding limit
+is written without its bytes with `W_TEXTURE_OMITTED`. The setting is off by
+default so a pack made without it is byte-identical to one from an earlier
+release; the IGP document describes the members it adds.
 
 CLI flags `--circle-segments` and `--chord-tolerance-m` override their JSON fields.
 `convert --strict` returns failure and does not write the requested pack when
@@ -207,10 +250,28 @@ direct and inherited registry routes. Routes describe dispatch, not conformance.
 The native equivalent is `tessifc coverage --inventory`.
 
 `cancelGeometryStream(id)` releases stream caches while keeping the parsed model.
+
+Alignments of IFC4X3 are read as curves stationed along their segments: a
+linear placement lands on its basis curve, a sectioned solid or surface is
+lofted between the sections placed along it, and a sweep along a gradient
+curve is trimmed by distance along it. A parameter value on an alignment
+curve is the distance along it. `W_ALIGNMENT_SEGMENT_GAP`,
+`W_CANT_APPROXIMATED` and `W_LINEAR_PLACEMENT_MISMATCH` say when a file's
+segments, cant or cached positions do not agree with what the curve gives;
+the curve wins, except that a cached position whose axes agree only with
+the placement's `Axis` and `RefDirection` read as world directions says the
+file wrote them that way, and they are read so. The alignment's own `Axis`
+curves are not drawn.
+
 Chunk time limits are checked between products. To interrupt a synchronous product
 operation, terminate its worker and open the model in a new worker.
 
 ### Geometry, patched
+
+The patch, revision and editing methods in this and the next two sections
+come with the kernel's `edit` feature, on by default; a build without it (see
+`bindings/wasm/README.md`) has none of them, and `createEditingSession` says
+so the first time it is asked to change anything.
 
 ```ts
 const patch = kernel.evaluateProducts(id, Uint32Array.from([expressId]), JSON.stringify({
@@ -334,7 +395,8 @@ reports), `historyLimit` and `historyBytes` (how much undo history to keep).
 |---|---|
 | `evaluate()` | Evaluate the whole model; returns `{ pack, summary, outcomes, hierarchy }` and fixes the scene basis. A model with no product geometry evaluates to an empty pack. |
 | `adopt({ modelOffset, nextGeometryId })` | Take over a scene the host built, with the pack's offset and the next free geometry id. |
-| `runScript(source, selection, { commit })` | Run a script; returns `{ report, delta }`, `delta` null when nothing changed. `commit: false` discards edits. |
+| `runScript(source, selection, { commit })` | Run a script in this thread, without a time limit; returns `{ report, delta }`, `delta` null when nothing changed. `commit: false` discards edits. |
+| `runScriptWith(runner, source, selection, { commit, signal })` | The same through a script runner (below): the script runs in a worker thread and a stopped one reports `ok: false` with `timedOut` or `aborted`. Returns a promise. |
 | `setAttributes(edits)` | Publish `{ expressId, attribute, value, raw }` edits, preserving unrelated bytes. |
 | `applySnapshot(bytes)` | Publish an externally edited copy of the file. |
 | `refreshProducts(expressIds)` | Re-tessellate named products without a revision; the host chose the set. |
@@ -412,6 +474,17 @@ and `print`; `API_REFERENCE` is the same list as prose for a prompt:
 | `ifc.contain`, `ifc.void`, `ifc.fill`, `ifc.aggregate` | The containment, voiding, filling and aggregation relationships. |
 | `ifc.inverses(entity, className)`, `ifc.container(product)` | Entities referencing one, including records added or changed earlier in the same script; the containing spatial structure. |
 | `ifc.newGuid()`, `ifc.enum(v)`, `ifc.typed(type, v)`, `ifc.int(n)`, `ifc.context()`, `ifc.schema` | Values that need a marked form, the model context and its schema name. |
+
+In Node, `createScriptRunner({ kernelModule, timeoutMs })` from
+`@tessifc/edit/script-runner` runs scripts in a worker thread with its own
+kernel over a copy of the model, so the host's kernel never executes script
+code and a script that never returns is stopped by ending the thread.
+`session.runScriptWith(runner, source, selection)` publishes the snapshot the
+worker hands back; `runner.run(bytes, source, selection, { commit, signal })`
+is the same without a session. The worker stays warm between runs and
+reloads the model only when the bytes changed; `runner.dispose()` ends it.
+The limit is a guard against runaway scripts, not a security boundary: the
+script still has the process's permissions.
 
 `entity.is(name)` and `ifc.byType(name)` follow the schema's supertypes, so
 a `IfcWallStandardCase` added by the script is an `IfcWall` and an
@@ -505,8 +578,12 @@ Code, Claude Desktop or any MCP client edits a model with the tools listed in
 [Agents and pipelines](agents.md#the-tools), while the reference viewer
 follows at a loopback address. `node bindings/mcp/src/cli.js model.ifc`
 serves an existing file, `--new house.ifc` starts from a project, site,
-building and storeys. As a library, `createModelHost({ Kernel })` owns the
-kernel, the session, the saved file and a scene mirror;
+building and storeys. Scripts run in a worker thread under
+`--script-timeout-ms` (30 seconds by default, 0 for none); a stopped script
+reports `timedOut` and changes nothing. As a library,
+`createModelHost({ Kernel, kernelModule, scriptTimeoutMs })` owns the
+kernel, the session, the saved file and a scene mirror, with the limit active
+when `kernelModule` names the Node kernel;
 `createViewerServer(host, { root, port })` is the loopback server the viewer
 follows; `createTessifcServer(host)` is the MCP server for a transport of
 your choice. The package README lists the flags and the tools.
@@ -519,10 +596,21 @@ reference viewer's renderer in any element with a small API and no chrome:
 `isolate`, `showAll`, `focus`, `setView`, `setStyle` and `setSection` take
 express ids and plain values, `pick` answers a pointer, and `on` reports
 `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`,
-`revision` and `session`. `loadPack` shows an IGP pack from any producer, so
-a host that already runs the kernel in a worker feeds the view without a
-second parse. `viewer.renderer` is the `IfcRenderer` underneath for anything
-the API leaves out. The package README lists every call;
+`revision` and `session`. `createViewer(container, { worker: true })` runs
+the kernel in the package's worker instead, with no kernel on the page and
+`session()` returning promises; `loadPack` shows an IGP pack from any
+producer, so a host that already runs the kernel in a worker of its own feeds
+the view without a second parse. `viewer.renderer` is the `IfcRenderer`
+underneath for anything the API leaves out. `createViewer(host, { textures: true })` asks the kernel
+for materials and textures and paints them in the shaded style; image
+textures referenced by path load from the page's own origin, or from
+`textureBaseUrl`, unless `allowRemoteTextures` is set, and
+`viewer.setTextures(false)` returns to flat colours. Moving frames leave out
+product clusters outside the view and, from inside the model, clusters
+behind its largest opaque faces (`occlusion: false` turns the second part
+off), and they draw the coarse levels a pack carries in place of the full
+meshes (`motionLod: false` keeps the full meshes); a frame at rest draws
+everything at full detail. The package README lists every call;
 `examples/embed-viewer/` is a complete page.
 
 ```js
@@ -559,9 +647,14 @@ placed instance from a parsed IGP pack, sharing a `BufferGeometry` per IGP
 geometry, and `applyDelta(delta)` retires the affected and removed products
 and adds the delta's instances; a `full` delta rebuilds everything.
 `meshesOf(expressId)`, `setVisible`, `productIds()` and `dispose()` complete
-it. Helper geometry (openings, spaces, references) starts invisible. This
-retained scene favours correctness over draw-call count; `loadModel` remains
-the merged static path.
+it. Helper geometry (openings, spaces, references) starts invisible. With
+`{ textures: true }` a pack written with the `textures` setting gives each
+instance a `MeshStandardMaterial` from its material row, with the texture as
+its colour map and the pack's `uv` on the geometry; `textureBaseUrl` and
+`allowRemoteTextures` decide which image paths are fetched, and `onTexture`
+is called when an image arrives so a host that renders on demand can draw
+again. This retained scene favours correctness over draw-call count;
+`loadModel` remains the merged static path.
 
 ### Python session
 
@@ -617,7 +710,8 @@ The assistant provider is selected with `--assistant anthropic`, `fake` or
 `pip install anthropic`. `--model` and `--effort` pass through to the request.
 `--mcp` speaks MCP on stdin and stdout for an agent while the viewer server
 keeps running, `--new` creates the file first (`--schema`, `--storeys`).
-Scripts run in the session process without a sandbox.
+Scripts run in the session process without a sandbox and without a time
+limit.
 
 ## Reading IGP
 
@@ -629,8 +723,17 @@ how to assemble chunks into one pack with stable slots.
 ## Running in a worker
 
 The kernel is synchronous and single-threaded by design. Put it in a Web
-Worker so parsing and tessellation never block the page, and transfer buffers
-in both directions:
+Worker so parsing and tessellation never block the page. The embeddable
+viewer does this for you: `createViewer(host, { worker: true })` runs the
+kernel in the package's own worker, streams chunks to the page as transferred
+buffers and gives `session()` the same calls returning promises; a script
+past `scriptTimeoutMs` is stopped by ending the worker and the model is
+reopened from its last revision. `@tessifc/viewer/kernel-client` is that
+worker's promise API on its own, for a host with its own scene, and
+`@tessifc/viewer/kernel-worker-core` the worker body a bundler builds its own
+entry around. The package README shows both.
+
+For a worker of your own, transfer buffers in both directions:
 
 ```ts
 // main thread
@@ -662,8 +765,9 @@ self.onmessage = ({ data }) => {
 };
 ```
 
-`viewer/src/worker.js` adds model replacement, edits and export. The example
-closes each model after streaming; keep it open if later inspection is needed.
+The package's `kernel-worker-core.js` adds model replacement, edits and
+export. The example closes each model after streaming; keep it open if later
+inspection is needed.
 Chunk budgets are checked between products, so one expensive product may
 overrun a chunk's time limit. Terminate the worker for a hard cancellation.
 
@@ -681,11 +785,22 @@ overrun a chunk's time limit. Terminate the worker for a hard cancellation.
 
 ## Types
 
-`@tessifc/core` ships generated TypeScript declarations. The JavaScript
-packages (`@tessifc/edit`, `@tessifc/viewer`, `@tessifc/mcp`,
-`@tessifc/three`) are plain ES modules with JSDoc on every export and no
-declarations yet; a TypeScript host imports them with `allowJs` or a local
-declaration until they ship.
+Every package ships TypeScript declarations. `@tessifc/core`'s come from
+wasm-bindgen; those of `@tessifc/edit`, `@tessifc/viewer`, `@tessifc/mcp`
+and `@tessifc/three` are generated from the JSDoc of the JavaScript sources
+and named for every `exports` entry, so `import type { Session, Delta, Pack }
+from "@tessifc/edit"`, `import type { Viewer, ViewerOptions } from
+"@tessifc/viewer"`, `import type { ModelHost } from "@tessifc/mcp"` and
+`import type { RetainedModel, Batch } from "@tessifc/three"` resolve under
+`moduleResolution: "NodeNext"` or `"Bundler"`. Kernel arguments are typed as
+`@tessifc/core`'s `Kernel`; internal helpers stay loosely typed, and every
+parameter that reaches the public surface is annotated.
+
+In a checkout the declarations are build outputs: after the WASM build,
+`npm ci` at the repository root then `npm run types` generates them into
+each package's `types/` directory (`npm run typecheck` verifies them and
+type-checks the examples, which import the packages under `// @ts-check`).
+`npm pack` regenerates them, so a tarball always carries current ones.
 
 ## Bundlers and hosting
 
@@ -703,13 +818,23 @@ that library; the declarations are checked with TypeScript 5.9.
   threading in the browser build; parallelism comes from workers you spawn.
 * The Node build is CommonJS with the same API, in `pkg-node/`.
 * The module is built for speed; `scripts/build-wasm.py --profile wasm-release`
-  is the smaller, slower build. Building with one schema feature is smaller
-  still; see `bindings/wasm/README.md`.
+  is the smaller, slower build. Building with one schema feature, or without
+  the `edit` feature for a viewer that never edits, is smaller still; see
+  `bindings/wasm/README.md`.
 
 ## Diagnostics as an API
 
 Diagnostics carry a stable code and severity, with an element ID and source
-line when available. `E_`, `W_` and `I_` indicate error, warning and information.
+line when available. `E_`, `W_` and `I_` indicate error, warning and information;
+the information codes are `I_VERTEX_LOOP_IGNORED`, for a vertex loop that
+bounds no area on its face, and the texture notes `I_TEXTURE_MAP_IGNORED`,
+`I_TEXTURE_LAYERS_IGNORED` and `I_TEXTURE_GENERATOR_UNSUPPORTED`. A boolean
+the kernel cannot prove is reported with `W_BOOLEAN_REFUSED` (the code was
+`E_BOOLEAN_UNSUPPORTED_IN_CLIP_MODE` before 0.3.0; the operand is kept, so
+its severity is a warning) and an opening cut through the faces of a body
+with no usable inside with `W_OPENING_CUT_ON_SURFACE`; a whole-model budget
+ends a run with `E_GEOMETRY_LIMIT_REACHED`; an archive that cannot be read
+carries `E_IFCZIP_MALFORMED` or `E_IFCZIP_TOO_LARGE`.
 They do not independently prove that a product was drawn: inspect the product
 outcomes and geometry quality too. Packs carry evaluation diagnostics so a
 host can inspect them without reopening the model.

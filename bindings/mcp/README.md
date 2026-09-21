@@ -13,10 +13,14 @@ panel.
 From a checkout, after `python scripts/build-wasm.py --target both`:
 
 ```sh
-npm ci --prefix bindings/mcp
+npm ci                                                # at the repository root
 node bindings/mcp/src/cli.js house.ifc --new          # a new model, saved to house.ifc after every edit
 node bindings/mcp/src/cli.js model.ifc                # an existing file
 ```
+
+Installed from npm beside `@tessifc/core`, `npx tessifc-mcp model.ifc
+--root <checkout>` is the same server; `@tessifc/edit` comes with it, so
+only the viewer files need the checkout.
 
 The server speaks MCP on stdin and stdout and prints the viewer address on
 stderr, for example `Viewer: http://127.0.0.1:8000/viewer/?session=file`.
@@ -33,7 +37,8 @@ Options: `--new` (start from a project, site, building and storeys; refuses
 to overwrite an existing file without `--force`), `--schema IFC2X3|IFC4|IFC4X3`,
 `--units m|mm`, `--storeys "Ground floor:0,Upper floor:3"`, `--port 8000`
 (`0` picks a free port), `--no-viewer`, `--no-save` (keep the model in memory
-only), `--root <checkout>` (where the viewer and the WASM package are).
+only), `--script-timeout-ms 30000` (stop a script that runs longer; `0` for
+no limit), `--root <checkout>` (where the viewer and the WASM package are).
 
 ## Tools
 
@@ -43,7 +48,7 @@ only), `--root <checkout>` (where the viewer and the WASM package are).
 | `find_products` | Products of a class, filtered by name or storey |
 | `product_info` | One entity: attributes, container, property sets, representation items, placement |
 | `inspect_model` | Run read-only JavaScript and return what it prints |
-| `edit_model` | Run a script; its edits become one revision. Returns the kernel's affected and removed products, diagnostics and whether the file was saved |
+| `edit_model` | Run a script; its edits become one revision. Returns the kernel's affected and removed products, diagnostics and whether the file was saved; `timedOut` when the script was stopped at the limit |
 | `undo`, `redo` | New revisions that restore earlier content |
 | `export_model` | Write the committed IFC to a path |
 | `new_model`, `open_model` | Start a model from nothing, or follow another file |
@@ -65,16 +70,20 @@ with the diagnostics, and the committed model is unchanged.
 import { createModelHost, createTessifcServer, createViewerServer } from "@tessifc/mcp";
 ```
 
-`createModelHost({ Kernel })` holds the kernel, the editing session, the
-current snapshot and its content version, the file it saves to, and a scene
-mirror for verification. `createViewerServer(host, { root, port })` is the
+`createModelHost({ Kernel, kernelModule, scriptTimeoutMs })` holds the
+kernel, the editing session, the current snapshot and its content version,
+the file it saves to, and a scene mirror for verification; with
+`kernelModule` (the path of the Node kernel) scripts run in a worker thread
+under the limit, without it they run in the process without one. `createViewerServer(host, { root, port })` is the
 loopback server the viewer follows; `createTessifcServer(host)` returns the
 MCP server for the transport of your choice. `examples/agent-building/` uses
 the host and the viewer server without MCP.
 
 ## Boundary
 
-Scripts run in the server process with its permissions and without a sandbox;
-review what an agent proposes before granting it automatic edits elsewhere.
+Scripts run with the server's permissions and without a sandbox, in a worker
+thread that is ended when a script passes the time limit; the limit catches a
+script that never returns and is not a security boundary. Review what an
+agent proposes before granting it automatic edits elsewhere.
 The viewer server binds to the loopback interface only, checks the Host and
 Origin headers, and requires a per-process token on every command.

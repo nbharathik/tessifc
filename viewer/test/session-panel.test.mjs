@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// The session panel without any Python: browser scripts, undo, examples, and
-// the assistant against a scripted OpenAI-compatible server on the loopback.
+// The session panel without any Python: browser scripts, undo, examples, the
+// assistant against a scripted OpenAI-compatible server on the loopback, and
+// a script that never returns stopped at the time limit.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { chromium } from "playwright";
@@ -257,6 +258,47 @@ try {
   await page.waitForFunction(() => document.querySelectorAll("#assistant-log .proposal button.accent[disabled]").length === 2, null, { timeout: 60000 });
   assert.equal(await page.evaluate(() => window.__tessifc.state.model.lastUpdate.affectedProducts.length), 1);
   console.log("ok the automatic policy runs the proposal and reports the impact");
+
+  // A script that never returns is stopped at the limit; the model reopens in a
+  // fresh worker at its last revision with the scene and the edits kept.
+  await page.click("#rail-script");
+  await page.evaluate((id) => window.__tessifc.selectExpressId(id), wallId);
+  await page.waitForFunction(() => window.__tessifc.state.selection?.infoState === "ready");
+  await page.evaluate(() => {
+    window.__tessifc.state.settings.scriptTimeoutMs = 500;
+  });
+  const productsBefore = await products();
+  const propertyRows = await page.evaluate(() => document.querySelectorAll("#property-list .prop-row").length);
+  await page.fill("#script-editor", 'ifc.byType("IfcWall")[0].Name = "never"; while (true) {}');
+  await page.click("#script-run");
+  await page.waitForFunction(() => /ScriptTimeout/.test(document.querySelector("#script-output").textContent), null, { timeout: 60000 });
+  await page.waitForFunction(() => window.__tessifc.state.revisionPending === null && window.__tessifc.state.workerReady
+    && window.__tessifc.state.selection?.infoState === "ready", null, { timeout: 60000 });
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "0");
+  assert.equal(await products(), productsBefore);
+  assert.deepEqual(await page.evaluate(() => window.__tessifc.state.scriptHistory), { undo: 0, redo: 0 });
+  assert.equal(await page.evaluate(() => window.__tessifc.state.dirty), true);
+  assert.equal(await page.evaluate(() => document.querySelectorAll("#property-list .prop-row").length), propertyRows);
+  assert.match(await page.evaluate(() => window.__tessifc.state.selection.info.fields.find((item) => item.name === "Name").value), /Assistant renamed wall/);
+  assert.match(await page.textContent("#status-text"), /reopened at revision 0/);
+  console.log("ok an endless script is stopped at the limit and the model reopens at its last revision");
+
+  // The reopened model takes scripts again; the selection is still the wall.
+  await page.selectOption("#script-example", { label: "Add a door to a wall" });
+  await page.click("#script-run");
+  await revision("1");
+  assert.equal(await products(), productsBefore + 2);
+  assert.equal(await page.evaluate(() => window.__tessifc.state.model.lastUpdate.affectedProducts.length), 3);
+  const exported = await page.evaluate(() => new Promise((resolve) => {
+    const worker = window.__tessifc.state.worker;
+    const requestId = 1_000_000;
+    worker.addEventListener("message", ({ data }) => {
+      if (data.type === "export-result" && data.requestId === requestId) resolve(new TextDecoder("latin1").decode(new Uint8Array(data.buffer)));
+    });
+    worker.postMessage({ type: "export", requestId, modelId: window.__tessifc.state.model.modelId });
+  }));
+  assert.ok(exported.includes("'Assistant renamed wall'") && !exported.includes("'never'"), "the reopened model carries the earlier edits, not the stopped script's");
+  console.log("ok the reopened model takes scripts again and keeps the earlier edits");
 
   assert.deepEqual(problems, []);
 } finally {

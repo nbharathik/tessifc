@@ -20,6 +20,8 @@
 #![warn(missing_docs)]
 
 pub mod pack;
+pub mod report;
+#[cfg(feature = "revision")]
 pub mod revision;
 
 /// Diagnostic codes this crate raises itself.
@@ -30,6 +32,8 @@ pub mod codes {
     pub const RELATIONSHIP_TOO_LARGE: DiagCode = DiagCode("W_RELATIONSHIP_TOO_LARGE");
     /// A coordinate did not survive the narrowing to f32; the part was dropped.
     pub const NON_FINITE_GEOMETRY: DiagCode = DiagCode("W_NON_FINITE_GEOMETRY");
+    /// A texture's pixels were left out of the pack because they are over the size limit.
+    pub const TEXTURE_OMITTED: DiagCode = tessifc_geom::codes::TEXTURE_OMITTED;
 }
 
 /// Narrowest length precision a file may drive the tolerances with, in metres.
@@ -39,15 +43,18 @@ const MAX_PRECISION_M: f64 = 1e-3;
 
 use glam::DVec3;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tessifc_geom::{
-    DiagnosticSink, EvalCaches, EvalCtx, PhaseTimings, Provenance, Registry, Settings, Tolerances,
-    Units, product_category, product_parts, product_transform, should_include,
+    DiagnosticSink, EvalCaches, EvalCtx, PhaseTimings, Provenance, Registry, Settings, Stopwatch,
+    Tolerances, Units, product_category, product_parts, product_transform, should_include,
 };
 use tessifc_mesh::Mesh64;
 use tessifc_model::Model;
 use tessifc_step::{DiagCode, Diagnostic};
 
-pub use tessifc_geom::{PartGeometry, ProductCategory, SharedKey};
+pub use tessifc_geom::{
+    Material, PartGeometry, ProductCategory, SharedKey, Texture, TextureGenerator, TextureSource,
+};
 
 /// The geometry of one product that shares a single colour.
 pub struct ShapePart {
@@ -58,6 +65,8 @@ pub struct ShapePart {
     pub color: [u8; 4],
     /// Which representation, item and evaluator produced it.
     pub provenance: Provenance,
+    /// Its material, when the `textures` setting is on and the file styles it.
+    pub material: Option<std::sync::Arc<Material>>,
 }
 
 impl ShapePart {
@@ -69,6 +78,11 @@ impl ShapePart {
     /// Triangles in the part.
     pub fn triangle_count(&self) -> usize {
         self.geometry.triangle_count()
+    }
+
+    /// Vertices in the part.
+    pub fn vertex_count(&self) -> usize {
+        self.geometry.vertex_count()
     }
 
     /// Axis-aligned world bounds.
@@ -124,6 +138,11 @@ impl Shape {
     pub fn triangle_count(&self) -> usize {
         self.parts.iter().map(ShapePart::triangle_count).sum()
     }
+
+    /// Vertices across every part.
+    pub fn vertex_count(&self) -> usize {
+        self.parts.iter().map(ShapePart::vertex_count).sum()
+    }
 }
 
 /// Everything one evaluation run produced.
@@ -147,6 +166,10 @@ pub struct EvaluationResult {
     pub georef: Option<String>,
     /// Processor time spent in each evaluation phase.
     pub timings: PhaseTimings,
+    /// Set when a budget in the settings stopped the run before every product.
+    pub limit_reached: Option<LimitReached>,
+    /// Products the tripped budget left unevaluated, in ascending express id.
+    pub skipped: Vec<u32>,
 }
 
 impl EvaluationResult {
@@ -198,6 +221,66 @@ pub enum ProductState {
     Emitted,
     /// Evaluation finished without triangles; inspect diagnostics for the cause.
     EmptyOrFailed,
+    /// Never evaluated: a budget in the settings stopped the run first.
+    SkippedByLimit,
+}
+
+/// The budget setting that stopped a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum BudgetKind {
+    /// `maxTotalTriangles`.
+    #[serde(rename = "maxTotalTriangles")]
+    Triangles,
+    /// `maxTotalVertices`.
+    #[serde(rename = "maxTotalVertices")]
+    Vertices,
+    /// `maxGeometryMs`.
+    #[serde(rename = "maxGeometryMs")]
+    Time,
+}
+
+impl BudgetKind {
+    /// The setting's JSON name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetKind::Triangles => "maxTotalTriangles",
+            BudgetKind::Vertices => "maxTotalVertices",
+            BudgetKind::Time => "maxGeometryMs",
+        }
+    }
+}
+
+/// Why a run stopped before every product was evaluated.
+///
+/// Budgets are checked between products, so `reached` is the tally when the
+/// check failed, which can exceed `limit` by one product's worth.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitReached {
+    /// Which budget tripped.
+    pub which: BudgetKind,
+    /// The budget as set.
+    pub limit: f64,
+    /// The tally when the check failed.
+    pub reached: f64,
+    /// Products left unevaluated.
+    pub products_skipped: usize,
+}
+
+impl LimitReached {
+    /// The model-level diagnostic reporting this stop.
+    fn diagnostic(&self, done: usize, total: usize) -> Diagnostic {
+        Diagnostic::error(
+            tessifc_geom::codes::GEOMETRY_LIMIT_REACHED,
+            0,
+            format!(
+                "stopped after {done} of {total} products: {} reached {} of {}",
+                self.which.as_str(),
+                self.reached,
+                self.limit
+            ),
+        )
+    }
 }
 
 fn product_outcomes(
@@ -205,6 +288,7 @@ fn product_outcomes(
     selected: &HashSet<u32>,
     done: &HashSet<u32>,
     emitted: &HashSet<u32>,
+    skipped: &HashSet<u32>,
 ) -> Vec<ProductOutcome> {
     let mut outcomes: Vec<_> = model
         .entities_of_type("IfcProduct")
@@ -214,6 +298,8 @@ fn product_outcomes(
                 ProductState::Filtered
             } else if emitted.contains(&id) {
                 ProductState::Emitted
+            } else if skipped.contains(&id) {
+                ProductState::SkippedByLimit
             } else if product.attr("Representation").as_entity().is_none() {
                 ProductState::NoRepresentation
             } else if tessifc_geom::representation_of(product).is_none() {
@@ -234,10 +320,14 @@ fn product_outcomes(
     outcomes
 }
 
+/// A host's wall clock in milliseconds, for the time budget where the target has no clock.
+pub type Clock = Arc<dyn Fn() -> f64 + Send + Sync>;
+
 /// Turns models into geometry.
 pub struct Engine {
     /// Caller settings.
     pub settings: Settings,
+    clock: Option<Clock>,
 }
 
 impl Default for Engine {
@@ -251,12 +341,24 @@ impl Engine {
     pub fn new() -> Self {
         Engine {
             settings: Settings::default(),
+            clock: None,
         }
     }
 
     /// An engine with the given settings.
     pub fn with_settings(settings: Settings) -> Self {
-        Engine { settings }
+        Engine {
+            settings,
+            clock: None,
+        }
+    }
+
+    /// Measure the time budget with this clock instead of the process clock.
+    ///
+    /// Needed where there is no process clock, as in WebAssembly, and in tests.
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// The products this engine would evaluate, in ascending express id.
@@ -286,20 +388,23 @@ impl Engine {
     /// same source.
     pub fn evaluate(&self, model: &Model) -> EvaluationResult {
         let mut session = self.session(model);
-        let ids = std::mem::take(&mut session.products);
-        let (shapes, diagnostics, timings) = evaluate_all(&session, model, &ids);
-        let mut leading = std::mem::take(&mut session.leading);
-        leading.extend(diagnostics);
+        #[cfg(feature = "parallel")]
+        if rayon::current_num_threads() > 1 && session.products.len() >= MIN_PARALLEL_PRODUCTS {
+            return evaluate_parallel(session, model);
+        }
+        let batch = session.next(model, |_| false);
         EvaluationResult {
             settings: self.settings.clone(),
-            shapes,
-            diagnostics: dedup_diagnostics(leading, &mut HashSet::new()),
+            shapes: batch.shapes,
+            diagnostics: batch.diagnostics,
             products_considered: session.products_considered,
             products_filtered: session.products_filtered,
             units: session.units,
             model_offset: session.model_offset,
             georef: session.georef,
-            timings,
+            timings: batch.timings,
+            limit_reached: session.budget.tripped,
+            skipped: session.skipped,
         }
     }
 
@@ -307,7 +412,8 @@ impl Engine {
     pub fn outcomes(&self, model: &Model, result: &EvaluationResult) -> Vec<ProductOutcome> {
         let selected: HashSet<_> = self.products(model).into_iter().collect();
         let emitted: HashSet<_> = result.shapes.iter().map(|shape| shape.express_id).collect();
-        product_outcomes(model, &selected, &selected, &emitted)
+        let skipped: HashSet<_> = result.skipped.iter().copied().collect();
+        product_outcomes(model, &selected, &selected, &emitted, &skipped)
     }
 
     /// Start evaluating a model in batches.
@@ -339,8 +445,69 @@ pub struct Session {
     products_filtered: usize,
     emitted: Vec<u32>,
     triangles: usize,
+    vertices: usize,
     leading: Vec<Diagnostic>,
     seen: HashSet<(DiagCode, Option<u32>, String)>,
+    budget: Budget,
+    skipped: Vec<u32>,
+}
+
+/// The budgets from the settings, and the clock they are measured on.
+struct Budget {
+    triangles: Option<u64>,
+    vertices: Option<u64>,
+    ms: Option<f64>,
+    started: Stopwatch,
+    clock: Option<Clock>,
+    clock_start: f64,
+    tripped: Option<LimitReached>,
+}
+
+impl Budget {
+    fn new(settings: &Settings, clock: Option<Clock>) -> Budget {
+        let clock_start = clock.as_ref().map_or(0.0, |clock| clock());
+        Budget {
+            triangles: settings.max_total_triangles,
+            vertices: settings.max_total_vertices,
+            ms: settings.max_geometry_ms,
+            started: Stopwatch::start(),
+            clock,
+            clock_start,
+            tripped: None,
+        }
+    }
+
+    fn is_bounded(&self) -> bool {
+        self.triangles.is_some() || self.vertices.is_some() || self.ms.is_some()
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        match &self.clock {
+            Some(clock) => clock() - self.clock_start,
+            None => self.started.ms(),
+        }
+    }
+
+    /// The first budget the tallies have exhausted, if any.
+    fn exceeded(&self, triangles: usize, vertices: usize) -> Option<(BudgetKind, f64, f64)> {
+        if let Some(limit) = self.triangles
+            && triangles as u64 >= limit
+        {
+            return Some((BudgetKind::Triangles, limit as f64, triangles as f64));
+        }
+        if let Some(limit) = self.vertices
+            && vertices as u64 >= limit
+        {
+            return Some((BudgetKind::Vertices, limit as f64, vertices as f64));
+        }
+        if let Some(limit) = self.ms {
+            let elapsed = self.elapsed_ms();
+            if elapsed >= limit {
+                return Some((BudgetKind::Time, limit, elapsed));
+            }
+        }
+        None
+    }
 }
 
 /// What one call to [`Session::next`] produced.
@@ -427,6 +594,9 @@ impl Session {
                 .with_id(id),
             );
         }
+        // Placement warnings raised while choosing the offset; the cache means
+        // evaluation will not raise them again.
+        leading.extend(sink.take());
 
         Session {
             settings: engine.settings.clone(),
@@ -441,8 +611,11 @@ impl Session {
             products_filtered: filtered,
             emitted: Vec::new(),
             triangles: 0,
+            vertices: 0,
             leading,
             seen: HashSet::new(),
+            budget: Budget::new(&engine.settings, engine.clock.clone()),
+            skipped: Vec::new(),
         }
     }
 
@@ -478,6 +651,11 @@ impl Session {
     /// Units the file declared.
     pub fn units(&self) -> Units {
         self.units
+    }
+
+    /// The effective settings of this session.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     /// How many products were considered.
@@ -518,6 +696,27 @@ impl Session {
         self.triangles
     }
 
+    /// Vertices produced so far.
+    pub fn vertices(&self) -> usize {
+        self.vertices
+    }
+
+    /// Set once a budget stopped the session; it is finished from then on.
+    pub fn limit_reached(&self) -> Option<&LimitReached> {
+        self.budget.tripped.as_ref()
+    }
+
+    /// Products a tripped budget left unevaluated.
+    pub fn skipped(&self) -> &[u32] {
+        &self.skipped
+    }
+
+    /// Measure the time budget with this clock from now on.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.budget.clock_start = clock();
+        self.budget.clock = Some(clock);
+    }
+
     /// Per-product progress, including products with no drawable representation.
     pub fn outcomes(&self, model: &Model) -> Vec<ProductOutcome> {
         product_outcomes(
@@ -525,6 +724,7 @@ impl Session {
             &self.products.iter().copied().collect(),
             &self.products[..self.cursor].iter().copied().collect(),
             &self.emitted.iter().copied().collect(),
+            &self.skipped.iter().copied().collect(),
         )
     }
 
@@ -556,10 +756,31 @@ impl Session {
             total: self.products.len(),
         };
         while self.cursor < self.products.len() {
+            // Between products, never inside one: a budget stops the next
+            // product from starting and skips the rest.
+            if self.budget.is_bounded()
+                && let Some((which, limit, reached)) = self
+                    .budget
+                    .exceeded(self.triangles + progress.triangles, self.vertices)
+            {
+                let skipped = self.products[self.cursor..].to_vec();
+                let tripped = LimitReached {
+                    which,
+                    limit,
+                    reached,
+                    products_skipped: skipped.len(),
+                };
+                diagnostics.push(tripped.diagnostic(self.cursor, self.products.len()));
+                self.budget.tripped = Some(tripped);
+                self.skipped = skipped;
+                self.cursor = self.products.len();
+                break;
+            }
             let id = self.products[self.cursor];
             self.cursor += 1;
             if let Some(shape) = evaluate_one(&ctx, registry, model, id) {
                 progress.triangles += shape.triangle_count();
+                self.vertices += shape.vertex_count();
                 self.emitted.push(shape.express_id);
                 shapes.push(shape);
             }
@@ -604,6 +825,7 @@ fn evaluate_one(ctx: &EvalCtx<'_>, registry: &Registry, model: &Model, id: u32) 
                 geometry,
                 color: part.color.0,
                 provenance: part.provenance,
+                material: part.material,
             }
         })
         .collect();
@@ -617,78 +839,102 @@ fn evaluate_one(ctx: &EvalCtx<'_>, registry: &Registry, model: &Model, id: u32) 
     })
 }
 
-/// Evaluate `ids` with a fresh context, in order.
-fn evaluate_chunk(
-    session: &Session,
-    model: &Model,
-    ids: &[u32],
-) -> (Vec<Shape>, Vec<Diagnostic>, PhaseTimings) {
-    let sink = DiagnosticSink::default();
-    let registry = Registry::shared(model.image().schema);
-    let ctx = EvalCtx::new(
-        model,
-        session.units,
-        session.tolerances,
-        &session.settings,
-        &sink,
-    )
-    .with_registry(registry);
-    let mut shapes = Vec::new();
-    let mut diagnostics = Vec::new();
-    for &id in ids {
-        if let Some(shape) = evaluate_one(&ctx, registry, model, id) {
-            shapes.push(shape);
-        }
-        diagnostics.extend(sink.take());
-    }
-    let timings = ctx.time.take();
-    (shapes, diagnostics, timings)
-}
+/// Evaluate every product across the thread pool.
+///
+/// Budgets are shared tallies: once one is exhausted, products not yet
+/// started are skipped, so which ones depends on how the pool scheduled them.
+#[cfg(feature = "parallel")]
+fn evaluate_parallel(mut session: Session, model: &Model) -> EvaluationResult {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Evaluate every id, across the thread pool where there is one.
-fn evaluate_all(
-    session: &Session,
-    model: &Model,
-    ids: &[u32],
-) -> (Vec<Shape>, Vec<Diagnostic>, PhaseTimings) {
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        if rayon::current_num_threads() > 1 && ids.len() >= MIN_PARALLEL_PRODUCTS {
-            // One product is one unit of work, so boolean-heavy walls cannot pin the
-            // run to one thread; each rayon split carries its own caches.
-            let registry = Registry::shared(model.image().schema);
-            let results: Vec<(Option<Shape>, Vec<Diagnostic>, PhaseTimings)> = ids
-                .par_iter()
-                .map_init(EvalCaches::default, |caches, &id| {
-                    let sink = DiagnosticSink::default();
-                    let ctx = EvalCtx::with_caches(
-                        model,
-                        session.units,
-                        session.tolerances,
-                        &session.settings,
-                        &sink,
-                        std::mem::take(caches),
-                    )
-                    .with_registry(registry);
-                    let shape = evaluate_one(&ctx, registry, model, id);
-                    let timings = ctx.time.take();
-                    *caches = ctx.into_caches();
-                    (shape, sink.take(), timings)
-                })
-                .collect();
-            let mut shapes = Vec::with_capacity(results.len());
-            let mut diagnostics = Vec::new();
-            let mut timings = PhaseTimings::default();
-            for (shape, product_diagnostics, product_timings) in results {
-                shapes.extend(shape);
-                diagnostics.extend(product_diagnostics);
-                timings.merge(product_timings);
+    let ids = std::mem::take(&mut session.products);
+    let registry = Registry::shared(model.image().schema);
+    let budget = &session.budget;
+    let bounded = budget.is_bounded();
+    let triangles = AtomicUsize::new(0);
+    let vertices = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    // One product is one unit of work, so boolean-heavy walls cannot pin the
+    // run to one thread; each rayon split carries its own caches.
+    let results: Vec<(Option<Shape>, Vec<Diagnostic>, PhaseTimings, bool)> = ids
+        .par_iter()
+        .map_init(EvalCaches::default, |caches, &id| {
+            if bounded && stop.load(Ordering::Relaxed) {
+                return (None, Vec::new(), PhaseTimings::default(), true);
             }
-            return (shapes, diagnostics, timings);
+            let sink = DiagnosticSink::default();
+            let ctx = EvalCtx::with_caches(
+                model,
+                session.units,
+                session.tolerances,
+                &session.settings,
+                &sink,
+                std::mem::take(caches),
+            )
+            .with_registry(registry);
+            let shape = evaluate_one(&ctx, registry, model, id);
+            let timings = ctx.time.take();
+            *caches = ctx.into_caches();
+            if bounded {
+                if let Some(shape) = &shape {
+                    triangles.fetch_add(shape.triangle_count(), Ordering::Relaxed);
+                    vertices.fetch_add(shape.vertex_count(), Ordering::Relaxed);
+                }
+                let (triangles, vertices) = (
+                    triangles.load(Ordering::Relaxed),
+                    vertices.load(Ordering::Relaxed),
+                );
+                if budget.exceeded(triangles, vertices).is_some() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            (shape, sink.take(), timings, false)
+        })
+        .collect();
+
+    let mut shapes = Vec::with_capacity(results.len());
+    let mut diagnostics = std::mem::take(&mut session.leading);
+    let mut timings = PhaseTimings::default();
+    let mut skipped = Vec::new();
+    for (&id, (shape, product_diagnostics, product_timings, was_skipped)) in ids.iter().zip(results)
+    {
+        if was_skipped {
+            skipped.push(id);
         }
+        shapes.extend(shape);
+        diagnostics.extend(product_diagnostics);
+        timings.merge(product_timings);
     }
-    evaluate_chunk(session, model, ids)
+    let mut limit_reached = None;
+    if !skipped.is_empty()
+        && let Some((which, limit, reached)) = budget.exceeded(
+            triangles.load(Ordering::Relaxed),
+            vertices.load(Ordering::Relaxed),
+        )
+    {
+        let tripped = LimitReached {
+            which,
+            limit,
+            reached,
+            products_skipped: skipped.len(),
+        };
+        diagnostics.push(tripped.diagnostic(ids.len() - skipped.len(), ids.len()));
+        limit_reached = Some(tripped);
+    }
+    EvaluationResult {
+        settings: session.settings.clone(),
+        shapes,
+        diagnostics: dedup_diagnostics(diagnostics, &mut HashSet::new()),
+        products_considered: session.products_considered,
+        products_filtered: session.products_filtered,
+        units: session.units,
+        model_offset: session.model_offset,
+        georef: session.georef.clone(),
+        timings,
+        limit_reached,
+        skipped,
+    }
 }
 
 /// Below this many products the pool is not worth waking.
@@ -936,12 +1182,210 @@ mod tests {
     }
 
     #[test]
+    fn placement_diagnostics_from_session_setup_are_kept() {
+        // A grid placement with no intersection cannot be resolved. The warning
+        // is raised while the session picks its model offset, before any
+        // geometry, and must reach the caller with the rest.
+        let source = format!(
+            "{TWO_WALLS}#20=IFCGRIDPLACEMENT($,$);\n\
+             #21=IFCWALL('c',$,'W3',$,$,#20,#5,$,$);\n"
+        );
+        let model = model_of(&source);
+        let result = Engine::new().evaluate(&model);
+        assert_eq!(result.shapes.len(), 3);
+        assert!(
+            result.diagnostics.iter().any(|d| {
+                d.code == tessifc_geom::codes::PLACEMENT_UNSUPPORTED && d.express_id == Some(21)
+            }),
+            "got {:?}",
+            result.diagnostics
+        );
+        // Streaming takes the same path: the warning is in the first batch, once.
+        let mut session = Engine::new().session(&model);
+        let batch = session.next(&model, |_| false);
+        let count = batch
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == tessifc_geom::codes::PLACEMENT_UNSUPPORTED)
+            .count();
+        assert_eq!(count, 1, "got {:?}", batch.diagnostics);
+    }
+
+    #[test]
     fn an_empty_model_produces_an_empty_result() {
         let model = model_of("#1=IFCWALL('a',$,'W',$,$,$,$,$,$);\n");
         let result = Engine::new().evaluate(&model);
         assert!(result.shapes.is_empty());
         assert_eq!(result.triangles(), 0);
         assert!(result.bounds().is_none());
+    }
+
+    fn bounded(settings: impl FnOnce(&mut Settings)) -> Engine {
+        let mut engine = Engine::new();
+        settings(&mut engine.settings);
+        engine
+    }
+
+    #[test]
+    fn three_chairs_stop_at_a_triangle_budget() {
+        // Four products of twelve triangles each; the budget trips after two.
+        let model = model_of(THREE_CHAIRS);
+        let engine = bounded(|s| s.max_total_triangles = Some(20));
+        let result = engine.evaluate(&model);
+        assert_eq!(result.shapes.len(), 2, "two products fit under the budget");
+        let limit = result.limit_reached.as_ref().expect("the budget tripped");
+        assert_eq!(limit.which, BudgetKind::Triangles);
+        assert_eq!(limit.limit, 20.0);
+        assert_eq!(limit.reached, 24.0);
+        assert_eq!(limit.products_skipped, 2);
+        assert_eq!(result.skipped, vec![53, 63]);
+        let stops: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == tessifc_geom::codes::GEOMETRY_LIMIT_REACHED)
+            .collect();
+        assert_eq!(stops.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(stops[0].express_id, None, "a model-level diagnostic");
+        assert!(
+            stops[0]
+                .message
+                .starts_with("stopped after 2 of 4 products")
+        );
+        let outcomes = engine.outcomes(&model, &result);
+        let skipped: Vec<u32> = outcomes
+            .iter()
+            .filter(|o| o.state == ProductState::SkippedByLimit)
+            .map(|o| o.express_id)
+            .collect();
+        assert_eq!(skipped, vec![53, 63]);
+        assert_eq!(
+            serde_json::to_string(&ProductState::SkippedByLimit).unwrap(),
+            "\"skipped_by_limit\""
+        );
+        assert_eq!(
+            serde_json::to_value(limit).unwrap()["which"],
+            "maxTotalTriangles"
+        );
+    }
+
+    #[test]
+    fn a_vertex_budget_trips_too_and_an_unset_one_never_does() {
+        let model = model_of(THREE_CHAIRS);
+        let result = bounded(|s| s.max_total_vertices = Some(8)).evaluate(&model);
+        assert_eq!(
+            result.shapes.len(),
+            1,
+            "a box's eight vertices meet the budget"
+        );
+        assert_eq!(
+            result.limit_reached.as_ref().map(|l| l.which),
+            Some(BudgetKind::Vertices)
+        );
+        let result = Engine::new().evaluate(&model);
+        assert!(result.limit_reached.is_none() && result.skipped.is_empty());
+        assert_eq!(result.shapes.len(), 4);
+    }
+
+    #[test]
+    fn a_time_budget_trips_with_a_fake_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let model = model_of(THREE_CHAIRS);
+        // Ten milliseconds pass at every reading of the clock.
+        let ticks = Arc::new(AtomicU64::new(0));
+        let clock: Clock = Arc::new(move || ticks.fetch_add(10, Ordering::SeqCst) as f64);
+        let engine = bounded(|s| s.max_geometry_ms = Some(15.0)).with_clock(clock);
+        let result = engine.evaluate(&model);
+        assert_eq!(
+            result.shapes.len(),
+            1,
+            "the second check sees twenty milliseconds"
+        );
+        let limit = result.limit_reached.as_ref().expect("the budget tripped");
+        assert_eq!(limit.which, BudgetKind::Time);
+        assert_eq!(limit.products_skipped, 3);
+        assert!(limit.reached >= 15.0);
+    }
+
+    #[test]
+    fn a_tripped_session_is_finished_and_its_last_batch_is_final() {
+        let model = model_of(THREE_CHAIRS);
+        let engine = bounded(|s| s.max_total_triangles = Some(20));
+        let mut session = engine.session(&model);
+        // One product per batch: the trip happens at the top of the third.
+        let first = session.next(&model, |_| true);
+        assert_eq!(first.shapes.len(), 1);
+        assert!(!first.is_final && session.limit_reached().is_none());
+        let second = session.next(&model, |_| true);
+        assert_eq!(second.shapes.len(), 1);
+        assert!(!second.is_final);
+        let third = session.next(&model, |_| true);
+        assert!(third.shapes.is_empty());
+        assert!(third.is_final && session.is_finished());
+        assert!(
+            third
+                .diagnostics
+                .iter()
+                .any(|d| d.code == tessifc_geom::codes::GEOMETRY_LIMIT_REACHED)
+        );
+        assert_eq!(session.limit_reached().map(|l| l.products_skipped), Some(2));
+        assert_eq!(session.skipped(), &[53, 63]);
+        assert_eq!(session.done(), session.total());
+        let outcomes = session.outcomes(&model);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| o.state == ProductState::SkippedByLimit)
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn a_parallel_run_stops_at_the_budget_with_one_diagnostic() {
+        // Enough walls to wake the pool, each a box of twelve triangles.
+        let mut source = String::from(
+            "#1=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,1.,1.);\n#2=IFCDIRECTION((0.,0.,1.));\n\
+             #3=IFCEXTRUDEDAREASOLID(#1,$,#2,1.);\n#4=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#3));\n\
+             #5=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));\n",
+        );
+        let count = 80u32;
+        for index in 0..count {
+            let id = 100 + index;
+            source.push_str(&format!("#{id}=IFCWALL('w{index}',$,$,$,$,$,#5,$,$);\n"));
+        }
+        let model = model_of(&source);
+        let engine = bounded(|s| s.max_total_triangles = Some(120));
+        let result = engine.evaluate(&model);
+        assert!(
+            result.shapes.len() >= 10 && result.shapes.len() < count as usize,
+            "{} shapes",
+            result.shapes.len()
+        );
+        let limit = result.limit_reached.as_ref().expect("the budget tripped");
+        assert_eq!(limit.which, BudgetKind::Triangles);
+        assert_eq!(limit.products_skipped, result.skipped.len());
+        assert_eq!(
+            result.shapes.len() + result.skipped.len(),
+            count as usize,
+            "every product was either evaluated or skipped"
+        );
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == tessifc_geom::codes::GEOMETRY_LIMIT_REACHED)
+                .count(),
+            1
+        );
+        let outcomes = engine.outcomes(&model, &result);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| o.state == ProductState::SkippedByLimit)
+                .count(),
+            result.skipped.len()
+        );
     }
 
     #[test]
@@ -1073,22 +1517,24 @@ mod tests {
 
     #[test]
     fn chunked_evaluation_matches_the_serial_result() {
-        // The parallel path is chunks evaluated with separate contexts and
-        // concatenated. Whatever the chunking, the answer must be the same.
+        // A stream is batches evaluated with carried caches and concatenated.
+        // Whatever the batching, the answer must be the whole-model one.
         let model = model_of(THREE_CHAIRS);
         let engine = Engine::new();
-        let session = engine.session(&model);
-        let ids = session.products.clone();
-        let (serial, serial_diagnostics, _) = evaluate_chunk(&session, &model, &ids);
+        let serial = engine.evaluate(&model);
+        let mut session = engine.session(&model);
         let mut chunked = Vec::new();
         let mut chunked_diagnostics = Vec::new();
-        for chunk in ids.chunks(1) {
-            let (shapes, diagnostics, _) = evaluate_chunk(&session, &model, chunk);
-            chunked.extend(shapes);
-            chunked_diagnostics.extend(diagnostics);
+        loop {
+            let batch = session.next(&model, |_| true);
+            chunked.extend(batch.shapes);
+            chunked_diagnostics.extend(batch.diagnostics);
+            if batch.is_final {
+                break;
+            }
         }
-        assert_eq!(serial.len(), chunked.len());
-        for (a, b) in serial.iter().zip(&chunked) {
+        assert_eq!(serial.shapes.len(), chunked.len());
+        for (a, b) in serial.shapes.iter().zip(&chunked) {
             assert_eq!(a.express_id, b.express_id);
             assert_eq!(
                 a.parts[0].geometry.shared_key(),
@@ -1097,10 +1543,7 @@ mod tests {
             assert_eq!(a.parts[0].mesh().positions, b.parts[0].mesh().positions);
         }
         let codes = |list: &[Diagnostic]| list.iter().map(|d| d.code).collect::<Vec<_>>();
-        assert_eq!(
-            codes(&dedup_diagnostics(serial_diagnostics, &mut HashSet::new())),
-            codes(&dedup_diagnostics(chunked_diagnostics, &mut HashSet::new()))
-        );
+        assert_eq!(codes(&serial.diagnostics), codes(&chunked_diagnostics));
     }
 
     #[test]

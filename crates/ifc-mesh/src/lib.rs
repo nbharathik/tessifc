@@ -18,6 +18,7 @@
 
 pub mod bsp;
 pub mod clip;
+pub mod decimate;
 pub mod locality;
 pub mod mesh;
 pub mod simplify;
@@ -32,7 +33,14 @@ pub use clip::{
     intersection_general, intersection_general_or_reason, is_convex, union_general,
     union_general_or_reason,
 };
-pub use locality::{cache_miss_ratio, optimize_vertex_locality, optimize_vertex_locality_f32};
+pub use decimate::{
+    DecimateOptions, LOD_MIN_TRIANGLES, LOD_TARGET_RATIO, MAX_DECIMATE_TRIANGLES, decimate,
+    decimate_f32,
+};
+pub use locality::{
+    cache_miss_ratio, optimize_index_locality, optimize_vertex_locality,
+    optimize_vertex_locality_f32,
+};
 pub use mesh::{Mesh64, face_normals, newell_normal};
 pub use simplify::{merge_coplanar, restore_boundary_vertices};
 pub use triangulate::{
@@ -40,6 +48,7 @@ pub use triangulate::{
     triangulation_deviates,
 };
 pub use weld::{
-    heal_t_junctions, orient_triangles_consistently, remove_duplicate_triangles,
-    split_coincident_edges, weld, weld_and_close,
+    drop_hanging_slivers, heal_t_junctions, orient_triangles_consistently,
+    remove_duplicate_triangles, split_coincident_edges, split_manifold_shells, weld,
+    weld_and_close,
 };

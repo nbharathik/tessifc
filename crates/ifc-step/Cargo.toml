@@ -16,13 +16,18 @@ readme = "README.md"
 [dependencies]
 memchr = { workspace = true }
 tessifc-schema = { workspace = true }
+miniz_oxide = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 
 # Schema selection forwards down the whole dependency chain.
 [features]
-default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3", "ifczip", "edit"]
+# Read a `.ifczip` archive: one deflated `.ifc` inside a ZIP container.
+ifczip = ["dep:miniz_oxide"]
+# Source-preserving attribute edits.
+edit = []
 schema-ifc2x3 = ["tessifc-schema/schema-ifc2x3"]
 schema-ifc4 = ["tessifc-schema/schema-ifc4"]
 schema-ifc4x3 = ["tessifc-schema/schema-ifc4x3"]

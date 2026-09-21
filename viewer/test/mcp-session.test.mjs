@@ -3,7 +3,7 @@
 // host, the selection report, and a reopen when the host starts a new model.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,11 +12,13 @@ import { instrumentViewer } from "./harness.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const mcpDir = resolve(root, "bindings/mcp");
-if (!existsSync(resolve(mcpDir, "node_modules/@modelcontextprotocol/sdk"))) {
-  console.log("skip  install the MCP package first (npm ci --prefix bindings/mcp)");
+const require = createRequire(resolve(mcpDir, "package.json"));
+try {
+  require.resolve("@modelcontextprotocol/sdk/client/index.js");
+} catch {
+  console.log("skip  install the workspace first (npm ci at the repository root)");
   process.exit(0);
 }
-const require = createRequire(resolve(mcpDir, "package.json"));
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { StdioClientTransport } = require("@modelcontextprotocol/sdk/client/stdio.js");
 

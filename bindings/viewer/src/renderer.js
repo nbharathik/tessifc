@@ -8,6 +8,11 @@ import { frameSphere, wheelZoomFactor, zoomCamera } from "./navigation.js";
 import { boxInView, viewSidePlanes } from "./culling.js";
 import { buildBoundsTree, queryBoundsTree } from "./picking.js";
 import { createGpuFrameGate } from "./gpu-frame-gate.js";
+import { createTextureCache } from "./textures.js";
+import { planClusters, visibleRuns } from "./clusters.js";
+import {
+  OCCLUSION_GRID_WIDTH, OCCLUSION_INSIDE_RADII, clusterHidden, createOccluderSelection, createOcclusionGrid, rasteriseOccluders,
+} from "./occlusion.js";
 
 export const BATCH_VERTEX_LIMIT = 260_000;
 // The drawing buffer follows the display's own pixel ratio up to this cap.
@@ -37,6 +42,9 @@ const RESIZE_SETTLE_MS = 150;
 const WIRE_PREPARE_BYTE_LIMIT = 32 * 1024 * 1024;
 const WIRE_PREPARE_SLICE_MS = 5;
 
+// Occluders are chosen in idle slices of this length after a load or a delta.
+const OCCLUDER_SLICE_MS = 6;
+
 const RENDER_UNIFORM_NAMES = [
   "uProjection",
   "uView",
@@ -55,6 +63,10 @@ const RENDER_UNIFORM_NAMES = [
   "uVisibilityWidth",
   "uPlainBatch",
 ];
+const TEXTURED_UNIFORM_NAMES = [...RENDER_UNIFORM_NAMES, "uTexture", "uUvTransform"];
+
+// The `material` column value of an instance without a material row.
+const NO_MATERIAL = 0xffffffff;
 
 /** Choose a stable drawing-buffer scale within device and fill-rate limits. */
 export function renderPixelRatio(
@@ -248,6 +260,7 @@ export class IfcRenderer {
     this.onContextLost = null;
     this.onContextRestored = null;
     // Kept so a restored context can rebuild exactly what was on screen.
+    /** @type {(record: number) => boolean} */
     this.visibilityPredicate = () => true;
     this.batches = [];
     this.opaqueBatches = [];
@@ -307,6 +320,38 @@ export class IfcRenderer {
     this.visibilityTexture = null;
     this.visibilityTextureWidth = 1;
     this.visibilityHeight = 1;
+    // Cluster culling: on a moving frame, clusters outside the lateral frustum
+    // are left out; a rest frame always draws everything. Occlusion adds the
+    // clusters behind the largest opaque faces once the camera is inside the
+    // model; seen whole from outside, nothing is ever fully hidden.
+    this.clusterCulling = true;
+    this.occlusionCulling = true;
+    this.occluders = null;
+    this.occluderSelection = null;
+    this.occlusionGrid = null;
+    this.clusterCullActive = false;
+    this.clusterStatesDirty = false;
+    this.motionFrame = false;
+    this.lastFrameReduced = false;
+    this.occlusionStats = { clusters: 0, frustumHidden: 0, occluded: 0, hiddenTriangles: 0, submittedTriangles: 0, occludersDrawn: 0 };
+    // Motion level of detail: a moving frame draws a mesh's coarse level where the pack has one.
+    this.motionLod = true;
+    this.coarseActive = false;
+    this.coarseDrawn = 0;
+    /** @type {Map<number, any>} base geometry id -> its coarse level entry */
+    this.levelsById = new Map();
+    // Filtered coarse indices per base geometry id, or null where there is no level.
+    this.coarseByGeometry = new Map();
+    // Textures: off draws every product in its flat colour, whatever the pack carries.
+    this.textures = false;
+    this.texturePolicy = { allowRemote: false, baseUrl: null };
+    this.textureCache = null;
+    this.texturedProgramSet = null;
+    this.programTextured = false;
+    this.frameTextured = false;
+    this.framePicking = false;
+    this.frameProjection = null;
+    this.depthOnlyActive = false;
     this.drag = null;
     this.interacting = false;
     this.wheelQualityTimer = 0;
@@ -369,6 +414,7 @@ export class IfcRenderer {
     // Streaming: the camera follows the growing model until the user takes it over.
     this.streaming = false;
     this.cameraTouched = false;
+    /** @type {DisplayColors} */
     this.renderColors = new Uint8Array(0);
     this.dimmedProducts = 0;
     this.darkProducts = 0;
@@ -430,7 +476,7 @@ export class IfcRenderer {
     gl.vertexAttribPointer(capPosition, 3, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
-    gl.clearColor(...this.background, 1);
+    gl.clearColor(this.background[0], this.background[1], this.background[2], 1);
     gl.clearStencil(0);
     gl.enable(gl.DEPTH_TEST);
     this.applyDepthConvention();
@@ -457,6 +503,8 @@ export class IfcRenderer {
     this.wheelQualityTimer = 0;
     this.clearTimers();
     this.cancelWirePreparation();
+    this.cancelOccluderSelection();
+    this.occluders = null;
     this.drag = null;
     this.interacting = false;
     this.gestureScale = 1;
@@ -477,6 +525,8 @@ export class IfcRenderer {
     this.targetCache.clear();
     this.visibilityTexture = null;
     this.visibilityCapacity = 0;
+    this.textureCache = null;
+    this.texturedProgramSet = null;
     this.onContextLost?.();
   }
 
@@ -494,6 +544,86 @@ export class IfcRenderer {
     // The page may have no frame scheduled, so the restored view is drawn here.
     this.render(true);
     this.onContextRestored?.();
+  }
+
+  /** The programs that sample a texture, compiled on first use so an untextured model pays nothing. */
+  texturedPrograms() {
+    if (this.texturedProgramSet) return this.texturedProgramSet;
+    const gl = this.gl;
+    const textured = (source) => source.replace("#version 300 es", "#version 300 es\n#define TEXTURED");
+    const surface = createProgram(gl, textured(VERTEX_SHADER), textured(FRAGMENT_SHADER));
+    const section = createProgram(gl, textured(VERTEX_SHADER),
+      textured(FRAGMENT_SHADER).replace("#define TEXTURED", "#define TEXTURED\n#define SECTION"));
+    this.texturedProgramSet = {
+      surface,
+      surfaceUniforms: uniforms(gl, surface, TEXTURED_UNIFORM_NAMES),
+      section,
+      sectionUniforms: uniforms(gl, section, TEXTURED_UNIFORM_NAMES),
+    };
+    return this.texturedProgramSet;
+  }
+
+  /** The texture cache of the open model, created when a textured batch first draws. */
+  ensureTextureCache() {
+    if (!this.textureCache) {
+      this.textureCache = createTextureCache(this.gl, {
+        allowRemote: this.texturePolicy.allowRemote,
+        baseUrl: this.texturePolicy.baseUrl,
+        onDirty: () => {
+          this.dirty = true;
+          this.onDirty?.();
+        },
+      });
+    }
+    return this.textureCache;
+  }
+
+  /**
+   * Draw the pack's textures, or every product in its flat colour. `policy`
+   * says whether references outside the page's origin may be fetched and
+   * where relative ones resolve; a change rebuilds the batches.
+   * @param {boolean} active
+   * @param {{ allowRemote?: boolean, baseUrl?: string | null }} [policy]
+   */
+  setTextures(active, policy = {}) {
+    const wanted = Boolean(active);
+    const allowRemote = policy.allowRemote ?? this.texturePolicy.allowRemote;
+    const baseUrl = policy.baseUrl === undefined ? this.texturePolicy.baseUrl : policy.baseUrl;
+    const policyChanged = allowRemote !== this.texturePolicy.allowRemote || baseUrl !== this.texturePolicy.baseUrl;
+    if (wanted === this.textures && !policyChanged) return;
+    this.textures = wanted;
+    this.texturePolicy = { allowRemote, baseUrl };
+    this.textureCache?.dispose();
+    this.textureCache = null;
+    if (this.pack && !this.contextLost) this.reload(this.pack, this.visibilityPredicate);
+    this.dirty = true;
+  }
+
+  /** The texture a record draws with under the current setting, or null. */
+  textureOf(pack) {
+    if (!this.textures) return null;
+    return (record, geometry) => recordTextureId(pack, record, geometry);
+  }
+
+  /**
+   * The coarse index array of a mesh for the GPU, filtered like the fine one,
+   * as the shared buffer's index type; null when the pack has no level for it.
+   */
+  coarseIndices(geometry, prepared, indexType) {
+    const key = `${geometry.id}:${indexType}`;
+    this.coarseByGeometry ??= new Map();
+    if (this.coarseByGeometry.has(key)) return this.coarseByGeometry.get(key);
+    const level = this.levelsById.get(geometry.id);
+    let coarse = null;
+    if (level && level.indices.length < prepared.indices.length) {
+      const filtered = level.indices.length > MAX_FILTERED_TRIANGLES * 3
+        ? level.indices
+        : filterCoincidentTriangles(geometry.positions, level.indices);
+      const IndexArray = indexType === this.gl.UNSIGNED_INT ? Uint32Array : Uint16Array;
+      coarse = filtered instanceof IndexArray ? filtered : IndexArray.from(filtered);
+    }
+    this.coarseByGeometry.set(key, coarse);
+    return coarse;
   }
 
   /** The render view of a mesh, filtered once per mesh and opacity; the source mesh is untouched. */
@@ -739,6 +869,11 @@ export class IfcRenderer {
     }
   }
 
+  /**
+   * Upload a whole pack; `isVisible` says which records start visible.
+   * @param {import("@tessifc/edit/types").Pack} pack
+   * @param {(record: number) => boolean} [isVisible]
+   */
   load(pack, isVisible = () => true) {
     isVisible = activePredicate(pack, isVisible);
     this.visibilityPredicate = isVisible;
@@ -760,6 +895,7 @@ export class IfcRenderer {
     this.depthOverlayPrecisionSafe = depthOverlayPrecisionSupported(this.renderBounds.radius);
     this.createVisibilityTexture(pack.instances.count);
     const geometryById = geometryIndex(pack);
+    this.levelsById = levelIndex(pack);
     this.recordLocations = Array(pack.instances.count).fill(null);
     for (let record = 0; record < pack.instances.count; record += 1) {
       if (!isActiveRecord(pack, record)) continue;
@@ -798,6 +934,7 @@ export class IfcRenderer {
       geometryById,
       contested: this.depthContested,
       recordLocations: this.recordLocations,
+      textureOf: this.textureOf(pack),
     });
     const preparedByKey = new Map();
     const sharedByKey = new Map();
@@ -830,6 +967,7 @@ export class IfcRenderer {
         group.records,
         group.transparent,
         shared,
+        group.texture,
       );
       this.batches.push(batch);
       gpuBytes += batch.gpuBytes;
@@ -848,7 +986,7 @@ export class IfcRenderer {
         }
         return { ...item, prepared };
       });
-      const batch = this.createBakedBatch(items, group.color, group.vertexCount);
+      const batch = this.createBakedBatch(items, group.color, group.vertexCount, group.texture);
       this.batches.push(batch);
       gpuBytes += batch.gpuBytes;
       eagerWireBytesAvoided += batch.indexCount * indexByteWidth(batch.indexType, this.gl) * 2;
@@ -880,6 +1018,7 @@ export class IfcRenderer {
     this.gpuBufferBytes = gpuBytes;
     this.prepareInteractionTarget();
     this.scheduleWirePreparation();
+    this.scheduleOccluderSelection();
     this.fit("perspective");
     this.dirty = true;
     const baseDrawCalls = this.batches.length;
@@ -923,7 +1062,13 @@ export class IfcRenderer {
     this.dirty = true;
   }
 
-  /** Draw records `from..to` of the assembled pack as lean batches; the finish does the full analysis. */
+  /**
+   * Draw records `from..to` of the assembled pack as lean batches; the finish does the full analysis.
+   * @param {import("@tessifc/edit/types").Pack} pack
+   * @param {number} from
+   * @param {number} to
+   * @param {(record: number) => boolean} [isVisible]
+   */
   appendStream(pack, from, to, isVisible = () => true) {
     isVisible = activePredicate(pack, isVisible);
     this.visibilityPredicate = isVisible;
@@ -948,6 +1093,7 @@ export class IfcRenderer {
     this.darkProducts += floors.brightened;
 
     const geometryById = geometryIndex(pack);
+    this.levelsById = levelIndex(pack);
     for (let record = from; record < to; record += 1) {
       // Written first: a record without usable bounds must not keep the default visible byte.
       this.baseVisible[record] = isVisible(record) ? 255 : 0;
@@ -971,6 +1117,7 @@ export class IfcRenderer {
     const plan = planRenderBatches(pack, undefined, this.renderColors, { from, to }, {
       geometryById,
       recordLocations: this.recordLocations,
+      textureOf: this.textureOf(pack),
     });
     const sharedByKey = new Map();
     let gpuBytes = 0;
@@ -985,13 +1132,13 @@ export class IfcRenderer {
         this.sharedGeometryBuffers.push(shared);
         gpuBytes += shared.gpuBytes;
       }
-      const batch = this.createInstancedBatch(group.geometry, prepared, group.records, group.transparent, shared);
+      const batch = this.createInstancedBatch(group.geometry, prepared, group.records, group.transparent, shared, group.texture);
       this.pushStreamBatch(batch);
       gpuBytes += batch.gpuBytes;
     }
     for (const group of plan.baked) {
       const items = group.items.map((item) => ({ ...item, prepared: prepare(item.geometry, group.transparent) }));
-      const batch = this.createBakedBatch(items, group.color, group.vertexCount);
+      const batch = this.createBakedBatch(items, group.color, group.vertexCount, group.texture);
       this.pushStreamBatch(batch);
       gpuBytes += batch.gpuBytes;
     }
@@ -1007,7 +1154,11 @@ export class IfcRenderer {
     this.dirty = true;
   }
 
-  /** Give streamed batches the stable material priority the finish will, so early orbiting stays steady. */
+  /**
+   * Give streamed batches the stable material priority the finish will, so early orbiting stays steady.
+   * @param {number} count
+   * @param {(record: number) => boolean} [isVisible]
+   */
   planStreamDepth(count, isVisible = () => true) {
     const depthPlan = planDepthMaterials(this.renderColors, this.recordLocations, count, isVisible);
     this.applyDepthPlan(depthPlan);
@@ -1070,7 +1221,10 @@ export class IfcRenderer {
     const table = this.contestedTriangles;
     if (!table || batch.transparent) return;
     const out = [];
+    // How many overlay indices each source contributed, so clusters get their ranges.
+    const perSource = [];
     for (const source of batch.wireSources ?? []) {
+      const before = out.length;
       const records = batch.baked ? [source.record] : batch.records;
       let mapping = mappings.get(source.indices);
       if (mapping === undefined) {
@@ -1093,8 +1247,20 @@ export class IfcRenderer {
           out.push(source.indices[prepared * 3] + base, source.indices[prepared * 3 + 1] + base, source.indices[prepared * 3 + 2] + base);
         }
       }
+      perSource.push(out.length - before);
     }
     if (!out.length) return;
+    if (batch.clusters) {
+      let offset = 0;
+      for (const cluster of batch.clusters) {
+        let count = 0;
+        if (batch.baked) for (let at = cluster.first; at < cluster.first + cluster.count; at += 1) count += perSource[at] ?? 0;
+        else count = out.length;
+        cluster.overlayOffset = batch.baked ? offset : 0;
+        cluster.overlayCount = count;
+        if (batch.baked) offset += count;
+      }
+    }
     const IndexArray = batch.indexType === gl.UNSIGNED_INT ? Uint32Array : Uint16Array;
     const indices = IndexArray.from(out);
     const buffer = gl.createBuffer();
@@ -1128,7 +1294,11 @@ export class IfcRenderer {
     else this.opaqueBatches.push(batch);
   }
 
-  /** Rebuild from the assembled pack, keeping a camera the user moved during the stream. */
+  /**
+   * Rebuild from the assembled pack, keeping a camera the user moved during the stream.
+   * @param {import("@tessifc/edit/types").Pack} pack
+   * @param {(record: number) => boolean} [isVisible]
+   */
   finishStream(pack, isVisible = () => true) {
     const touched = this.cameraTouched;
     const origin = this.renderOrigin.slice();
@@ -1154,13 +1324,22 @@ export class IfcRenderer {
     return { ...result, cameraKept: touched };
   }
 
-  /** Rebuild from a patched pack without moving the camera. */
+  /**
+   * Rebuild from a patched pack without moving the camera.
+   * @param {import("@tessifc/edit/types").Pack} pack
+   * @param {(record: number) => boolean} [isVisible]
+   */
   reload(pack, isVisible = () => true) {
     this.cameraTouched = true;
     return this.finishStream(pack, isVisible);
   }
 
-  /** Replace affected bounded batches while keeping every other GPU allocation. */
+  /**
+   * Replace affected bounded batches while keeping every other GPU allocation.
+   * @param {import("@tessifc/edit/types").Pack} pack
+   * @param {{ changed: boolean, replaced?: number[], removed?: number[], added?: number[], [key: string]: any }} delta
+   * @param {(record: number) => boolean} [isVisible]
+   */
   applyDelta(pack, delta, isVisible = () => true) {
     if (!this.pack) throw new Error("Load a model before applying a scene delta.");
     const previousOffset = this.pack.index.model_offset ?? [0, 0, 0];
@@ -1191,6 +1370,7 @@ export class IfcRenderer {
       depthRanks: this.depthRanks, depthContested: this.depthContested,
     };
     const geometryById = geometryIndex(pack);
+    this.levelsById = levelIndex(pack);
     const locations = Array(count).fill(null);
     for (let record = 0; record < count; record++) {
       if (!isActiveRecord(pack, record)) continue;
@@ -1216,7 +1396,7 @@ export class IfcRenderer {
     const range = delta.appended ?? delta;
     for (let record = range.from; record < range.to; record++) if (isActiveRecord(pack, record)) records.add(record);
     const plan = planRenderBatches(pack, undefined, colors, null, {
-      geometryById, contested: depthPlan.contested, recordLocations: locations, records,
+      geometryById, contested: depthPlan.contested, recordLocations: locations, records, textureOf: this.textureOf(pack),
     });
     const retained = this.batches.filter((batch) => !replacing.has(batch));
     const created = [], createdShared = [];
@@ -1241,11 +1421,11 @@ export class IfcRenderer {
           sharedByKey.set(key, shared);
           createdShared.push(shared);
         }
-        created.push(this.createInstancedBatch(group.geometry, prepared, group.records, group.transparent, shared));
+        created.push(this.createInstancedBatch(group.geometry, prepared, group.records, group.transparent, shared, group.texture));
       }
       for (const group of plan.baked) {
         const items = group.items.map((item) => ({ ...item, prepared: prepare(item.geometry, group.transparent) }));
-        created.push(this.createBakedBatch(items, group.color, group.vertexCount));
+        created.push(this.createBakedBatch(items, group.color, group.vertexCount, group.texture));
       }
     } catch (error) {
       for (const batch of created) this.releaseBatch(batch);
@@ -1299,12 +1479,14 @@ export class IfcRenderer {
       this.batches.reduce((bytes, batch) => bytes + batch.gpuBytes, 0) +
       this.sharedGeometryBuffers.reduce((bytes, shared) => bytes + shared.gpuBytes, 0);
     this.scheduleWirePreparation();
+    this.scheduleOccluderSelection();
     this.dirty = true;
     return { ...this.deltaSummary(), patchStats: { reusedBatches: retained.length, rebuiltBatches: replacing.size, createdBatches: created.length, uploadedBytes } };
   }
 
   releaseBatch(batch) {
     this.gl.deleteVertexArray(batch.vao);
+    for (const cluster of batch.clusters ?? []) if (cluster.vao) this.gl.deleteVertexArray(cluster.vao);
     for (const buffer of batch.buffers) this.gl.deleteBuffer(buffer);
   }
 
@@ -1358,31 +1540,107 @@ export class IfcRenderer {
     const indexBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+    const buffers = [positionBuffer, indexBuffer];
+    const indexType = indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+    let coarseIndexBuffer = null;
+    let coarseIndexCount = 0;
+    const coarse = this.coarseIndices(geometry, prepared, indexType);
+    if (coarse) {
+      coarseIndexBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, coarseIndexBuffer);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, coarse, gl.STATIC_DRAW);
+      coarseIndexCount = coarse.length;
+      buffers.push(coarseIndexBuffer);
+    }
+    let uvBuffer = null;
+    let uvBytes = 0;
+    if (this.textures && geometry.uv && geometry.uv.length === positions.length / 3 * 2) {
+      uvBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, geometry.uv, gl.STATIC_DRAW);
+      buffers.push(uvBuffer);
+      uvBytes = geometry.uv.byteLength;
+    }
     return {
       geometry,
       indices,
       positionBuffer,
       indexBuffer,
+      uvBuffer,
+      coarseIndexBuffer,
+      coarseIndexCount,
       indexCount: indices.length,
-      indexType: indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
+      indexType,
       wireBuffer: null,
       wireCount: 0,
-      gpuBytes: positions.byteLength + indices.byteLength,
-      buffers: [positionBuffer, indexBuffer],
+      gpuBytes: positions.byteLength + indices.byteLength + uvBytes + (coarse ? coarse.byteLength : 0),
+      buffers,
     };
   }
 
-  createInstancedBatch(geometry, prepared, records, transparent, shared) {
+  /** Give a shared geometry its coarse index buffer, once a level exists for it. */
+  refreshSharedCoarse(shared) {
     const gl = this.gl;
-    const { indices } = prepared;
+    if (shared.coarseIndexBuffer) {
+      gl.deleteBuffer(shared.coarseIndexBuffer);
+      shared.buffers = shared.buffers.filter((buffer) => buffer !== shared.coarseIndexBuffer);
+      shared.gpuBytes -= shared.coarseIndexCount * indexByteWidth(shared.indexType, gl);
+      shared.coarseIndexBuffer = null;
+      shared.coarseIndexCount = 0;
+    }
+    const prepared = { indices: shared.indices };
+    const coarse = this.coarseIndices(shared.geometry, prepared, shared.indexType);
+    if (!coarse) return false;
+    shared.coarseIndexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, shared.coarseIndexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, coarse, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+    shared.coarseIndexCount = coarse.length;
+    shared.buffers.push(shared.coarseIndexBuffer);
+    shared.gpuBytes += coarse.byteLength;
+    return true;
+  }
+
+  /**
+   * A vertex array over a shared mesh whose per-instance pointers start at
+   * `firstInstance`, so a run of instances can be drawn without a base instance.
+   */
+  createInstancedVao(shared, textured, matrixBuffer, colorBuffer, idBuffer, firstInstance) {
+    const gl = this.gl;
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
-
     gl.bindBuffer(gl.ARRAY_BUFFER, shared.positionBuffer);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-
+    if (textured) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, shared.uvBuffer);
+      gl.enableVertexAttribArray(7);
+      gl.vertexAttribPointer(7, 2, gl.FLOAT, false, 0, 0);
+    }
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, shared.indexBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, matrixBuffer);
+    for (let column = 0; column < 4; column += 1) {
+      const location = 1 + column;
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribPointer(location, 4, gl.FLOAT, false, 64, firstInstance * 64 + column * 16);
+      gl.vertexAttribDivisor(location, 1);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+    gl.enableVertexAttribArray(5);
+    gl.vertexAttribPointer(5, 4, gl.UNSIGNED_BYTE, true, 0, firstInstance * 4);
+    gl.vertexAttribDivisor(5, 1);
+    gl.bindBuffer(gl.ARRAY_BUFFER, idBuffer);
+    gl.enableVertexAttribArray(6);
+    gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 0, firstInstance * 4);
+    gl.vertexAttribDivisor(6, 1);
+    gl.bindVertexArray(null);
+    return vao;
+  }
+
+  createInstancedBatch(geometry, prepared, records, transparent, shared, texture = null) {
+    const gl = this.gl;
+    const { indices } = prepared;
+    const textured = texture !== null && texture !== undefined && Boolean(shared.uvBuffer);
 
     const matrices = new Float32Array(records.length * 16);
     const colors = new Uint8Array(records.length * 4);
@@ -1407,31 +1665,31 @@ export class IfcRenderer {
     const matrixBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, matrixBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, matrices, gl.STATIC_DRAW);
-    for (let column = 0; column < 4; column += 1) {
-      const location = 1 + column;
-      gl.enableVertexAttribArray(location);
-      gl.vertexAttribPointer(location, 4, gl.FLOAT, false, 64, column * 16);
-      gl.vertexAttribDivisor(location, 1);
-    }
-
     const colorBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(5);
-    gl.vertexAttribPointer(5, 4, gl.UNSIGNED_BYTE, true, 0, 0);
-    gl.vertexAttribDivisor(5, 1);
-
     const idBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, idBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, ids, gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(6);
-    gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 0, 0);
-    gl.vertexAttribDivisor(6, 1);
+    const vao = this.createInstancedVao(shared, textured, matrixBuffer, colorBuffer, idBuffer, 0);
 
-    gl.bindVertexArray(null);
+    // Clusters of consecutive instances; each past the first gets a vertex
+    // array whose instance pointers start at its first instance.
+    const vertices = prepared.positions.length / 3;
+    let clusters = null;
+    if (!transparent) {
+      clusters = planClusters(records, () => vertices, () => indices.length, (record) => this.recordLocations[record]?.bounds);
+      for (let at = 1; at < clusters.length; at += 1) {
+        clusters[at].vao = this.createInstancedVao(shared, textured, matrixBuffer, colorBuffer, idBuffer, clusters[at].first);
+      }
+      if (clusters[0]) clusters[0].vao = null;
+    }
 
     return {
       vao,
+      clusters,
+      clusterState: clusters ? new Uint8Array(clusters.length) : null,
+      clusterHidden: 0,
       baked: false,
       records: Uint32Array.from(records),
       color: null,
@@ -1452,15 +1710,18 @@ export class IfcRenderer {
       wireSources: [{ geometry, indices, base: 0 }],
       sharedGeometry: shared,
       indexType: shared.indexType,
+      texture: textured ? texture : null,
       gpuBytes: matrices.byteLength + colors.byteLength + ids.byteLength,
       buffers: [matrixBuffer, colorBuffer, idBuffer],
     };
   }
 
-  createBakedBatch(items, color, vertexCount) {
+  createBakedBatch(items, color, vertexCount, texture = null) {
     const gl = this.gl;
     const positions = new Float32Array(vertexCount * 3);
     const ids = new Float32Array(vertexCount);
+    const textured = texture !== null && texture !== undefined && this.textures;
+    const uvs = textured ? new Float32Array(vertexCount * 2) : null;
     const indexCount = items.reduce((total, item) => total + item.prepared.indices.length, 0);
     const IndexArray = vertexCount > 65_535 ? Uint32Array : Uint16Array;
     const indices = new IndexArray(indexCount);
@@ -1473,6 +1734,9 @@ export class IfcRenderer {
       const matrix = this.pack.instances.transforms.subarray(item.record * 16, item.record * 16 + 16);
       transformPositions(positions, vertexOffset * 3, source, matrix, this.renderOrigin);
       ids.fill(item.record, vertexOffset, vertexOffset + source.length / 3);
+      if (uvs && item.geometry.uv && item.geometry.uv.length === source.length / 3 * 2) {
+        uvs.set(item.geometry.uv, vertexOffset * 2);
+      }
       for (let index = 0; index < item.prepared.indices.length; index += 1) {
         indices[indexOffset + index] = item.prepared.indices[index] + vertexOffset;
       }
@@ -1503,13 +1767,33 @@ export class IfcRenderer {
     gl.bufferData(gl.ARRAY_BUFFER, ids, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(6);
     gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 0, 0);
+    let uvBuffer = null;
+    if (uvs) {
+      uvBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, uvs, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(7);
+      gl.vertexAttribPointer(7, 2, gl.FLOAT, false, 0, 0);
+    }
     const indexBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
     gl.bindVertexArray(null);
 
-    return {
+    // Clusters are index ranges, since the items were laid out in order.
+    const clusters = color[3] < 255 ? null : planClusters(
+      items,
+      (item) => item.prepared.positions.length / 3,
+      (item) => item.prepared.indices.length,
+      (item) => this.recordLocations[item.record]?.bounds,
+    );
+    const batch = {
       vao,
+      clusters,
+      clusterState: clusters ? new Uint8Array(clusters.length) : null,
+      clusterHidden: 0,
+      coarseIndexBuffer: null,
+      coarseIndexCount: 0,
       baked: true,
       records: Uint32Array.from(items, (item) => item.record),
       color: Float32Array.from(color, (value) => value / 255),
@@ -1528,9 +1812,122 @@ export class IfcRenderer {
       wireCount: 0,
       wireSources,
       indexType: indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT,
-      gpuBytes: positions.byteLength + indices.byteLength + ids.byteLength,
-      buffers: [positionBuffer, indexBuffer, idBuffer],
+      texture: uvs ? texture : null,
+      gpuBytes: positions.byteLength + indices.byteLength + ids.byteLength + (uvs ? uvs.byteLength : 0),
+      buffers: uvBuffer ? [positionBuffer, indexBuffer, idBuffer, uvBuffer] : [positionBuffer, indexBuffer, idBuffer],
     };
+    if (!batch.transparent) this.refreshBakedCoarse(batch);
+    return batch;
+  }
+
+  /**
+   * Build a baked batch's coarse index array: each item's level where the
+   * pack has one, its fine indices otherwise, laid out like the fine array
+   * so the clusters keep their ranges. Nothing is built when no item has a level.
+   */
+  refreshBakedCoarse(batch) {
+    const gl = this.gl;
+    if (batch.coarseIndexBuffer) {
+      gl.deleteBuffer(batch.coarseIndexBuffer);
+      batch.buffers = batch.buffers.filter((buffer) => buffer !== batch.coarseIndexBuffer);
+      batch.gpuBytes -= batch.coarseIndexCount * indexByteWidth(batch.indexType, gl);
+      this.gpuBufferBytes -= batch.coarseIndexCount * indexByteWidth(batch.indexType, gl);
+      batch.coarseIndexBuffer = null;
+      batch.coarseIndexCount = 0;
+    }
+    const sources = batch.wireSources ?? [];
+    if (!this.levelsById?.size || !sources.some((source) => this.levelsById.has(source.geometry.id))) return false;
+    const parts = sources.map((source) => this.coarseIndices(source.geometry, { indices: source.indices }, batch.indexType));
+    if (!parts.some(Boolean)) return false;
+    const counts = sources.map((source, at) => (parts[at] ? parts[at].length : source.indices.length));
+    const total = counts.reduce((sum, count) => sum + count, 0);
+    const IndexArray = batch.indexType === gl.UNSIGNED_INT ? Uint32Array : Uint16Array;
+    const coarse = new IndexArray(total);
+    let offset = 0;
+    sources.forEach((source, at) => {
+      const part = parts[at] ?? source.indices;
+      for (let index = 0; index < part.length; index += 1) coarse[offset + index] = part[index] + source.base;
+      offset += part.length;
+    });
+    if (batch.clusters) {
+      // One source per item, in the items' order, so a cluster's range is a sum over its items.
+      let start = 0;
+      for (const cluster of batch.clusters) {
+        let count = 0;
+        for (let item = cluster.first; item < cluster.first + cluster.count; item += 1) count += counts[item] ?? 0;
+        cluster.coarseOffset = start;
+        cluster.coarseCount = count;
+        start += count;
+      }
+    }
+    batch.coarseIndexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, batch.coarseIndexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, coarse, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+    batch.coarseIndexCount = coarse.length;
+    batch.buffers.push(batch.coarseIndexBuffer);
+    batch.gpuBytes += coarse.byteLength;
+    this.gpuBufferBytes += coarse.byteLength;
+    return true;
+  }
+
+  /** The coarse index buffer a batch draws with on a reduced frame, or null. */
+  coarseOf(batch) {
+    if (batch.baked) return batch.coarseIndexBuffer ? batch : null;
+    const shared = batch.sharedGeometry;
+    return shared?.coarseIndexBuffer ? shared : null;
+  }
+
+  /**
+   * Take coarse levels that arrived after the load: `pack` is the assembled
+   * pack holding them, `ids` the level entries' ids. Shared geometries gain
+   * their coarse index buffer, baked batches rebuild their coarse arrays;
+   * no vertex is uploaded again.
+   * @param {import("@tessifc/edit/types").Pack} pack
+   * @param {number[]} ids
+   */
+  applyLodLevels(pack, ids) {
+    if (this.contextLost || !this.pack) return { shared: 0, baked: 0 };
+    this.pack = pack;
+    this.levelsById = levelIndex(pack);
+    const bases = new Set();
+    const byId = geometryIndex(pack);
+    for (const id of ids) {
+      const level = byId.get(id);
+      if (level?.lod) bases.add(level.lod.of);
+    }
+    for (const key of [...this.coarseByGeometry.keys()]) {
+      if (bases.has(Number(key.split(":")[0]))) this.coarseByGeometry.delete(key);
+    }
+    let shared = 0, baked = 0;
+    for (const buffers of this.sharedGeometryBuffers) {
+      if (bases.has(buffers.geometry.id) && this.refreshSharedCoarse(buffers)) shared += 1;
+    }
+    for (const batch of this.batches) {
+      if (!batch.baked || batch.transparent) continue;
+      if (!(batch.wireSources ?? []).some((source) => bases.has(source.geometry.id))) continue;
+      if (this.refreshBakedCoarse(batch)) baked += 1;
+    }
+    this.gpuBufferBytes = this.visibility.byteLength +
+      this.batches.reduce((bytes, batch) => bytes + batch.gpuBytes, 0) +
+      this.sharedGeometryBuffers.reduce((bytes, item) => bytes + item.gpuBytes, 0);
+    this.dirty = true;
+    return { shared, baked };
+  }
+
+  /** Off draws the fine mesh on moving frames too. */
+  setMotionLod(active) {
+    const wanted = active !== false;
+    if (wanted === this.motionLod) return;
+    this.motionLod = wanted;
+    this.dirty = true;
+  }
+
+  /** What the pack and the GPU hold in coarse levels. */
+  meshLevelState() {
+    let coarseBatches = 0;
+    for (const batch of this.batches) if (this.coarseOf(batch)) coarseBatches += 1;
+    return { levels: this.levelsById.size, coarseBatches, motionLod: this.motionLod, coarseActive: this.coarseActive };
   }
 
   clear() {
@@ -1545,11 +1942,19 @@ export class IfcRenderer {
     this.pointers.clear();
     for (const batch of this.batches) {
       gl.deleteVertexArray(batch.vao);
+      for (const cluster of batch.clusters ?? []) if (cluster.vao) gl.deleteVertexArray(cluster.vao);
       for (const buffer of batch.buffers) gl.deleteBuffer(buffer);
     }
     for (const shared of this.sharedGeometryBuffers) {
       for (const buffer of shared.buffers) gl.deleteBuffer(buffer);
     }
+    this.cancelOccluderSelection();
+    this.occluders = null;
+    this.clusterCullActive = false;
+    this.lastFrameReduced = false;
+    this.coarseActive = false;
+    this.levelsById = new Map();
+    this.coarseByGeometry.clear();
     this.batches = [];
     this.opaqueBatches = [];
     this.contestedOpaqueBatches = [];
@@ -1583,6 +1988,8 @@ export class IfcRenderer {
     this.renderColors = new Uint8Array(0);
     this.dimmedProducts = 0;
     this.darkProducts = 0;
+    this.textureCache?.dispose();
+    this.textureCache = null;
     this.dirty = true;
   }
 
@@ -1594,6 +2001,11 @@ export class IfcRenderer {
     this.clear();
     this.gl.deleteProgram(this.surfaceProgram);
     this.gl.deleteProgram(this.sectionProgram);
+    if (this.texturedProgramSet) {
+      this.gl.deleteProgram(this.texturedProgramSet.surface);
+      this.gl.deleteProgram(this.texturedProgramSet.section);
+      this.texturedProgramSet = null;
+    }
     this.gl.deleteProgram(this.capProgram);
     this.gl.deleteVertexArray(this.capVao);
     this.gl.deleteBuffer(this.capBuffer);
@@ -1665,6 +2077,7 @@ export class IfcRenderer {
     const replacedBacking = this.canvas.width !== this.gpuPacingWidth || this.canvas.height !== this.gpuPacingHeight;
     const moving = this.interacting && (!this.drag || this.drag.moved || this.pointers.size > 1 || this.wheelQualityTimer);
     if (!this.gpuPacing.allow(force || replacedBacking, moving || this.streaming ? 2 : this.idleGpuLimit)) return;
+    this.motionFrame = Boolean(moving);
     this.adaptMotionScale(performance.now());
     const gl = this.gl;
     const offscreen = this.ensureRenderTarget();
@@ -1689,6 +2102,8 @@ export class IfcRenderer {
     gl.viewport(0, 0, width, height);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
     this.draw(false);
+    // A reduced frame is redrawn whole once the gesture ends.
+    this.lastFrameReduced = (this.clusterCullActive && this.occlusionStats.hiddenTriangles > 0) || (this.coarseActive && this.coarseDrawn > 0);
     if (offscreen) {
       if (!this.presentTarget()) {
         // Try the next target; the failed key stays skipped until the canvas resizes.
@@ -1730,7 +2145,17 @@ export class IfcRenderer {
     // Only sectioned views need fragment discard, which inhibits early depth rejection.
     this.program = this.section.active ? this.sectionProgram : this.surfaceProgram;
     this.uniforms = this.section.active ? this.sectionUniforms : this.surfaceUniforms;
+    this.programTextured = false;
+    this.framePicking = picking;
+    this.frameProjection = projection;
+    this.depthOnlyActive = false;
+    // Textures show in the shaded style only; every other pass keeps the flat colour.
+    this.frameTextured = !picking && this.textures && this.style === "shaded";
+    // Coarse levels stand in for their meshes on shaded moving frames only.
+    this.coarseActive = !picking && this.motionLod && this.motionFrame && this.style === "shaded" && !this.section.active && this.levelsById.size > 0;
+    this.coarseDrawn = 0;
     this.updateBatchVisibility();
+    this.applyOcclusion(picking);
     this.bindProgram(this.program, this.uniforms, picking, projection);
     const wire = !picking && this.style === "wire";
     const normalFill = !picking && !wire && this.style !== "xray";
@@ -1745,10 +2170,12 @@ export class IfcRenderer {
       let depthOnly = false;
       for (const batch of this.opaqueBatches) {
         if (batch.culled) continue;
-        const next = prepass && batch.depthContested && !batch.overlayResolved;
+        // A batch drawn coarse keeps its colour: its fine overlay is not drawn over it.
+        const next = prepass && batch.depthContested && !batch.overlayResolved && !(this.coarseActive && this.coarseOf(batch));
         if (next !== depthOnly) {
           gl.colorMask(!next, !next, !next, !next);
           gl.uniform1i(this.uniforms.uDepthOnly, next ? 1 : 0);
+          this.depthOnlyActive = next;
           depthOnly = next;
         }
         this.drawBatch(batch);
@@ -1756,6 +2183,7 @@ export class IfcRenderer {
       if (depthOnly) {
         gl.colorMask(true, true, true, true);
         gl.uniform1i(this.uniforms.uDepthOnly, 0);
+        this.depthOnlyActive = false;
       }
 
       if (this.depthTieBreak && this.depthOverlayPrecisionSafe && this.contestedOpaqueBatches.length) {
@@ -1764,7 +2192,7 @@ export class IfcRenderer {
         gl.depthMask(false);
         gl.depthFunc(this.reversedDepth ? gl.GEQUAL : gl.LEQUAL);
         for (const batch of this.contestedOpaqueBatches) {
-          if (batch.culled) continue;
+          if (batch.culled || (this.coarseActive && this.coarseOf(batch))) continue;
           const maximumDepth = this.depthOverlayMaximumDepthForBatch(batch);
           this.applyOverlayOffset(offset, maximumDepth);
           this.drawBatch(batch, false, this.uniforms, Boolean(batch.overlay));
@@ -1833,22 +2261,203 @@ export class IfcRenderer {
     if (blending) gl.disable(gl.BLEND);
   }
 
+  /** Switch between the flat and the textured program mid-frame, carrying the frame's uniforms over. */
+  activateProgram(textured) {
+    if (textured === this.programTextured) return;
+    const gl = this.gl;
+    let program, locations;
+    if (textured) {
+      const programs = this.texturedPrograms();
+      program = this.section.active ? programs.section : programs.surface;
+      locations = this.section.active ? programs.sectionUniforms : programs.surfaceUniforms;
+    } else {
+      program = this.section.active ? this.sectionProgram : this.surfaceProgram;
+      locations = this.section.active ? this.sectionUniforms : this.surfaceUniforms;
+    }
+    this.program = program;
+    this.uniforms = locations;
+    this.programTextured = textured;
+    this.bindProgram(program, locations, this.framePicking, this.frameProjection ?? this.projection);
+    gl.uniform1i(locations.uDepthOnly, this.depthOnlyActive ? 1 : 0);
+    if (textured) gl.uniform1i(locations.uTexture, 1);
+  }
+
+  /** Bind the batch's texture on unit 1, the placeholder until it has decoded. */
+  bindBatchTexture(batch, locations) {
+    const gl = this.gl;
+    const cache = this.ensureTextureCache();
+    const pack = this.pack;
+    const entry = cache.get(batch.texture, () => (pack?.index?.textures ?? []).find((record) => record.id === batch.texture));
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, cache.handleOf(entry));
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniformMatrix3fv(locations.uUvTransform, false, entry.transform);
+  }
+
   drawBatch(batch, wire = false, locations = this.uniforms, overlay = false) {
     if (batch.culled) return;
     const gl = this.gl;
-    gl.bindVertexArray(batch.vao);
+    const textured = this.frameTextured && !wire && batch.texture !== null && batch.texture !== undefined;
+    this.activateProgram(textured);
+    locations = this.uniforms;
+    if (textured) this.bindBatchTexture(batch, locations);
     gl.uniform1i(locations.uBaked, batch.baked ? 1 : 0);
     gl.uniform1i(locations.uPlainBatch, batch.allRecordsVisible && !batch.anyRecordSelected ? 1 : 0);
-    if (batch.baked) gl.vertexAttrib4fv(5, batch.color);
     const subset = overlay && batch.overlay ? batch.overlay : null;
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, wire ? batch.wireBuffer : subset ? subset.buffer : batch.indexBuffer);
+    const coarse = !wire && !subset && this.coarseActive ? this.coarseOf(batch) : null;
+    if (coarse) this.coarseDrawn += 1;
+    // A moving frame with hidden clusters draws the visible runs; anything else draws the batch whole.
+    if (!wire && this.clusterCullActive && batch.clusterHidden > 0 && batch.clusters) {
+      for (const [first, count] of visibleRuns(batch.clusterState)) this.drawClusterRun(batch, first, count, subset, coarse);
+      return;
+    }
+    gl.bindVertexArray(batch.vao);
+    if (batch.baked) gl.vertexAttrib4fv(5, batch.color);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, wire ? batch.wireBuffer : subset ? subset.buffer : coarse ? coarse.coarseIndexBuffer : batch.indexBuffer);
     gl.drawElementsInstanced(
       wire ? gl.LINES : gl.TRIANGLES,
-      wire ? batch.wireCount : subset ? subset.count : batch.indexCount,
+      wire ? batch.wireCount : subset ? subset.count : coarse ? coarse.coarseIndexCount : batch.indexCount,
       batch.indexType,
       0,
       batch.instanceCount,
     );
+  }
+
+  /** One draw for `count` consecutive clusters from `first`: an index range of a baked batch, a run of instances otherwise. */
+  drawClusterRun(batch, first, count, subset, coarse = null) {
+    const gl = this.gl;
+    const clusters = batch.clusters;
+    const head = clusters[first];
+    if (batch.baked) {
+      let indexCount = 0;
+      for (let at = first; at < first + count; at += 1) {
+        indexCount += subset ? (clusters[at].overlayCount ?? 0) : coarse ? (clusters[at].coarseCount ?? 0) : clusters[at].indexCount;
+      }
+      if (!indexCount) return;
+      const offset = subset ? (head.overlayOffset ?? 0) : coarse ? (head.coarseOffset ?? 0) : head.indexOffset;
+      gl.bindVertexArray(batch.vao);
+      gl.vertexAttrib4fv(5, batch.color);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, subset ? subset.buffer : coarse ? coarse.coarseIndexBuffer : batch.indexBuffer);
+      gl.drawElementsInstanced(gl.TRIANGLES, indexCount, batch.indexType, offset * indexByteWidth(batch.indexType, gl), 1);
+      return;
+    }
+    let instances = 0;
+    for (let at = first; at < first + count; at += 1) instances += clusters[at].count;
+    gl.bindVertexArray(head.vao ?? batch.vao);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, subset ? subset.buffer : coarse ? coarse.coarseIndexBuffer : batch.indexBuffer);
+    gl.drawElementsInstanced(gl.TRIANGLES, subset ? subset.count : coarse ? coarse.coarseIndexCount : batch.indexCount, batch.indexType, 0, instances);
+  }
+
+  /**
+   * Decide the clusters a moving frame leaves out: those outside the lateral
+   * frustum and those behind the occluder grid. Any other frame draws every
+   * cluster, so a rest frame is never reduced.
+   */
+  applyOcclusion(picking) {
+    const active = !picking && this.clusterCulling && this.motionFrame && this.style === "shaded" && !this.section.active;
+    const inside = this.camera.distance < this.renderBounds.radius * OCCLUSION_INSIDE_RADII;
+    const occlude = active && inside && this.occlusionCulling && Boolean(this.occluders && this.occluders.count > 0);
+    this.clusterCullActive = active;
+    const stats = this.occlusionStats;
+    if (!active) {
+      if (this.clusterStatesDirty) {
+        for (const batch of this.opaqueBatches) if (batch.clusterState) { batch.clusterState.fill(0); batch.clusterHidden = 0; }
+        this.clusterStatesDirty = false;
+      }
+      stats.frustumHidden = stats.occluded = stats.hiddenTriangles = stats.submittedTriangles = stats.occludersDrawn = 0;
+      return;
+    }
+    const width = this.target?.frameWidth ?? this.canvas.width;
+    const height = this.target?.frameHeight ?? this.canvas.height;
+    const aspect = width / Math.max(height, 1);
+    if (!this.occlusionGrid || Math.abs(this.occlusionGrid.width / this.occlusionGrid.height - aspect) > 0.05) {
+      this.occlusionGrid = createOcclusionGrid(OCCLUSION_GRID_WIDTH, aspect);
+    }
+    const near = this.cameraDepthRange.near;
+    const isVisible = (record) => isActiveRecord(this.pack, record) && this.visibility[record * 2] >= 128;
+    if (occlude) rasteriseOccluders(this.occlusionGrid, this.viewProjection, this.view, near, this.occluders, isVisible);
+    const delta = Math.max(4 * DEPTH_OVERLAY_DISTANCE_TOLERANCE, this.renderBounds.radius * 2e-5, 1e-3);
+    let clusters = 0, frustumHidden = 0, occluded = 0, hiddenTriangles = 0, submitted = 0;
+    for (const batch of this.opaqueBatches) {
+      if (!batch.clusters || !batch.clusterState) continue;
+      const state = batch.clusterState;
+      let hidden = 0;
+      if (batch.culled) {
+        state.fill(0);
+        batch.clusterHidden = 0;
+        continue;
+      }
+      const perInstance = batch.baked ? 1 : batch.indexCount / 3;
+      for (let at = 0; at < batch.clusters.length; at += 1) {
+        const cluster = batch.clusters[at];
+        const triangles = batch.baked ? cluster.indexCount / 3 : cluster.count * perInstance;
+        clusters += 1;
+        submitted += triangles;
+        let bits = 0;
+        if (cluster.bounded) {
+          if (!boxInView(cluster.center, cluster.halfExtents, this.viewPlanes)) { bits = 1; frustumHidden += 1; }
+          else if (occlude && clusterHidden(this.occlusionGrid, this.viewProjection, this.view, near, cluster.center, cluster.halfExtents, delta)) { bits = 2; occluded += 1; }
+        }
+        state[at] = bits;
+        if (bits) { hidden += 1; hiddenTriangles += triangles; }
+      }
+      batch.clusterHidden = hidden;
+    }
+    this.clusterStatesDirty = true;
+    stats.clusters = clusters;
+    stats.frustumHidden = frustumHidden;
+    stats.occluded = occluded;
+    stats.hiddenTriangles = hiddenTriangles;
+    stats.submittedTriangles = submitted;
+    stats.occludersDrawn = occlude ? this.occlusionGrid.used : 0;
+  }
+
+  /** Pick the model's occluders in idle slices; nothing is occluded until they exist. */
+  scheduleOccluderSelection() {
+    this.cancelOccluderSelection();
+    this.occluders = null;
+    if (!this.occlusionCulling || !this.pack || !this.pack.instances.count) return;
+    const selection = createOccluderSelection(this.pack, this.renderColors, this.renderOrigin, {
+      radius: this.renderBounds.radius,
+      isActive: (record) => isActiveRecord(this.pack, record),
+    });
+    const work = { selection, handle: null };
+    const slice = () => {
+      work.handle = null;
+      if (this.occluderSelection !== work || this.contextLost) return;
+      if (selection.step(performance.now() + OCCLUDER_SLICE_MS)) {
+        this.occluders = selection.result();
+        this.occluderSelection = null;
+        return;
+      }
+      work.handle = whenIdle(slice);
+    };
+    this.occluderSelection = work;
+    work.handle = whenIdle(slice);
+  }
+
+  cancelOccluderSelection() {
+    const work = this.occluderSelection;
+    if (!work) return;
+    if (work.handle) cancelWhenIdle(work.handle);
+    this.occluderSelection = null;
+  }
+
+  /** Off draws every cluster on moving frames too; on selects the model's occluders first. */
+  setOcclusionCulling(active) {
+    const wanted = active !== false;
+    if (wanted === this.occlusionCulling) return;
+    this.occlusionCulling = wanted;
+    if (wanted && !this.occluders && !this.occluderSelection) this.scheduleOccluderSelection();
+    this.dirty = true;
+  }
+
+  /** Off draws whole batches on moving frames, as a rest frame does. */
+  setClusterCulling(active) {
+    const wanted = active !== false;
+    if (wanted === this.clusterCulling) return;
+    this.clusterCulling = wanted;
+    this.dirty = true;
   }
 
   /** One toward-camera step: clamped with the extension, whole depth units without it. */
@@ -2071,6 +2680,20 @@ export class IfcRenderer {
       targetBytes: this.renderTargetBytes(),
       canvasBytes: this.canvasStorageBytes(),
       pixelRatio: this.canvas.width / Math.max(this.canvasCssWidth, 1),
+      texturesActive: this.textures,
+      texturedBatches: this.batches.filter((batch) => batch.texture !== null && batch.texture !== undefined).length,
+      texturesLoaded: this.textureCache?.readyCount ?? 0,
+      coarseActive: this.coarseActive,
+      lod: this.meshLevelState(),
+      occlusionState: {
+        clusterCulling: this.clusterCulling,
+        enabled: this.occlusionCulling,
+        occluders: this.occluders ? this.occluders.count : 0,
+        selecting: Boolean(this.occluderSelection),
+        active: this.clusterCullActive,
+        lastFrameReduced: this.lastFrameReduced,
+        ...this.occlusionStats,
+      },
     };
   }
 
@@ -2154,7 +2777,7 @@ export class IfcRenderer {
     this.background.set(parseHexColor(color) ?? CANVAS_COLORS[this.viewportTheme]);
     this.sectionCapColor =
       parseHexColor(capColor) ?? SECTION_CAP_COLORS[this.viewportTheme];
-    this.gl.clearColor(...this.background, 1);
+    this.gl.clearColor(this.background[0], this.background[1], this.background[2], 1);
     this.dirty = true;
   }
 
@@ -2223,6 +2846,7 @@ export class IfcRenderer {
     gl.clear(gl.STENCIL_BUFFER_BIT);
     gl.bindVertexArray(null);
     this.bindProgram(this.program, this.uniforms, false, this.projection);
+    if (this.programTextured) this.gl.uniform1i(this.uniforms.uTexture, 1);
     this.cappingActive = true;
   }
 
@@ -2813,7 +3437,7 @@ export class IfcRenderer {
       const remaining = this.pointers.values().next().value;
       this.drag = remaining ? { ...remaining, startX: remaining.x, startY: remaining.y, moved: true, pan: this.camera.mode !== "perspective" } : null;
       this.interacting = this.pointers.size > 0 || Boolean(this.wheelQualityTimer);
-      if (!this.interacting && this.target?.slot === "gesture") this.dirty = true;
+      if (!this.interacting && (this.target?.slot === "gesture" || this.lastFrameReduced)) this.dirty = true;
       // Notify the scheduler of the boundary without redrawing an unchanged full-quality frame.
       this.onCameraChange?.();
     };
@@ -2833,7 +3457,7 @@ export class IfcRenderer {
         this.wheelQualityTimer = setTimeout(() => {
           this.wheelQualityTimer = 0;
           this.interacting = this.pointers.size > 0;
-          if (!this.interacting && this.target?.slot === "gesture") this.dirty = true;
+          if (!this.interacting && (this.target?.slot === "gesture" || this.lastFrameReduced)) this.dirty = true;
           this.onCameraChange?.();
         }, 120);
       },
@@ -2929,6 +3553,11 @@ layout(location=3) in vec4 aModel2;
 layout(location=4) in vec4 aModel3;
 layout(location=5) in vec4 aColor;
 layout(location=6) in float aRecord;
+#ifdef TEXTURED
+layout(location=7) in vec2 aUv;
+uniform mat3 uUvTransform;
+out vec2 vUv;
+#endif
 uniform mat4 uProjection;
 uniform mat4 uView;
 uniform bool uBaked;
@@ -2949,6 +3578,9 @@ void main() {
   vColor = aColor;
   vDepth = length(view.xyz);
   vRecord = aRecord;
+  #ifdef TEXTURED
+  vUv = (uUvTransform * vec3(aUv, 1.0)).xy;
+  #endif
   // Skipping the per-vertex fetch matters: most batches are wholly visible and unselected.
   if (uPlainBatch) {
     vVisible = 1.0;
@@ -2973,6 +3605,10 @@ in float vDepth;
 flat in float vRecord;
 flat in float vVisible;
 flat in float vSelected;
+#ifdef TEXTURED
+in vec2 vUv;
+uniform sampler2D uTexture;
+#endif
 uniform bool uPicking;
 uniform bool uDepthOnly;
 uniform int uStyle;
@@ -3008,8 +3644,13 @@ void main() {
   vec3 lightB = normalize(vec3(-0.65, 0.20, 0.42));
   float hemisphere = mix(0.38, 0.58, normal.z * 0.5 + 0.5);
   float diffuse = hemisphere + max(dot(normal, lightA), 0.0) * 0.52 + max(dot(normal, lightB), 0.0) * 0.16;
+  vec3 base = vColor.rgb;
+  #ifdef TEXTURED
+  // The texture modulates the surface colour in the shaded style only.
+  if (uStyle == 0) base *= texture(uTexture, vUv).rgb;
+  #endif
   // IGP colours are display-space values: light in roughly linear space and convert back.
-  vec3 color = vColor.rgb * pow(max(diffuse, 0.0), 1.0 / 2.2);
+  vec3 color = base * pow(max(diffuse, 0.0), 1.0 / 2.2);
   if (vSelected > 0.5) color = mix(color, vec3(1.0, 0.28, 0.12), 0.72);
   else if (vSelected > 0.0) color = mix(color, vec3(0.36, 0.74, 1.0), min(vSelected * 1.5, 0.75));
   float alpha = vColor.a;
@@ -3173,7 +3814,7 @@ export function planDepthMaterials(
   colors,
   recordBounds,
   recordCount = Math.floor(colors.length / 4),
-  isVisible = () => true,
+  /** @type {(record: number) => boolean} */ isVisible = () => true,
   options = {},
 ) {
   const rankPlan = planDepthRanks(colors, recordCount);
@@ -3332,13 +3973,18 @@ function luminanceOf(red, green, blue) {
   return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
 }
 
-/** The pack's colours with both floors applied; the input is never modified. */
+/** @typedef {Uint8Array & { active?: Uint8Array | null, raisedCount?: number, brightenedCount?: number }} DisplayColors */
+
+/**
+ * The pack's colours with both floors applied; the input is never modified.
+ * @returns {DisplayColors}
+ */
 export function displayColors(
   pack,
   minimumAlpha = MINIMUM_VISIBLE_ALPHA,
   minimumLuminance = MINIMUM_VISIBLE_LUMINANCE,
 ) {
-  const colors = Uint8Array.from(pack.instances.colors);
+  const colors = /** @type {DisplayColors} */ (Uint8Array.from(pack.instances.colors));
   if (pack.instances.active) colors.active = pack.instances.active;
   const floors = applyDisplayFloors(colors, 0, pack.instances.count, minimumAlpha, minimumLuminance, pack.instances.active);
   colors.raisedCount = floors.raised;
@@ -3462,6 +4108,9 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
   // uncontested neighbours into the overlay pass.
   const contested = options.contested ?? null;
   const contestKey = (record) => (contested?.[record] ? 1 : 0);
+  // A textured record draws with its own program, so it never shares a batch with an untextured one.
+  const textureOf = options.textureOf ?? null;
+  const textureKey = (record, geometry) => (textureOf ? textureOf(record, geometry) ?? null : null);
   const locations = options.recordLocations ?? null;
   const instanceMinVertices = Number.isFinite(options.instanceMinVertices)
     ? Math.max(0, options.instanceMinVertices)
@@ -3479,6 +4128,8 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
     if (!geometryById.has(geometryId)) continue;
     const transparent = shade[record * 4 + 3] < 255;
     sourceGroups.add(`${geometryId}:${transparent ? 1 : 0}`);
+    const geometry = geometryById.get(geometryId);
+    const texture = textureKey(record, geometry);
     if (transparent) {
       transparentGeometryUse.set(
         geometryId,
@@ -3486,15 +4137,16 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
       );
       transparentItems.push({
         record,
-        geometry: geometryById.get(geometryId),
+        geometry,
+        texture,
       });
       continue;
     }
     opaqueGeometryUse.set(geometryId, (opaqueGeometryUse.get(geometryId) ?? 0) + 1);
     const colorKey = Array.from(shade.subarray(record * 4, record * 4 + 4)).join(",");
-    const key = `${geometryId}:0:${colorKey}:${contestKey(record)}`;
+    const key = `${geometryId}:0:${colorKey}:${contestKey(record)}:${texture ?? ""}`;
     if (!byGeometry.has(key)) {
-      byGeometry.set(key, { geometry: geometryById.get(geometryId), transparent: false, records: [] });
+      byGeometry.set(key, { geometry, transparent: false, records: [], texture });
     }
     byGeometry.get(key).records.push(record);
   }
@@ -3542,8 +4194,8 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
     // Small reused geometry joins the colour batches one copy per record.
     for (const record of group.records) {
       const color = Array.from(shade.subarray(record * 4, record * 4 + 4));
-      const key = `${color.join(",")}:${contestKey(record)}`;
-      if (!byColor.has(key)) byColor.set(key, { color, items: [] });
+      const key = `${color.join(",")}:${contestKey(record)}:${group.texture ?? ""}`;
+      if (!byColor.has(key)) byColor.set(key, { color, items: [], texture: group.texture ?? null });
       byColor.get(key).items.push({ record, geometry: group.geometry });
     }
   }
@@ -3561,6 +4213,7 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
         transparent: material.color[3] < 255,
         items,
         vertexCount,
+        texture: material.texture,
       });
       items = [];
       vertexCount = 0;
@@ -3585,6 +4238,7 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
         geometry: item.geometry,
         transparent: true,
         records: [item.record],
+        texture: item.texture,
       });
     } else {
       const color = Array.from(shade.subarray(item.record * 4, item.record * 4 + 4));
@@ -3593,6 +4247,7 @@ export function planRenderBatches(pack, vertexLimit = BATCH_VERTEX_LIMIT, colors
         transparent: true,
         items: [item],
         vertexCount: item.geometry.positions.length / 3,
+        texture: item.texture,
       });
     }
   }
@@ -3995,8 +4650,36 @@ function createEdgeSet(indexCount) {
 }
 
 /** The meshes of a pack by id, built once per pass rather than once per caller. */
+/**
+ * The texture a record draws with, or null: a material row naming a texture
+ * and a mesh carrying texture coordinates.
+ * @param {{ instances: { material?: Uint32Array | null }, index?: { materials?: Array<Record<string, any>> } }} pack
+ * @param {number} record
+ * @param {{ uv?: Float32Array | null } | undefined} geometry
+ * @returns {number | null}
+ */
+export function recordTextureId(pack, record, geometry) {
+  const column = pack.instances.material;
+  if (!column || !geometry?.uv) return null;
+  const row = column[record];
+  if (row === NO_MATERIAL || row === undefined) return null;
+  const material = pack.index?.materials?.[row];
+  return typeof material?.texture === "number" ? material.texture : null;
+}
+
 function geometryIndex(pack) {
   return new Map(pack.geometry.map((item) => [item.id, item]));
+}
+
+/** Base geometry id -> its first coarse level, the one moving frames draw. */
+function levelIndex(pack) {
+  const levels = new Map();
+  for (const item of pack.geometry) {
+    if (!item.lod || !Number.isInteger(item.lod.of)) continue;
+    const known = levels.get(item.lod.of);
+    if (!known || item.lod.level < known.lod.level) levels.set(item.lod.of, item);
+  }
+  return levels;
 }
 
 function isActiveRecord(pack, record) {
@@ -4007,6 +4690,7 @@ function activePredicate(pack, predicate) {
   return (record) => isActiveRecord(pack, record) && predicate(record);
 }
 
+/** @param {any} pack @param {(record: number) => boolean} [isVisible] */
 function computeModelBounds(pack, isVisible = () => true) {
   const bounds = emptyBounds();
   const geometry = geometryIndex(pack);

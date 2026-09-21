@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # three-viewer
 
-A drag-and-drop IFC viewer in one HTML file. Parsing, geometry and rendering
-all happen in the tab; nothing is uploaded anywhere.
+A drag-and-drop IFC viewer in one HTML page and one script. Parsing,
+geometry and rendering all happen in the tab; nothing is uploaded anywhere.
+`main.js` runs under `// @ts-check` against the packages' declarations.
 
 ## Running it
 
@@ -16,7 +17,9 @@ python -m http.server 8000 --bind 127.0.0.1
 ```
 
 Then open <http://127.0.0.1:8000/examples/three-viewer/> and drop a `.ifc` file
-on it.
+on it. The import map at the top of the page points the package names at the
+checkout and three.js at a CDN; with a bundler, install the packages and
+delete the map.
 
 ## What it shows
 

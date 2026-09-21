@@ -80,6 +80,20 @@ pub struct Settings {
     pub cut_openings: bool,
     /// How deep a representation graph may nest before it is abandoned.
     pub max_depth: u32,
+    /// Stop evaluating once this many triangles exist across the model; `None` is no limit.
+    pub max_total_triangles: Option<u64>,
+    /// Stop evaluating once this many vertices exist across the model; `None` is no limit.
+    pub max_total_vertices: Option<u64>,
+    /// Stop evaluating once this much wall time has passed, in milliseconds; `None` is no limit.
+    pub max_geometry_ms: Option<f64>,
+    /// Read materials and textures and carry texture coordinates. Off by
+    /// default: packs stay byte-identical and no texture is ever fetched.
+    pub textures: bool,
+    /// The most bytes one embedded texture may hold.
+    pub max_texture_bytes: usize,
+    /// Coarse levels to write for large meshes, 0 to 2. Off by default:
+    /// packs stay byte-identical, and a level is a function of its mesh.
+    pub lod_levels: u8,
 }
 
 impl Default for Settings {
@@ -99,6 +113,12 @@ impl Default for Settings {
             weld: true,
             cut_openings: true,
             max_depth: 24,
+            max_total_triangles: None,
+            max_total_vertices: None,
+            max_geometry_ms: None,
+            textures: false,
+            max_texture_bytes: 16 << 20,
+            lod_levels: 0,
         }
     }
 }
@@ -130,6 +150,21 @@ impl Settings {
         }
         if !(1..=128).contains(&self.max_depth) {
             return Err(invalid("maxDepth must be in [1, 128]"));
+        }
+        if self.max_total_triangles == Some(0) {
+            return Err(invalid("maxTotalTriangles must be positive"));
+        }
+        if self.max_total_vertices == Some(0) {
+            return Err(invalid("maxTotalVertices must be positive"));
+        }
+        if self
+            .max_geometry_ms
+            .is_some_and(|ms| !ms.is_finite() || ms <= 0.0)
+        {
+            return Err(invalid("maxGeometryMs must be finite and positive"));
+        }
+        if self.lod_levels > 2 {
+            return Err(invalid("lodLevels must be 0, 1 or 2"));
         }
         Ok(())
     }
@@ -189,6 +224,11 @@ impl DiagnosticSink {
     /// Record an error against an instance.
     pub fn error(&self, code: DiagCode, express_id: u32, message: impl Into<String>) {
         self.push(Diagnostic::error(code, 0, message).with_id(express_id));
+    }
+
+    /// Record a note against an instance.
+    pub fn info(&self, code: DiagCode, express_id: u32, message: impl Into<String>) {
+        self.push(Diagnostic::info(code, 0, message).with_id(express_id));
     }
 
     /// Take everything recorded so far.
@@ -329,10 +369,22 @@ pub struct EvalCtx<'a> {
     materials: RefCell<Option<MaterialTable>>,
     /// Geometry of each `IfcRepresentationMap`, before per-instance targets.
     mapped_geometry: RefCell<HashMap<u32, MappedResult>>,
+    /// Alignment curves by entity, shared by every placement and sweep along them.
+    alignment_curves: RefCell<HashMap<u32, AlignmentResult>>,
     /// Same-colour items of a mapped representation merged, keyed by (representation, items).
     merged_mapped: RefCell<HashMap<(u32, u64), Arc<Mesh64>>>,
     /// `IfcIndexedColourMap` by the face set it colours, built on first use.
     colour_maps: RefCell<Option<HashMap<u32, u32>>>,
+    /// Indexed texture maps by the face set they map, built on first use.
+    texture_maps: RefCell<Option<HashMap<u32, u32>>>,
+    /// Face texture maps by the face they map, built on first use.
+    face_texture_maps: RefCell<Option<HashMap<u32, u32>>>,
+    /// Coordinate generators by the texture they generate for, built on first use.
+    generators: RefCell<Option<HashMap<u32, String>>>,
+    /// Materials read so far, by surface style.
+    materials_by_style: RefCell<HashMap<u32, Option<Arc<crate::style::Material>>>>,
+    /// Textures read so far, by texture entity.
+    textures_by_id: RefCell<HashMap<u32, Option<Arc<crate::style::Texture>>>>,
     /// Boolean outcomes retained across nested evaluation and cached families.
     boolean_outcomes: RefCell<HashMap<u32, crate::product::BooleanStatus>>,
     /// Boolean results of the product being evaluated, by item id.
@@ -349,6 +401,9 @@ pub(crate) type MappedResult = Result<Arc<Vec<MappedPart>>, GeomError>;
 /// Material colours by object id, built once per model.
 pub(crate) type MaterialTable = Arc<HashMap<u32, crate::style::Rgba>>;
 
+/// An alignment curve, or the error building it gave.
+pub(crate) type AlignmentResult = Result<Arc<crate::eval::alignment::SpatialCurve>, GeomError>;
+
 /// Everything a context remembers between products.
 ///
 /// A streaming caller carries these across contexts with [`EvalCtx::into_caches`].
@@ -360,6 +415,7 @@ pub struct EvalCaches {
     materials: Option<MaterialTable>,
     mapped_geometry: HashMap<u32, MappedResult>,
     merged_mapped: HashMap<(u32, u64), Arc<Mesh64>>,
+    alignment_curves: HashMap<u32, AlignmentResult>,
 }
 
 impl EvalCaches {
@@ -402,7 +458,13 @@ impl<'a> EvalCtx<'a> {
             materials: RefCell::new(caches.materials),
             mapped_geometry: RefCell::new(caches.mapped_geometry),
             merged_mapped: RefCell::new(caches.merged_mapped),
+            alignment_curves: RefCell::new(caches.alignment_curves),
             colour_maps: RefCell::new(None),
+            texture_maps: RefCell::new(None),
+            face_texture_maps: RefCell::new(None),
+            generators: RefCell::new(None),
+            materials_by_style: RefCell::new(HashMap::new()),
+            textures_by_id: RefCell::new(HashMap::new()),
             boolean_outcomes: RefCell::new(caches.boolean_outcomes),
             boolean_meshes: RefCell::new(HashMap::new()),
             depth: std::cell::Cell::new(0),
@@ -453,6 +515,7 @@ impl<'a> EvalCtx<'a> {
             materials: self.materials.into_inner(),
             mapped_geometry: self.mapped_geometry.into_inner(),
             merged_mapped: self.merged_mapped.into_inner(),
+            alignment_curves: self.alignment_curves.into_inner(),
         }
     }
 
@@ -527,6 +590,91 @@ impl<'a> EvalCtx<'a> {
             .clone()
     }
 
+    /// The indexed texture map of a tessellated face set, if the file has one.
+    pub fn texture_map_of(&self, face_set: u32) -> Option<u32> {
+        let mut maps = self.texture_maps.borrow_mut();
+        let index = maps.get_or_insert_with(|| {
+            self.model
+                .entities_of_type("IfcIndexedTriangleTextureMap")
+                .chain(self.model.entities_of_type("IfcIndexedPolygonalTextureMap"))
+                .filter_map(|map| {
+                    map.attr("MappedTo")
+                        .as_entity()
+                        .map(|target| (target.id(), map.id()))
+                })
+                .collect()
+        });
+        index.get(&face_set).copied()
+    }
+
+    /// The `IfcTextureMap` of a face, if the file has one.
+    pub fn face_texture_map_of(&self, face: u32) -> Option<u32> {
+        let mut maps = self.face_texture_maps.borrow_mut();
+        let index = maps.get_or_insert_with(|| {
+            self.model
+                .entities_of_type("IfcTextureMap")
+                .filter_map(|map| {
+                    map.attr("MappedTo")
+                        .as_entity()
+                        .map(|target| (target.id(), map.id()))
+                })
+                .collect()
+        });
+        index.get(&face).copied()
+    }
+
+    /// The mode of the coordinate generator that maps a texture, if any.
+    pub fn generator_of(&self, texture: u32) -> Option<String> {
+        let mut generators = self.generators.borrow_mut();
+        let index = generators.get_or_insert_with(|| {
+            let mut index = HashMap::new();
+            for generator in self.model.entities_of_type("IfcTextureCoordinateGenerator") {
+                let Some(mode) = generator.attr("Mode").as_text() else {
+                    continue;
+                };
+                for value in generator.attr("Maps").as_list().into_iter().flatten() {
+                    if let Some(mapped) = value.as_entity() {
+                        index.entry(mapped.id()).or_insert_with(|| mode.decode());
+                    }
+                }
+            }
+            index
+        });
+        index.get(&texture).cloned()
+    }
+
+    /// The material of a surface style, read once with `build`.
+    pub(crate) fn material_of(
+        &self,
+        style: u32,
+        build: impl FnOnce() -> Option<crate::style::Material>,
+    ) -> Option<Arc<crate::style::Material>> {
+        if let Some(known) = self.materials_by_style.borrow().get(&style) {
+            return known.clone();
+        }
+        let material = build().map(Arc::new);
+        self.materials_by_style
+            .borrow_mut()
+            .insert(style, material.clone());
+        material
+    }
+
+    /// A texture, read once with `build`.
+    pub(crate) fn texture_of(
+        &self,
+        texture: u32,
+        build: impl FnOnce() -> Option<crate::style::Texture>,
+    ) -> Option<Arc<crate::style::Texture>> {
+        if let Some(known) = self.textures_by_id.borrow().get(&texture) {
+            return known.clone();
+        }
+        let read = build().map(Arc::new);
+        self.textures_by_id
+            .borrow_mut()
+            .insert(texture, read.clone());
+        read
+    }
+
     /// Evaluate a mapped representation once and share it across mapping targets.
     ///
     /// Caching the source also emits its diagnostics once rather than per placement.
@@ -543,6 +691,22 @@ impl<'a> EvalCtx<'a> {
             .borrow_mut()
             .insert(representation_id, parts.clone());
         parts
+    }
+
+    /// The alignment curve of an entity, built once with `build` and then shared.
+    pub(crate) fn alignment_curve(
+        &self,
+        curve_id: u32,
+        build: impl FnOnce() -> Result<crate::eval::alignment::SpatialCurve, GeomError>,
+    ) -> AlignmentResult {
+        if let Some(curve) = self.alignment_curves.borrow().get(&curve_id) {
+            return curve.clone();
+        }
+        let curve = build().map(Arc::new);
+        self.alignment_curves
+            .borrow_mut()
+            .insert(curve_id, curve.clone());
+        curve
     }
 
     /// The items `items` (a bit per index) of a mapped representation, merged into one mesh.
@@ -586,6 +750,31 @@ mod tests {
         assert_eq!(Tolerances::from_precision(0.0).len, 1e-4);
         assert_eq!(Tolerances::from_precision(-1.0).len, 1e-4);
         assert_eq!(Tolerances::from_precision(f64::NAN).len, 1e-4);
+    }
+
+    #[test]
+    fn budgets_must_be_positive_or_absent() {
+        let mut settings = Settings::default();
+        assert!(settings.validate().is_ok());
+        settings.max_total_triangles = Some(0);
+        assert!(settings.validate().is_err());
+        settings.max_total_triangles = Some(1);
+        settings.max_total_vertices = Some(0);
+        assert!(settings.validate().is_err());
+        settings.max_total_vertices = None;
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            settings.max_geometry_ms = Some(bad);
+            assert!(settings.validate().is_err(), "{bad}");
+        }
+        settings.max_geometry_ms = Some(250.0);
+        assert!(settings.validate().is_ok());
+        settings.lod_levels = 3;
+        assert!(
+            settings.validate().is_err(),
+            "three coarse levels are not offered"
+        );
+        settings.lod_levels = 2;
+        assert!(settings.validate().is_ok());
     }
 
     #[test]
@@ -675,6 +864,7 @@ mod tests {
                 Ok(vec![MappedPart {
                     mesh: Arc::new(mesh),
                     colour: None,
+                    material: None,
                 }])
             })
             .unwrap();

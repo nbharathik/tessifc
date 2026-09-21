@@ -4,6 +4,7 @@
 //! mesh is written once; class ids are chunk-local. The assembler keeps one
 //! growing set of columns and hands out a pack-shaped view of them.
 
+/** @type {Record<string, [any, number]>} */
 const COLUMNS = {
   geometryIds: [Uint32Array, 1],
   expressIds: [Uint32Array, 1],
@@ -12,13 +13,24 @@ const COLUMNS = {
   colors: [Uint8Array, 4],
   flags: [Uint16Array, 1],
   provenance: [Uint32Array, 1],
+  material: [Uint32Array, 1],
   active: [Uint8Array, 1],
 };
+
+const NO_MATERIAL = 0xffffffff;
 
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 // Slots are encoded in Float32 GPU attributes. Retired slots are not recycled:
 // column storage grows with total revision parts until an explicit reopen.
 export const MAX_INSTANCE_SLOTS = 2 ** 24;
+
+/**
+ * The assembled scene: a pack whose instance table also carries `active` and
+ * `activeCount`, since retired revision slots stay in the columns.
+ * @typedef {import("@tessifc/edit/types").Pack & { instances: { activeCount: number, active: Uint8Array }, chunks: number, sharedRecords: number }} AssembledPack
+ */
+
+/** @typedef {ReturnType<typeof createPackAssembler>} PackAssembler */
 
 /** A growing pack; `pack()` views point into assembler storage and last until the next append. */
 export function createPackAssembler() {
@@ -35,6 +47,11 @@ export function createPackAssembler() {
   // and every chunk's column is remapped onto the merged table.
   const provenance = [];
   const provenanceIndex = new Map();
+  // Materials are chunk-local like classes; textures are global by id and
+  // arrive once, so they are kept by id.
+  const materials = [];
+  const materialIndex = new Map();
+  const textures = new Map();
   let diagnostics = [];
   let columns = allocate(1024);
   let count = 0;
@@ -84,6 +101,17 @@ export function createPackAssembler() {
     return id;
   }
 
+  function materialId(row) {
+    const key = JSON.stringify(row ?? null);
+    let id = materialIndex.get(key);
+    if (id === undefined) {
+      id = materials.length;
+      materials.push(row);
+      materialIndex.set(key, id);
+    }
+    return id;
+  }
+
   /** Add one chunk. Returns the record range it occupies. */
   function append(chunk) {
     ensureCapacity(count + chunk.instances.count);
@@ -93,6 +121,8 @@ export function createPackAssembler() {
         ...chunk.index,
         classes: undefined,
         provenance: undefined,
+        materials: undefined,
+        textures: undefined,
         diagnostics: undefined,
         stats: undefined,
         stream: undefined,
@@ -102,13 +132,15 @@ export function createPackAssembler() {
       if (geometryIds.has(mesh.id)) continue;
       geometryIds.add(mesh.id);
       geometry.push(mesh);
-      geometryBytes += mesh.positions.byteLength + mesh.indices.byteLength;
-      normalsBytes += mesh.positions.length * 4;
+      geometryBytes += meshBytes(mesh);
+      normalsBytes += mesh.lod ? 0 : mesh.positions.length * 4;
       if (appendingPatch) patchMeshes.add(mesh.id);
       if (Number.isFinite(mesh.id) && mesh.id > maxGeometryId) maxGeometryId = mesh.id;
     }
     const remap = chunk.index.classes.map((name) => classId(String(name)));
     const provenanceRemap = (chunk.index.provenance ?? []).map((row) => provenanceId(row));
+    const materialRemap = (chunk.index.materials ?? []).map((row) => materialId(row));
+    for (const texture of chunk.index.textures ?? []) if (!textures.has(texture.id)) textures.set(texture.id, texture);
     const added = chunk.instances.count;
     for (const [name, [, width]] of Object.entries(COLUMNS)) {
       // An optional column is absent from a pack written before it existed.
@@ -125,6 +157,11 @@ export function createPackAssembler() {
       if (chunk.instances.provenance) {
         const row = chunk.instances.provenance[record];
         columns.provenance[count + record] = provenanceRemap[row] ?? 0xffffffff;
+      }
+      columns.material[count + record] = NO_MATERIAL;
+      if (chunk.instances.material) {
+        const row = chunk.instances.material[record];
+        columns.material[count + record] = row === NO_MATERIAL ? NO_MATERIAL : materialRemap[row] ?? NO_MATERIAL;
       }
       if (columns.active[count + record] && !isIdentity(chunk.instances.transforms, record * 16)) sharedRecords += 1;
     }
@@ -230,7 +267,9 @@ export function createPackAssembler() {
     const live = new Set();
     for (let record = 0; record < count; record++) if (columns.active[record]) live.add(columns.geometryIds[record]);
     const dead = new Set();
-    for (const mesh of geometry) if (!live.has(mesh.id) && (streamFinished || patchMeshes.has(mesh.id))) dead.add(mesh.id);
+    for (const mesh of geometry) if (!mesh.lod && !live.has(mesh.id) && (streamFinished || patchMeshes.has(mesh.id))) dead.add(mesh.id);
+    // A coarse level lives exactly as long as its base.
+    for (const mesh of geometry) if (mesh.lod && (dead.has(mesh.lod.of) || !geometryIds.has(mesh.lod.of))) dead.add(mesh.id);
     if (!dead.size) return;
     for (const id of dead) {
       patchMeshes.delete(id);
@@ -238,23 +277,60 @@ export function createPackAssembler() {
     }
     geometry = geometry.filter((mesh) => {
       if (!dead.has(mesh.id)) return true;
-      geometryBytes -= mesh.positions.byteLength + mesh.indices.byteLength;
-      normalsBytes -= mesh.positions.length * 4;
+      geometryBytes -= meshBytes(mesh);
+      normalsBytes -= mesh.lod ? 0 : mesh.positions.length * 4;
       return false;
     });
   }
 
+  /**
+   * Add coarse levels computed for meshes of this pack, each `{ of, level,
+   * indices }` over the base's positions; returns the ids given to them. A
+   * level of a base the pack no longer holds, or that it already has, is skipped.
+   * @param {Array<{ of: number, level: number, indices: Uint16Array | Uint32Array }>} levels
+   * @returns {number[]}
+   */
+  function addLodLevels(levels) {
+    const byId = new Map(geometry.map((mesh) => [mesh.id, mesh]));
+    const ids = [];
+    for (const level of levels) {
+      const base = byId.get(level.of);
+      if (!base || base.lod || !(level.level === 1 || level.level === 2)) continue;
+      if (geometry.some((mesh) => mesh.lod && mesh.lod.of === level.of && mesh.lod.level === level.level)) continue;
+      const indices = level.indices;
+      const vertices = base.positions.length / 3;
+      if (!indices || indices.length % 3 !== 0 || !indices.length) continue;
+      let valid = true;
+      for (let at = 0; at < indices.length; at += 1) if (indices[at] >= vertices) { valid = false; break; }
+      if (!valid) continue;
+      const id = maxGeometryId + 1;
+      maxGeometryId = id;
+      const mesh = { id, primitive: base.primitive ?? "triangles", bbox: base.bbox, closed: base.closed ?? null, positions: base.positions,
+        indices, uv: base.uv ?? null, lod: { of: level.of, level: level.level } };
+      geometry.push(mesh);
+      geometryIds.add(id);
+      byId.set(id, mesh);
+      geometryBytes += meshBytes(mesh);
+      ids.push(id);
+    }
+    return ids;
+  }
+
   /** The pack so far, shaped exactly like `readIgp`'s result. */
+  /** @returns {AssembledPack} */
   function pack() {
+    /** @type {Record<string, any>} */
     const instances = { count, activeCount };
     for (const [name, [, width]] of Object.entries(COLUMNS)) instances[name] = columns[name].subarray(0, count * width);
     let instanceBytes = 0;
     for (const name of Object.keys(COLUMNS)) instanceBytes += instances[name].byteLength;
-    return {
+    return /** @type {AssembledPack} */ ({
       index: {
         ...(index ?? {}),
         classes: classes.slice(),
         provenance: provenance.slice(),
+        materials: materials.slice(),
+        textures: [...textures.values()],
         diagnostics: diagnostics.slice(),
         stats: { ...stats },
       },
@@ -265,7 +341,7 @@ export function createPackAssembler() {
       chunks,
       sharedRecords,
       memory: { geometryBytes, instanceBytes, gpuBytes: geometryBytes + normalsBytes + count * (16 * 4 + 3 * 4) },
-    };
+    });
   }
 
   return {
@@ -283,7 +359,13 @@ export function createPackAssembler() {
     },
     // Never lowered by pruning, so a patch id can never collide with one already issued.
     nextGeometryId: () => maxGeometryId + 1,
+    addLodLevels,
   };
+}
+
+/** The bytes a mesh adds to the pack; a level shares its base's positions and uv. */
+function meshBytes(mesh) {
+  return mesh.indices.byteLength + (mesh.lod ? 0 : mesh.positions.byteLength + (mesh.uv?.byteLength ?? 0));
 }
 
 /** Whether a column-major 4x4 at `offset` is the identity. */
@@ -305,7 +387,8 @@ function sameMesh(left, right) {
   return left === right || Boolean(left && right &&
     (left.primitive ?? "triangles") === (right.primitive ?? "triangles") &&
     (left.closed ?? null) === (right.closed ?? null) &&
-    equalArray(left.bbox, right.bbox) && equalArray(left.positions, right.positions) && equalArray(left.indices, right.indices));
+    equalArray(left.bbox, right.bbox) && equalArray(left.positions, right.positions) && equalArray(left.indices, right.indices) &&
+    equalArray(left.uv ?? null, right.uv ?? null));
 }
 
 function partMetadata(pack, record) {
@@ -315,6 +398,7 @@ function partMetadata(pack, record) {
     Array.from(instances.colors.subarray(record * 4, record * 4 + 4)),
     Array.from(instances.transforms.subarray(record * 16, record * 16 + 16)),
     index.provenance?.[instances.provenance?.[record]] ?? null,
+    instances.material && instances.material[record] !== NO_MATERIAL ? index.materials?.[instances.material[record]] ?? null : null,
   ]);
 }
 

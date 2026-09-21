@@ -145,31 +145,31 @@ jobs:
           echo "$RUNNER_TEMP/binaryen-$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/binaryen-$BINARYEN_VERSION/bin/wasm-opt" --version
       - run: python scripts/build-wasm.py --target both
+      - name: install the npm workspace and generate the declarations
+        run: |
+          npm ci
+          npm run types
+          npm run typecheck
       - run: node bindings/wasm/test/smoke.mjs
       - run: node viewer/test/igp.test.mjs
       - run: node adapters/three/test/build.test.mjs
       - run: npm --prefix bindings/edit test
       - name: MCP server package and the demo house
         run: |
-          npm ci --prefix bindings/mcp
           npm --prefix bindings/mcp test
           node examples/agent-building/build-house.test.mjs
       - name: browser and website checks
         run: |
-          npm ci --prefix viewer
-          (cd viewer && npx playwright install --with-deps chromium)
+          npx playwright install --with-deps chromium
           npm --prefix viewer test
           npm --prefix bindings/viewer test
           python -m unittest discover -s scripts -p 'test_*.py'
           python scripts/build-site.py
+      # prepack in each package regenerates its declarations and checks them.
       - name: package the npm tarballs
         run: |
           mkdir -p dist
-          (cd bindings/wasm && npm pack --pack-destination ../../dist)
-          (cd bindings/edit && npm pack --pack-destination ../../dist)
-          (cd bindings/viewer && npm pack --pack-destination ../../dist)
-          (cd bindings/mcp && npm pack --pack-destination ../../dist)
-          (cd adapters/three && npm pack --pack-destination ../../dist)
+          npm run pack:all
       - uses: actions/upload-artifact@v4
         with:
           name: npm-packages
@@ -183,11 +183,9 @@ jobs:
             echo "NPM_TOKEN is not set; skipping npm publish. The tarballs are attached to the release."
             exit 0
           fi
-          (cd bindings/wasm && npm publish --access public --provenance --tag preview)
-          (cd bindings/edit && npm publish --access public --provenance --tag preview)
-          (cd bindings/viewer && npm publish --access public --provenance --tag preview)
-          (cd bindings/mcp && npm publish --access public --provenance --tag preview)
-          (cd adapters/three && npm publish --access public --provenance --tag preview)
+          for package in @tessifc/core @tessifc/edit @tessifc/viewer @tessifc/mcp @tessifc/three; do
+            npm publish --workspace "$package" --access public --provenance --tag preview
+          done
 
   crates:
     name: crates.io

@@ -13,8 +13,9 @@ function vector3(value, name) {
   return [Number(value[0]), Number(value[1]), Number(value[2] ?? 0)];
 }
 
+/** @param {number[]} vector @param {string} name */
 function unit(vector, name) {
-  const length = Math.hypot(...vector);
+  const length = Math.hypot(vector[0], vector[1], vector[2]);
   if (length < EPSILON) throw new Error(`${name} has no direction`);
   return vector.map((item) => item / length);
 }
@@ -124,6 +125,7 @@ export function createHelpers(core) {
     return storey;
   }
 
+  /** @param {{ from?: number[], to?: number[], height?: number, thickness?: number, storey?: any, name?: string, attributes?: object }} [options] */
   function addWall({ from, to, height = 3, thickness = 0.2, storey = null, name = "Wall", attributes = {} } = {}) {
     const [x1, y1, z1] = vector3(from, "from");
     const [x2, y2] = vector3(to, "to");
@@ -153,7 +155,10 @@ export function createHelpers(core) {
     return solid ? Number(solid.SweptArea.YDim) : null;
   }
 
-  /** An opening through `host`, at [x, y, sill] in the host's placement; `size` is [width, height]. */
+  /**
+   * An opening through `host`, at [x, y, sill] in the host's placement; `size` is [width, height].
+   * @param {{ in?: any, at?: number[], size?: number[], depth?: number | null, name?: string }} [options]
+   */
   function addOpening({ in: host, at = [0, 0, 0], size = [1, 1], depth = null, name = "Opening" } = {}) {
     if (!host) throw new Error("addOpening needs a host element in `in`");
     const [x, y, z] = vector3(at, "at");
@@ -167,6 +172,11 @@ export function createHelpers(core) {
     return opening;
   }
 
+  /**
+   * @param {string} className
+   * @param {{ in?: any, at?: number[], size?: number[], name?: string, attributes?: object }} options
+   * @param {number[]} sizeDefault
+   */
   function filling(className, { in: host, at = [0, 0, 0], size, name, attributes = {} }, sizeDefault) {
     const [width, height] = (size ?? sizeDefault).map(Number);
     const [x, y, z] = vector3(at, "at");
@@ -198,12 +208,15 @@ export function createHelpers(core) {
     return column;
   }
 
-  /** A beam from one point to another; `size` is [depth, width] of its section. */
+  /**
+   * A beam from one point to another; `size` is [depth, width] of its section.
+   * @param {{ from?: number[], to?: number[], size?: number[], storey?: any, name?: string, attributes?: object }} [options]
+   */
   function addBeam({ from, to, size = [0.3, 0.2], storey = null, name = "Beam", attributes = {} } = {}) {
     const start = vector3(from, "from");
     const end = vector3(to, "to");
     const along = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-    const length = Math.hypot(...along);
+    const length = Math.hypot(along[0], along[1], along[2]);
     if (length < EPSILON) throw new Error("addBeam needs two different points");
     const axis = along.map((item) => item / length);
     // The profile's x follows world up unless the beam is vertical.
@@ -243,6 +256,7 @@ export function createHelpers(core) {
     return pset;
   }
 
+  /** @param {number[]} color */
   function surfaceStyle([r, g, b, a = 1]) {
     const rgb = add("IfcColourRgb", { Red: Number(r), Green: Number(g), Blue: Number(b) });
     const rendering = add("IfcSurfaceStyleRendering", { SurfaceColour: rgb, Transparency: 1 - Number(a), ReflectanceMethod: "NOTDEFINED" });

@@ -182,23 +182,27 @@ impl PlacementCache {
     /// The world transform of an `IfcObjectPlacement`.
     ///
     /// Follows `PlacementRelTo` to the root; a cycle stops at a depth limit.
-    /// Grid placements resolve to the identity; see [`PlacementCache::world_with`].
+    /// Placements other than `IfcLocalPlacement` take their fallback; see
+    /// [`PlacementCache::world_with`].
     pub fn world(&mut self, model: &Model, placement: Entity<'_>, units: &Units) -> DMat4 {
         self.world_with(model, placement, units, &|_| None)
     }
 
-    /// The world transform, with grid placements resolved by `grid`.
+    /// The world transform, with every placement that is not an
+    /// `IfcLocalPlacement` offered to `resolver` first.
     ///
-    /// The resolver returns a grid placement's matrix in its grid's coordinates
-    /// and the placement that matrix is relative to; the chain continues from there.
+    /// The resolver returns the placement's matrix and the placement that
+    /// matrix is relative to; the chain continues from there. When it declines,
+    /// an `IfcLinearPlacement` uses its `CartesianPosition` and anything else
+    /// the identity, both relative to `PlacementRelTo`.
     pub fn world_with(
         &mut self,
         model: &Model,
         placement: Entity<'_>,
         units: &Units,
-        grid: &GridResolver<'_>,
+        resolver: &PlacementResolver<'_>,
     ) -> DMat4 {
-        self.resolve(model, placement, units, grid, 0)
+        self.resolve(model, placement, units, resolver, 0)
     }
 
     // `units` is threaded through rather than stored: a cache outlives one evaluation.
@@ -208,7 +212,7 @@ impl PlacementCache {
         model: &Model,
         placement: Entity<'_>,
         units: &Units,
-        grid: &GridResolver<'_>,
+        resolver: &PlacementResolver<'_>,
         depth: u32,
     ) -> DMat4 {
         if let Some(cached) = self.resolved.get(&placement.id()) {
@@ -224,23 +228,18 @@ impl PlacementCache {
                 axis2_placement_3d(placement.attr("RelativePlacement"), units),
                 placement.attr("PlacementRelTo").as_entity(),
             )
-        } else if placement.is_a("IfcGridPlacement") {
-            match grid(placement) {
+        } else {
+            match resolver(placement) {
                 Some((local, parent)) => (local, parent.and_then(|id| model.entity(id))),
                 None => (
-                    DMat4::IDENTITY,
+                    placement_fallback(placement, units),
                     placement.attr("PlacementRelTo").as_entity(),
                 ),
             }
-        } else {
-            (
-                DMat4::IDENTITY,
-                placement.attr("PlacementRelTo").as_entity(),
-            )
         };
 
         let world = match parent {
-            Some(parent) => self.resolve(model, parent, units, grid, depth + 1) * local,
+            Some(parent) => self.resolve(model, parent, units, resolver, depth + 1) * local,
             None => local,
         };
         self.resolved.insert(placement.id(), world);
@@ -248,8 +247,25 @@ impl PlacementCache {
     }
 }
 
-/// Resolves an `IfcGridPlacement` to its local matrix and the id of the placement it is relative to.
-pub type GridResolver<'a> = dyn for<'e> Fn(Entity<'e>) -> Option<(DMat4, Option<u32>)> + 'a;
+/// What a placement the resolver declined is worth on its own.
+fn placement_fallback(placement: Entity<'_>, units: &Units) -> DMat4 {
+    if placement.is_a("IfcLinearPlacement") {
+        // The optional cached position is the file's own answer for the frame.
+        let position = placement.attr("CartesianPosition");
+        if position.as_entity().is_some() {
+            return axis2_placement_3d(position, units);
+        }
+    }
+    DMat4::IDENTITY
+}
+
+/// Resolves a placement that is not an `IfcLocalPlacement` to its local matrix
+/// and the id of the placement it is relative to; `None` declines it.
+pub type PlacementResolver<'a> = dyn for<'e> Fn(Entity<'e>) -> Option<(DMat4, Option<u32>)> + 'a;
+
+/// The former name of [`PlacementResolver`], kept for one release.
+#[deprecated(note = "renamed to PlacementResolver")]
+pub type GridResolver<'a> = PlacementResolver<'a>;
 
 #[cfg(test)]
 mod tests {

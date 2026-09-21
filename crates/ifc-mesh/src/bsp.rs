@@ -335,6 +335,11 @@ pub(crate) fn bsp_cells_closing(
                 if crate::weld::heal_t_junctions(&mut oriented, close) > 0 {
                     crate::weld::weld_and_close(&mut oriented, close);
                 }
+                if !oriented.is_edge_manifold()
+                    && crate::weld::drop_hanging_slivers(&mut oriented, close) > 0
+                {
+                    crate::weld::weld_and_close(&mut oriented, close);
+                }
                 if !oriented.is_edge_manifold() {
                     let (open, over) = oriented.edge_defects();
                     return Err(format!(
@@ -348,6 +353,30 @@ pub(crate) fn bsp_cells_closing(
             oriented.fix_orientation();
             &oriented
         };
+    // The proof decides, so an input that happens to straddle one tolerance
+    // is tried at its neighbours before it is refused.
+    let mut refusal = String::new();
+    let floor = tol.min(1e-9);
+    for factor in [1.0, 10.0, 100.0, 0.1] {
+        let attempt = (tol * factor).clamp(floor, close);
+        if factor != 1.0 && attempt == tol {
+            continue;
+        }
+        match bsp_cells_at(mesh, attempt) {
+            Ok(cells) => return Ok(cells),
+            Err(why) if why.contains("cells hold") => {
+                if refusal.is_empty() {
+                    refusal = why;
+                }
+            }
+            Err(why) => return Err(why),
+        }
+    }
+    Err(refusal)
+}
+
+/// One decomposition of a closed, outward-wound mesh at one tolerance.
+fn bsp_cells_at(mesh: &Mesh64, tol: f64) -> Result<Vec<Mesh64>, String> {
     let target = mesh.signed_volume();
     let Some((low, high)) = mesh.bounds() else {
         return Err("no bounds".into());

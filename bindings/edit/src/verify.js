@@ -8,7 +8,11 @@ import { readIgp } from "./igp.js";
 
 const QUANTUM = 10000;
 
-/** Every active product's triangles in world space, quantised and sorted, keyed by express id. */
+/**
+ * Every active product's triangles in world space, quantised and sorted, keyed by express id.
+ * @param {{ geometry: any[], instances: any, index?: any }} pack
+ * @returns {Array<[number, string[]]>}
+ */
 export function normalizeScene(pack) {
   const meshes = new Map(pack.geometry.map((mesh) => [mesh.id, mesh]));
   const products = new Map();
@@ -30,10 +34,15 @@ export function normalizeScene(pack) {
     }
     products.set(instances.expressIds[record], triangles);
   }
-  return [...products].sort(([a], [b]) => a - b).map(([id, triangles]) => [id, triangles.sort()]);
+  return [...products].sort(([a], [b]) => a - b).map(([id, triangles]) => /** @type {[number, string[]]} */ ([id, triangles.sort()]));
 }
 
-/** A fresh whole-model evaluation of `bytes` in its own kernel; returns the parsed pack. */
+/**
+ * A fresh whole-model evaluation of `bytes` in its own kernel; returns the parsed pack.
+ * @param {typeof import("@tessifc/core").Kernel} Kernel
+ * @param {Uint8Array} bytes
+ * @param {Record<string, unknown>} [settings]
+ */
 export function evaluateScene(Kernel, bytes, settings = {}) {
   const kernel = new Kernel();
   try {
@@ -46,10 +55,13 @@ export function evaluateScene(Kernel, bytes, settings = {}) {
   }
 }
 
+/** @typedef {ReturnType<typeof createSceneMirror>} SceneMirror */
+
 /**
  * A scene that follows deltas without a renderer: the records of every
  * product and the meshes they use. `pack()` returns a pack-shaped view for
  * `normalizeScene`.
+ * @param {import("./types.js").Pack | null} [initial]
  */
 export function createSceneMirror(initial = null) {
   const records = new Map();
@@ -119,6 +131,8 @@ export function createSceneMirror(initial = null) {
 /**
  * Compare a mirror that followed the session's deltas with a fresh evaluation
  * of the session's exported file, product by product.
+ * @param {{ Kernel: typeof import("@tessifc/core").Kernel, session: import("./session.js").Session, mirror: SceneMirror, settings?: Record<string, unknown> | null }} options
+ * @returns {{ ok: boolean, revision: string, products: number, mismatches: Array<{ id: number, reason: string }>, elapsedMs: number }}
  */
 export function verifyRevision({ Kernel, session, mirror, settings = null }) {
   const started = typeof performance !== "undefined" ? performance.now() : Date.now();

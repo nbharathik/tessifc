@@ -65,3 +65,8 @@ and pipelines](../../docs/agents.md) shows the loop, the MCP server that
 packages it and how a renderer applies a delta.
 
 Scripts run with your program's permissions and without a sandbox.
+`runScript` runs them in the calling thread without a time limit; in Node,
+`createScriptRunner({ kernelModule, timeoutMs })` from
+`@tessifc/edit/script-runner` with `session.runScriptWith(runner, source)`
+runs each script in a worker thread with its own kernel and stops one that
+overruns by ending the thread.

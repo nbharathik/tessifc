@@ -83,7 +83,8 @@ The status bar reports the revision and affected geometry counts.
 Saving through atomic replacement avoids partially written snapshots. The
 server follows only the named IFC; scripts run in the session process, or in
 the page's worker for browser scripts, without a sandbox, so run code you
-trust and review assistant proposals. Stop the server with Ctrl+C.
+trust and review assistant proposals. Browser scripts are stopped at the time
+limit set in the viewer's settings; Python scripts are not. Stop the server with Ctrl+C.
 
 Without the server, open the original model normally and choose
 **File > Update IFC** with its edited version. The existing **Export IFC**

@@ -26,7 +26,7 @@ SCRIPT_API = SYSTEM_PROMPT.split("\n\n", 1)[1] if "\n\n" in SYSTEM_PROMPT else S
 _RUN_RESULT = {
     "type": "object",
     "properties": {
-        "ok": {"type": "boolean"}, "changed": {"type": "boolean"}, "revision": {"type": ["string", "null"]},
+        "ok": {"type": "boolean"}, "timedOut": {"type": "boolean"}, "changed": {"type": "boolean"}, "revision": {"type": ["string", "null"]},
         "version": {"type": ["string", "null"]}, "stdout": {"type": "string"}, "error": {"type": ["string", "null"]},
         "traceback": {"type": ["string", "null"]}, "operations": {"type": "object"}, "affectedProducts": {"type": ["array", "null"]},
         "removedProducts": {"type": ["array", "null"]}, "metadataProducts": {"type": ["array", "null"]}, "fullRebuild": {"type": ["boolean", "null"]},
@@ -123,7 +123,7 @@ class ModelTools:
             note = "No viewer is attached; connect one for the kernel's affected products."
         status = self.session.describe()
         return {
-            "ok": bool(result["ok"]), "changed": bool(result.get("changed")), "revision": str(result.get("revision")),
+            "ok": bool(result["ok"]), "timedOut": False, "changed": bool(result.get("changed")), "revision": str(result.get("revision")),
             "version": result.get("version"), "stdout": result.get("stdout", ""), "error": result.get("error"),
             "traceback": result.get("traceback"), "operations": result.get("operations", {}),
             "affectedProducts": applied.get("affectedProducts") if applied else None,
@@ -219,8 +219,8 @@ print(json.dumps({{"id": entity.id(), "class": entity.is_a(), "guid": getattr(en
     def inspect_model(self, *, code: str = "", **_) -> dict:
         result = self.session.run_script(str(code), self.session.selection or None, commit=False, label="inspect")
         if not result["ok"]:
-            raise ToolError(json.dumps({"ok": False, "error": result.get("error"), "traceback": result.get("traceback", ""), "stdout": result.get("stdout", "")}))
-        return {"ok": True, "stdout": result.get("stdout", ""), "error": None, "traceback": None}
+            raise ToolError(json.dumps({"ok": False, "timedOut": False, "error": result.get("error"), "traceback": result.get("traceback", ""), "stdout": result.get("stdout", "")}))
+        return {"ok": True, "timedOut": False, "stdout": result.get("stdout", ""), "error": None, "traceback": None}
 
     def edit_model(self, *, script: str = "", summary: str | None = None, **_) -> dict:
         result = self.session.run_script(str(script), self.session.selection or None, label=clip(summary, 200) if summary else "edit")

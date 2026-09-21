@@ -10,7 +10,7 @@ self.addEventListener("message", ({ data }) => {
   try {
     const byId = new Map(geometries.map((geometry) => [geometry.id, geometry]));
     const result = findContestedTriangles({ instances }, byId);
-    self.postMessage(
+    /** @type {{ postMessage: (message: any, transfer?: Transferable[]) => void }} */ (self).postMessage(
       { requestId, records: result.records, offsets: result.offsets, triangles: result.triangles, pairs: result.pairs, exhausted: result.exhausted },
       [result.records.buffer, result.offsets.buffer, result.triangles.buffer],
     );

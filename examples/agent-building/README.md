@@ -12,7 +12,7 @@ There are four ways to run it. The first three need the Node kernel:
 
 ```sh
 python scripts/build-wasm.py --target both
-npm ci --prefix bindings/mcp
+npm ci
 ```
 
 ## 1. Scripted, no model needed

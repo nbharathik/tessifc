@@ -6,22 +6,65 @@
   "author": "Bharathi Kannan",
   "type": "module",
   "main": "src/index.js",
+  "types": "./types/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
-    "./session": "./src/session.js",
-    "./script-engine": "./src/script-engine.js",
-    "./igp": "./src/igp.js",
-    "./agent-tools": "./src/agent-tools.js",
-    "./create-model": "./src/create-model.js",
-    "./providers": "./src/providers.js",
-    "./describe": "./src/describe.js",
-    "./script-helpers": "./src/script-helpers.js",
-    "./verify": "./src/verify.js",
-    "./examples": "./src/examples.js"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./session": {
+      "types": "./types/session.d.ts",
+      "default": "./src/session.js"
+    },
+    "./script-engine": {
+      "types": "./types/script-engine.d.ts",
+      "default": "./src/script-engine.js"
+    },
+    "./script-runner": {
+      "types": "./types/script-runner.d.ts",
+      "default": "./src/script-runner.js"
+    },
+    "./igp": {
+      "types": "./types/igp.d.ts",
+      "default": "./src/igp.js"
+    },
+    "./agent-tools": {
+      "types": "./types/agent-tools.d.ts",
+      "default": "./src/agent-tools.js"
+    },
+    "./create-model": {
+      "types": "./types/create-model.d.ts",
+      "default": "./src/create-model.js"
+    },
+    "./providers": {
+      "types": "./types/providers.d.ts",
+      "default": "./src/providers.js"
+    },
+    "./describe": {
+      "types": "./types/describe.d.ts",
+      "default": "./src/describe.js"
+    },
+    "./script-helpers": {
+      "types": "./types/script-helpers.d.ts",
+      "default": "./src/script-helpers.js"
+    },
+    "./verify": {
+      "types": "./types/verify.d.ts",
+      "default": "./src/verify.js"
+    },
+    "./examples": {
+      "types": "./types/examples.d.ts",
+      "default": "./src/examples.js"
+    },
+    "./types": {
+      "types": "./types/types.d.ts",
+      "default": "./src/types.js"
+    }
   },
   "sideEffects": false,
   "files": [
     "src/",
+    "types/",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -46,7 +89,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/script-engine.test.mjs && node test/providers.test.mjs && node test/session.test.mjs"
+    "test": "node test/script-engine.test.mjs && node test/providers.test.mjs && node test/session.test.mjs && node test/script-runner.test.mjs",
+    "types": "node ../../scripts/build-types.mjs .",
+    "typecheck": "node ../../scripts/build-types.mjs --check .",
+    "prepack": "npm run types"
   },
   "peerDependencies": {
     "@tessifc/core": "0.2.0"

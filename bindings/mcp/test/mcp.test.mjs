@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The MCP server end to end over a spawned CLI: the tools match the contract,
-// a model is created, edited, undone, exported and verified.
+// a model is created, edited, undone, exported and verified, and a script
+// that never returns is stopped at the time limit.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -29,7 +30,7 @@ const file = join(dir, "house.ifc");
 
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: [resolve(here, "../src/cli.js"), file, "--new", "--port", "0", "--storeys", "Ground floor:0,Upper floor:3"],
+  args: [resolve(here, "../src/cli.js"), file, "--new", "--port", "0", "--storeys", "Ground floor:0,Upper floor:3", "--script-timeout-ms", "500"],
   stderr: "pipe",
   cwd: root,
 });
@@ -92,6 +93,18 @@ try {
   ok(failing.isError && /ReferenceError/.test(text(failing).error) && text(failing).revision === "1", "a failing script is an error result and publishes nothing");
   const rejected = await client.callTool({ name: "edit_model", arguments: { script: 'ifc.byType("IfcWall")[0].Representation.Representations[0].Items[0].SweptArea = null;' } });
   ok(rejected.isError && /rejected/.test(text(rejected).error), "a candidate the kernel refuses is an error result with the reason");
+
+  const loopStarted = performance.now();
+  const looping = await client.callTool({ name: "edit_model", arguments: { script: "ifc.byType('IfcWall')[0].Name = 'never'; while (true) {}", summary: "Loops forever." } });
+  const loop = text(looping);
+  ok(looping.isError && loop.ok === false && loop.timedOut === true && /ScriptTimeout/.test(loop.error) && loop.changed === false && loop.revision === "1"
+    && loop.saved === false && performance.now() - loopStarted < 10000, "an endless edit_model is stopped at the limit, reports timedOut and changes nothing");
+  ok(text(await client.callTool({ name: "describe_model", arguments: {} })).revision === "1" && readFileSync(file).toString("latin1").includes("'South wall'")
+    && !readFileSync(file).toString("latin1").includes("'never'"), "the model and the file are as before the stopped script");
+  const status2 = await (await fetch(`${base}/__tessifc/session`)).json();
+  ok(status2.busy === false && status2.capabilities.scriptTimeoutMs === 500, "the host is not busy afterwards and reports the limit");
+  const peek = text(await client.callTool({ name: "inspect_model", arguments: { code: 'print(ifc.byType("IfcWall").length)' } }));
+  ok(peek.ok && peek.timedOut === false && peek.stdout === "1", "the next script runs on a fresh worker");
 
   const found = text(await client.callTool({ name: "find_products", arguments: { class: "IfcWall" } }));
   ok(found.total === 1 && found.products[0].name === "South wall" && found.products[0].storey === "Ground floor", "find_products lists the wall with its storey");

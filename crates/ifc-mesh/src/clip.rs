@@ -1896,6 +1896,17 @@ pub fn difference_prismatic_many(
     difference_prismatic_many_or_reason(body, cutters, tolerance).ok()
 }
 
+/// Closed shells that weld into one surface because they touch along edges,
+/// or `None` when the surface has no shared edge or does not come apart.
+fn touching_shells(mesh: &Mesh64, close: f64) -> Option<Vec<Mesh64>> {
+    let mut welded = mesh.clone();
+    crate::weld::weld(&mut welded, close);
+    if welded.edge_defects().1 == 0 {
+        return None;
+    }
+    crate::weld::split_manifold_shells(mesh, close).filter(|shells| shells.len() >= 2)
+}
+
 /// [`difference_prismatic_many`], with the reason for a refusal.
 pub fn difference_prismatic_many_or_reason(
     body: &Mesh64,
@@ -1911,21 +1922,31 @@ pub fn difference_prismatic_many_or_reason(
     // common refusal is found before the expensive side is touched.
     let mut cutter_cells = Vec::new();
     for (index, cutter) in cutters.iter().enumerate() {
-        cutter_cells.extend(
-            convex_cells_closing(cutter, tol, close)
-                .map_err(|why| format!("cutter {}: {why}", index + 1))?,
-        );
+        let cells = match convex_cells_closing(cutter, tol, close) {
+            Ok(cells) => Ok(cells),
+            // An opening of several touching solids is decomposed shell by shell.
+            Err(why) => match touching_shells(cutter, close) {
+                Some(shells) => shells
+                    .iter()
+                    .map(|shell| convex_cells_closing(shell, tol, close))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|cells| cells.concat())
+                    .map_err(|_| why),
+                None => Err(why),
+            },
+        };
+        cutter_cells.extend(cells.map_err(|why| format!("cutter {}: {why}", index + 1))?);
     }
     let body_cells = match convex_cells_closing(body, tol, close) {
         Ok(cells) => cells,
         // A body of several shells, such as the layers of a wall, is cut one
         // shell at a time; only a body in one piece is refused outright.
         Err(why) => {
-            let shells = {
+            let shells = touching_shells(body, close).unwrap_or_else(|| {
                 let mut welded = body.clone();
                 crate::weld::weld_and_close(&mut welded, close);
                 welded.connected_components()
-            };
+            });
             if shells.len() < 2 {
                 return Err(format!("body: {why}"));
             }
@@ -2392,6 +2413,60 @@ mod tests {
         );
     }
 
+    /// A pyramid on the unit square at `x = 1`, its base wound to face the box
+    /// it sits on and split along the same diagonal, so welding merges them.
+    fn pyramid_on_box_face() -> Mesh64 {
+        let mut mesh = Mesh64::new();
+        let base = [
+            mesh.push_vertex(DVec3::new(1.0, 0.0, 0.0)),
+            mesh.push_vertex(DVec3::new(1.0, 1.0, 0.0)),
+            mesh.push_vertex(DVec3::new(1.0, 1.0, 1.0)),
+            mesh.push_vertex(DVec3::new(1.0, 0.0, 1.0)),
+        ];
+        let apex = mesh.push_vertex(DVec3::new(2.0, 0.5, 0.5));
+        mesh.push_triangle(base[0], base[2], base[1]);
+        mesh.push_triangle(base[0], base[3], base[2]);
+        for side in 0..4 {
+            mesh.push_triangle(base[side], base[(side + 1) % 4], apex);
+        }
+        mesh
+    }
+
+    #[test]
+    fn openings_cut_a_body_of_touching_solids_exactly() {
+        // A box and a pyramid sharing a face, welded as an evaluator delivers
+        // them: the face survives once, its edges carry three triangles, and
+        // the union is neither a solid nor a prism.
+        let mut body = box_mesh(DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0));
+        body.append(&pyramid_on_box_face());
+        crate::weld::weld_and_close(&mut body, 1e-4);
+        assert!(
+            convex_cells_or_reason(&body, 1e-4).is_err(),
+            "the welded surface is not a solid on its own"
+        );
+        let window = box_mesh(DVec3::new(0.5, -1.0, 0.4), DVec3::new(1.5, 2.0, 0.6));
+        let cut = difference_prismatic_many_or_reason(&body, &[window], 1e-4)
+            .unwrap_or_else(|why| panic!("{why}"));
+        let expected = 1.0 + 1.0 / 3.0 - 0.1 - 0.075;
+        assert!(
+            (cut.signed_volume() - expected).abs() < 1e-9,
+            "{}",
+            cut.signed_volume()
+        );
+        // And a cutter of touching solids cuts as one opening.
+        let wall = box_mesh(DVec3::new(-1.0, 0.0, -1.0), DVec3::new(3.0, 1.0, 2.0));
+        let notch = box_mesh(DVec3::new(2.5, 0.5, 1.5), DVec3::new(4.0, 2.0, 3.0));
+        let wall = difference_convex(&wall, &notch, 1e-9).unwrap();
+        let cut = difference_prismatic_many_or_reason(&wall, &[body], 1e-4)
+            .unwrap_or_else(|why| panic!("{why}"));
+        let expected = 4.0 * 3.0 - 0.125 - 1.0 - 1.0 / 3.0;
+        assert!(
+            (cut.signed_volume() - expected).abs() < 1e-9,
+            "{}",
+            cut.signed_volume()
+        );
+    }
+
     #[test]
     fn a_refusal_on_one_shell_of_many_is_still_a_body_refusal() {
         // Two open panels side by side: neither shell can be decomposed.
@@ -2579,6 +2654,7 @@ mod tests {
             positions: vec![DVec3::ZERO; 3],
             indices: vec![0, 1, 7],
             closed: None,
+            uvs: Vec::new(),
         };
         let plane = Plane::from_point_normal(DVec3::ZERO, DVec3::Z).unwrap();
         assert!(clip(&stale, &plane, 1e-9).mesh.is_empty());

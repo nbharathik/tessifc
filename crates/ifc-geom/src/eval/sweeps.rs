@@ -3,11 +3,12 @@
 
 use crate::context::EvalCtx;
 use crate::error::{GeomError, codes};
+use crate::eval::alignment::{self, SpatialCurve};
 use crate::placement::{axis2_placement_3d, direction};
 use crate::registry::{Polyline3, Profile2D, Registry, SolidEvaluator};
 use glam::{DMat4, DVec2, DVec3};
 use tessifc_mesh::{Mesh64, triangulate_polygon};
-use tessifc_model::Entity;
+use tessifc_model::{Entity, Value};
 
 /// Upper bound on the vertices one swept disk may plan.
 pub(crate) const MAX_SWEEP_VERTICES: usize = 4_000_000;
@@ -96,6 +97,7 @@ impl SolidEvaluator for SweptDiskSolid {
                     curve = Polyline3 {
                         points,
                         closed: false,
+                        parameters: Vec::new(),
                     }
                 }
                 Err(reason) => ctx.diag.warn(
@@ -118,19 +120,61 @@ impl SolidEvaluator for SweptDiskSolid {
     }
 }
 
+/// A sweep's trim: the directrix parameter, or an arc length converted to it.
+#[derive(Clone, Copy)]
+enum TrimValue {
+    Parameter(f64),
+    Length(f64),
+}
+
+/// Read `StartParam` or `EndParam`; a typed length measure is arc length.
+fn trim_value(value: Value<'_>, ctx: &EvalCtx<'_>) -> Option<TrimValue> {
+    match value {
+        Value::Typed(typed)
+            if typed.is("IFCLENGTHMEASURE") || typed.is("IFCNONNEGATIVELENGTHMEASURE") =>
+        {
+            typed
+                .value()
+                .as_f64()
+                .map(|raw| TrimValue::Length(ctx.units.length(raw)))
+        }
+        other => other.as_f64().map(TrimValue::Parameter),
+    }
+}
+
 /// Cut the directrix to `StartParam`..`EndParam` where that is exact, else say so.
 ///
 /// A polyline is parameterised one unit per segment (ISO 10303-42); other
 /// directrix classes keep their whole length with a diagnostic.
 fn apply_trim(ctx: &EvalCtx<'_>, item: Entity<'_>, directrix: Entity<'_>, curve: &mut Polyline3) {
-    let start = item.attr("StartParam").as_f64();
-    let end = item.attr("EndParam").as_f64();
+    let start = trim_value(item.attr("StartParam"), ctx);
+    let end = trim_value(item.attr("EndParam"), ctx);
     if start.is_none() && end.is_none() {
         return;
     }
-    let trimmed = if directrix.is_a("IfcPolyline") {
+    let trimmed = if alignment::is_alignment_curve(directrix) {
+        // Trims on an alignment are distances along it, or its own parameter;
+        // the directrix is resampled between them rather than cut.
+        alignment::spatial_curve(ctx, directrix)
+            .ok()
+            .and_then(|spatial| {
+                let (from, to) = trim_range(ctx, item, &spatial).ok()?;
+                spatial.polyline(ctx, from, to).ok()
+            })
+            .map(|polyline| polyline.points)
+    } else if directrix.is_a("IfcPolyline") {
         let last = curve.points.len().saturating_sub(1) as f64;
-        trim_polyline(&curve.points, start.unwrap_or(0.0), end.unwrap_or(last))
+        let parameter = |value: Option<TrimValue>, default: f64| match value {
+            None => Some(default),
+            Some(TrimValue::Parameter(parameter)) => Some(parameter),
+            Some(TrimValue::Length(length)) => {
+                polyline_parameter_at_length(&curve.points, length, ctx.tol.len)
+            }
+        };
+        match (parameter(start, 0.0), parameter(end, last)) {
+            (Some(start), Some(end)) => trim_polyline(&curve.points, start, end),
+            _ => None,
+        }
     } else {
         None
     };
@@ -148,6 +192,59 @@ fn apply_trim(ctx: &EvalCtx<'_>, item: Entity<'_>, directrix: Entity<'_>, curve:
             ),
         ),
     }
+}
+
+/// The distances a sweep covers on an alignment directrix: its trims, or the whole curve.
+fn trim_range(
+    ctx: &EvalCtx<'_>,
+    item: Entity<'_>,
+    spatial: &SpatialCurve,
+) -> Result<(f64, f64), GeomError> {
+    let measure = |value: Option<TrimValue>, default: f64| match value {
+        None => default,
+        Some(TrimValue::Parameter(parameter)) => {
+            spatial.distance_of(alignment::CurveMeasure::Parameter(parameter))
+        }
+        Some(TrimValue::Length(length)) => length,
+    };
+    let from = measure(trim_value(item.attr("StartParam"), ctx), 0.0);
+    let to = measure(trim_value(item.attr("EndParam"), ctx), spatial.length());
+    if !(from.is_finite() && to.is_finite()) {
+        return Err(GeomError::Degenerate(
+            "a sweep along an unbounded curve".into(),
+        ));
+    }
+    Ok((from, to))
+}
+
+/// The polyline parameter (one unit per segment) at an arc length from its start.
+///
+/// A length past either end by more than the tolerance is not on the curve.
+fn polyline_parameter_at_length(points: &[DVec3], length: f64, tolerance: f64) -> Option<f64> {
+    if points.len() < 2 || !length.is_finite() {
+        return None;
+    }
+    let total: f64 = points
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).length())
+        .sum();
+    if length < -tolerance || length > total + tolerance {
+        return None;
+    }
+    let mut remaining = length.clamp(0.0, total);
+    for (index, pair) in points.windows(2).enumerate() {
+        let segment = (pair[1] - pair[0]).length();
+        if remaining <= segment || index + 2 == points.len() {
+            let fraction = if segment > 0.0 {
+                (remaining / segment).min(1.0)
+            } else {
+                0.0
+            };
+            return Some(index as f64 + fraction);
+        }
+        remaining -= segment;
+    }
+    Some((points.len() - 1) as f64)
 }
 
 /// The part of a polyline between two parameters, one unit per segment.
@@ -288,6 +385,49 @@ fn frames_for(tangents: &[DVec3], rule: &FrameRule) -> Result<Vec<(DVec3, DVec3)
     }
 }
 
+/// Stations along an alignment directrix with its exact tangents, the profile's
+/// x along a fixed reference; `derived` turns that reference about the tangent
+/// by the cant since the directrix start.
+fn alignment_stations(
+    ctx: &EvalCtx<'_>,
+    spatial: &SpatialCurve,
+    from: f64,
+    to: f64,
+    reference: DVec3,
+    derived: bool,
+) -> Result<Vec<Station>, GeomError> {
+    let start_cant = spatial.frame_at(0.0).cant;
+    let mut stations = Vec::new();
+    for s in spatial.stations(ctx, from, to)? {
+        let frame = spatial.frame_at(s);
+        let tangent = frame.tangent;
+        let projected = reference - tangent * reference.dot(tangent);
+        if projected.length_squared() <= 1e-20 {
+            return Err(GeomError::Degenerate(
+                "a sweep whose fixed reference is parallel to its directrix".into(),
+            ));
+        }
+        let mut normal = projected.normalize();
+        if derived {
+            let (sin, cos) = (frame.cant - start_cant).sin_cos();
+            normal = normal * cos + tangent.cross(normal) * sin;
+        }
+        stations.push(Station {
+            point: frame.point,
+            normal,
+            binormal: tangent.cross(normal).normalize(),
+            stretch_axis: DVec3::ZERO,
+            stretch: 1.0,
+        });
+    }
+    if stations.len() < 2 {
+        return Err(GeomError::Degenerate(
+            "a sweep directrix with fewer than two stations".into(),
+        ));
+    }
+    Ok(stations)
+}
+
 /// Sweep any profile along a directrix, mitring the corners.
 ///
 /// The profile's x and y follow the station frame and its z the tangent, so
@@ -301,7 +441,16 @@ fn sweep_profile(
 ) -> Result<Mesh64, GeomError> {
     let (points, closed) = directrix_points(curve, length_tolerance)?;
     let stations = stations(&points, closed, length_tolerance, rule)?;
+    sweep_profile_stations(profile, &stations, closed, area_tolerance)
+}
 
+/// The sweep itself, given its stations; `closed` joins the last to the first.
+fn sweep_profile_stations(
+    profile: &Profile2D,
+    stations: &[Station],
+    closed: bool,
+    area_tolerance: f64,
+) -> Result<Mesh64, GeomError> {
     // Loops in the order the cap triangulation indexes them.
     let mut flat: Vec<DVec2> = profile.outer.clone();
     let mut loops: Vec<(usize, bool)> = vec![(profile.outer.len(), !profile.open)];
@@ -335,7 +484,7 @@ fn sweep_profile(
     };
 
     let mut mesh = Mesh64::with_capacity(stations.len() * count, count * stations.len() * 6);
-    for station in &stations {
+    for station in stations {
         for point in &flat {
             let offset = station.normal * point.x + station.binormal * point.y;
             let along = offset.dot(station.stretch_axis) * (station.stretch - 1.0);
@@ -406,6 +555,7 @@ impl SolidEvaluator for SweptAreaAlongCurve {
     }
 
     fn evaluate(&self, ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Mesh64, GeomError> {
+        let derived = item.is_a("IfcDirectrixDerivedReferenceSweptAreaSolid");
         let registry = ctx.registry();
         let swept = item
             .attr("SweptArea")
@@ -426,9 +576,6 @@ impl SolidEvaluator for SweptAreaAlongCurve {
             .attr("Directrix")
             .as_entity()
             .ok_or_else(|| GeomError::missing("Directrix"))?;
-        let mut curve = registry.curve(ctx, directrix)?;
-        apply_trim(ctx, item, directrix, &mut curve);
-
         let reference = if item.is_a("IfcFixedReferenceSweptAreaSolid") {
             item.attr("FixedReference")
                 .as_entity()
@@ -450,13 +597,24 @@ impl SolidEvaluator for SweptAreaAlongCurve {
                 .normalize_or(DVec3::Z)
         };
 
-        let mut mesh = sweep_profile(
-            &profile,
-            &curve,
-            &FrameRule::FixedReference(reference),
-            ctx.tol.len,
-            ctx.tol.area,
-        )?;
+        // An alignment directrix has exact tangents and a cant at every
+        // station; any other curve is a polyline with mitred corners.
+        let mut mesh = if alignment::is_alignment_curve(directrix) {
+            let spatial = alignment::spatial_curve(ctx, directrix)?;
+            let (from, to) = trim_range(ctx, item, &spatial)?;
+            let stations = alignment_stations(ctx, &spatial, from, to, reference, derived)?;
+            sweep_profile_stations(&profile, &stations, false, ctx.tol.area)?
+        } else {
+            let mut curve = registry.curve(ctx, directrix)?;
+            apply_trim(ctx, item, directrix, &mut curve);
+            sweep_profile(
+                &profile,
+                &curve,
+                &FrameRule::FixedReference(reference),
+                ctx.tol.len,
+                ctx.tol.area,
+            )?
+        };
         mesh.transform(&axis2_placement_3d(item.attr("Position"), &ctx.units));
         Ok(mesh)
     }
@@ -918,6 +1076,7 @@ mod tests {
                 .map(|point| DVec3::from_array(*point))
                 .collect(),
             closed: false,
+            parameters: Vec::new(),
         }
     }
 
@@ -1144,6 +1303,211 @@ mod tests {
         // The profile's x axis follows the reference: XDim 0.3 stands vertical.
         let (low, high) = mesh.bounds().unwrap();
         assert!((high.z - low.z - 0.3).abs() < 1e-9 && (high.y - low.y - 0.2).abs() < 1e-9);
+    }
+
+    /// A fixed-reference sweep of a 0.3 by 0.2 rectangle along a three-segment
+    /// polyline, in millimetres so a length measure has a unit to convert.
+    fn trimmed_sweep_4x3(start: &str, end: &str) -> tessifc_model::Model {
+        crate::eval::tests::model_of_schema(
+            "IFC4X3_ADD2",
+            &format!(
+                "#1=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,300.,200.);\n\
+                 #2=IFCCARTESIANPOINT((0.,0.,0.));\n\
+                 #3=IFCCARTESIANPOINT((2000.,0.,0.));\n\
+                 #4=IFCCARTESIANPOINT((2000.,2000.,0.));\n\
+                 #5=IFCCARTESIANPOINT((0.,2000.,0.));\n\
+                 #6=IFCPOLYLINE((#2,#3,#4,#5));\n\
+                 #7=IFCDIRECTION((0.,0.,1.));\n\
+                 #8=IFCFIXEDREFERENCESWEPTAREASOLID(#1,$,#6,{start},{end},#7);\n\
+                 #9=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.);\n\
+                 #10=IFCUNITASSIGNMENT((#9));\n\
+                 #11=IFCPROJECT('p',$,$,$,$,$,$,$,#10);\n"
+            ),
+        )
+    }
+
+    #[test]
+    fn a_length_measure_trim_on_a_polyline_is_arc_length() {
+        // One metre in from the start and one metre short of the end, which in
+        // polyline parameters is 0.5 to 2.5.
+        let by_length = trimmed_sweep_4x3("IFCLENGTHMEASURE(1000.)", "IFCLENGTHMEASURE(5000.)");
+        let by_parameter = trimmed_sweep_4x3("IFCPARAMETERVALUE(0.5)", "IFCPARAMETERVALUE(2.5)");
+        let (mesh, diagnostics) = crate::eval::tests::eval_solid_with_diagnostics(&by_length, 8);
+        let mesh = mesh.unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let reference = crate::eval::tests::eval_solid(&by_parameter, 8).unwrap();
+        assert!(
+            (mesh.signed_volume() - reference.signed_volume()).abs() < 1e-9,
+            "length {} against parameter {}",
+            mesh.signed_volume(),
+            reference.signed_volume()
+        );
+        let (low, high) = mesh.bounds().unwrap();
+        assert!((low.x - 1.0).abs() < 1e-9, "starts a metre in, got {low}");
+        assert!(
+            (high.x - 2.1).abs() < 1e-9,
+            "ends a metre short of x 0, got {high}"
+        );
+    }
+
+    #[test]
+    fn a_length_measure_past_the_directrix_is_reported_not_extrapolated() {
+        let model = trimmed_sweep_4x3("IFCLENGTHMEASURE(0.)", "IFCLENGTHMEASURE(7000.)");
+        let (mesh, diagnostics) = crate::eval::tests::eval_solid_with_diagnostics(&model, 8);
+        let mesh = mesh.unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.code == codes::SWEEP_PARAMETERS_APPROXIMATED),
+            "{diagnostics:?}"
+        );
+        // The whole six-metre directrix was swept.
+        assert!((mesh.signed_volume().abs() - 0.36).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_directrix_derived_sweep_on_a_plain_curve_is_a_fixed_reference_sweep() {
+        let model = crate::eval::tests::model_of_schema(
+            "IFC4X3_ADD2",
+            concat!(
+                "#1=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,0.3,0.2);\n",
+                "#2=IFCCARTESIANPOINT((0.,0.,0.));\n",
+                "#3=IFCCARTESIANPOINT((2.,0.,0.));\n",
+                "#4=IFCPOLYLINE((#2,#3));\n",
+                "#5=IFCDIRECTION((0.,0.,1.));\n",
+                "#6=IFCDIRECTRIXDERIVEDREFERENCESWEPTAREASOLID(#1,$,#4,$,$,#5);\n",
+            ),
+        );
+        let mesh = crate::eval::tests::eval_solid(&model, 6).unwrap();
+        assert_eq!(mesh.closed, Some(true));
+        assert!((mesh.signed_volume().abs() - 0.12).abs() < 1e-9);
+    }
+
+    /// A straight ten metre base with cant rising from nothing to `angle` at its
+    /// end, as `#1..#15`; `#15` is the segmented reference curve.
+    fn canted_directrix(angle: f64) -> String {
+        let (sin, cos) = angle.sin_cos();
+        [
+            "#1=IFCCARTESIANPOINT((0.,0.));".to_string(),
+            "#2=IFCDIRECTION((1.,0.));".to_string(),
+            "#3=IFCAXIS2PLACEMENT2D(#1,#2);".to_string(),
+            "#4=IFCVECTOR(#2,1.);".to_string(),
+            "#5=IFCLINE(#1,#4);".to_string(),
+            "#6=IFCCURVESEGMENT(.CONTINUOUS.,#3,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#5);"
+                .to_string(),
+            "#7=IFCCOMPOSITECURVE((#6),.F.);".to_string(),
+            "#8=IFCCARTESIANPOINT((0.,0.,0.));".to_string(),
+            "#9=IFCDIRECTION((0.,0.,1.));".to_string(),
+            "#10=IFCAXIS2PLACEMENT3D(#8,#9,$);".to_string(),
+            "#11=IFCCURVESEGMENT(.CONTINUOUS.,#10,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#5);"
+                .to_string(),
+            "#12=IFCCARTESIANPOINT((10.,0.,0.));".to_string(),
+            format!("#13=IFCDIRECTION((0.,{},{}));", -sin, cos),
+            "#14=IFCAXIS2PLACEMENT3D(#12,#13,$);".to_string(),
+            "#15=IFCSEGMENTEDREFERENCECURVE((#11),.F.,#7,#14);".to_string(),
+            String::new(),
+        ]
+        .join("\n")
+    }
+
+    /// The largest z among the vertices near `x`.
+    fn top_at(mesh: &Mesh64, x: f64) -> f64 {
+        mesh.positions
+            .iter()
+            .filter(|p| (p.x - x).abs() < 1e-6)
+            .map(|p| p.z)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    #[test]
+    fn a_directrix_derived_sweep_turns_its_reference_with_the_cant() {
+        let angle: f64 = 0.2;
+        let source = canted_directrix(angle)
+            + "#20=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,0.4,0.2);\n"
+            + "#21=IFCDIRECTRIXDERIVEDREFERENCESWEPTAREASOLID(#20,$,#15,$,$,#9);\n"
+            + "#22=IFCFIXEDREFERENCESWEPTAREASOLID(#20,$,#15,$,$,#9);\n";
+        let model = crate::eval::tests::model_of_schema("IFC4X3_ADD2", &source);
+        let derived = crate::eval::tests::eval_solid(&model, 21).unwrap();
+        assert_eq!(derived.closed, Some(true));
+        // The reference is up, so profile x is vertical: 0.2 tall at the start,
+        // and at the end the rectangle is turned by the cant about the tangent.
+        assert!((top_at(&derived, 0.0) - 0.2).abs() < 1e-9);
+        let turned = 0.2 * angle.cos() + 0.1 * angle.sin();
+        assert!(
+            (top_at(&derived, 10.0) - turned).abs() < 1e-9,
+            "got {}",
+            top_at(&derived, 10.0)
+        );
+        // The fixed reference ignores the cant.
+        let fixed = crate::eval::tests::eval_solid(&model, 22).unwrap();
+        assert!((top_at(&fixed, 10.0) - 0.2).abs() < 1e-9);
+        assert!((fixed.signed_volume().abs() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_disk_along_a_gradient_curve_is_trimmed_by_distance_along() {
+        // A ten metre straight base with a gradient of a half; the disk runs
+        // from two to eight along, so its axis is six times the slope's length.
+        let slope: f64 = 0.5;
+        let along = 10.0 * (1.0 + slope * slope).sqrt();
+        let source = [
+            "#1=IFCCARTESIANPOINT((0.,0.));".to_string(),
+            "#2=IFCDIRECTION((1.,0.));".to_string(),
+            "#3=IFCAXIS2PLACEMENT2D(#1,#2);".to_string(),
+            "#4=IFCVECTOR(#2,1.);".to_string(),
+            "#5=IFCLINE(#1,#4);".to_string(),
+            "#6=IFCCURVESEGMENT(.CONTINUOUS.,#3,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#5);".to_string(),
+            "#7=IFCCOMPOSITECURVE((#6),.F.);".to_string(),
+            format!("#8=IFCDIRECTION((1.,{slope}));"),
+            "#9=IFCAXIS2PLACEMENT2D(#1,#8);".to_string(),
+            format!("#10=IFCCURVESEGMENT(.CONTINUOUS.,#9,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE({along}),#5);"),
+            "#11=IFCGRADIENTCURVE((#10),.F.,#7,$);".to_string(),
+            "#12=IFCSWEPTDISKSOLID(#11,0.1,$,IFCLENGTHMEASURE(2.),IFCLENGTHMEASURE(8.));".to_string(),
+            "#13=IFCSWEPTDISKSOLID(#11,0.1,$,$,$);".to_string(),
+            "#14=IFCSWEPTDISKSOLID(#11,0.1,$,2.,8.);".to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        let model = crate::eval::tests::model_of_schema("IFC4X3_ADD2", &source);
+        let (mesh, diagnostics) = crate::eval::tests::eval_solid_with_diagnostics(&model, 12);
+        let mesh = mesh.unwrap();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == codes::SWEEP_PARAMETERS_APPROXIMATED),
+            "{diagnostics:?}"
+        );
+        let expected = 6.0 * (1.0 + slope * slope).sqrt() * std::f64::consts::PI * 0.01;
+        let measured = mesh.signed_volume().abs();
+        assert!(
+            (measured - expected).abs() / expected < 0.02,
+            "six metres along the slope: {measured} vs {expected}"
+        );
+        let (min, max) = mesh
+            .positions
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), p| {
+                (low.min(p.x), high.max(p.x))
+            });
+        assert!(
+            (min - 2.0).abs() < 0.11 && (max - 8.0).abs() < 0.11,
+            "trimmed to [2, 8] along, got {min}..{max}"
+        );
+        // Without trims the whole ten metres are swept.
+        let whole = crate::eval::tests::eval_solid(&model, 13)
+            .unwrap()
+            .signed_volume()
+            .abs();
+        assert!(
+            (whole - expected * 10.0 / 6.0).abs() / whole < 0.02,
+            "got {whole}"
+        );
+        // A plain parameter value on an alignment composite is the distance along it.
+        let by_parameter = crate::eval::tests::eval_solid(&model, 14)
+            .unwrap()
+            .signed_volume()
+            .abs();
+        assert!((by_parameter - measured).abs() < 1e-9, "got {by_parameter}");
     }
 
     #[test]

@@ -52,7 +52,7 @@ viewer at a loopback address so a person can watch the agent work. From a
 checkout, after `python scripts/build-wasm.py --target both`:
 
 ```sh
-npm ci --prefix bindings/mcp
+npm ci
 claude mcp add tessifc -- node bindings/mcp/src/cli.js --new house.ifc
 ```
 
@@ -90,8 +90,8 @@ structured content.
 | `describe_model` | | `name`, `schema`, `revision`, `version`, `lengthUnit`, `products` by class, `storeys`, `history`, `viewer`, `text` (a prompt-ready summary) | yes |
 | `find_products` | `class`, `name`, `storey`, `limit` | `products` (`id`, `class`, `name`, `guid`, `storey`), `total` | yes |
 | `product_info` | `id` or `guid` | `id`, `class`, `guid`, `name`, `attributes`, `container`, `propertySets`, `representations`, `placement` | yes |
-| `inspect_model` | `code` | `ok`, `stdout`, `error`, `traceback`; a read-only run, nothing is published | yes |
-| `edit_model` | `script`, `summary` | `ok`, `changed`, `revision`, `version`, `stdout`, `operations`, `affectedProducts`, `removedProducts`, `metadataProducts`, `fullRebuild`, `diagnostics`, `history`, `saved` | yes |
+| `inspect_model` | `code` | `ok`, `timedOut`, `stdout`, `error`, `traceback`; a read-only run, nothing is published | yes |
+| `edit_model` | `script`, `summary` | `ok`, `timedOut`, `changed`, `revision`, `version`, `stdout`, `operations`, `affectedProducts`, `removedProducts`, `metadataProducts`, `fullRebuild`, `diagnostics`, `history`, `saved` | yes |
 | `undo`, `redo` | | as `edit_model`, plus `label` | yes |
 | `export_model` | `path` | `path`, `bytes`, `version` | yes |
 | `new_model` | `schema`, `name`, `units`, `site`, `building`, `storeys`, `path`, `force` | `revision`, `version`, `generation`, `storeys`, `products` | yes |
@@ -262,7 +262,12 @@ numbers the session gives you:
 Scripts run with your program's permissions and without a sandbox, in the
 browser worker, the MCP process or the session process. Review generated
 scripts before granting an agent automatic edits, and keep provider keys out
-of anything a script can read. The MCP servers bind to the loopback interface
+of anything a script can read. The browser viewer and the Node MCP server run
+each script under a time limit (`--script-timeout-ms`, 30 seconds by
+default, 0 for none) in a worker with its own kernel; a script still running
+at the limit is stopped by ending that worker, its edits are discarded and
+the result says `timedOut`. The limit catches a script that never returns;
+it is not a security boundary, and the Python session has none. The MCP servers bind to the loopback interface
 only, check the Host and Origin headers and require a per-process token on
 every viewer command. The session reparses the whole candidate file and scans
 dependencies model-wide; selective work is the tessellation and the renderer

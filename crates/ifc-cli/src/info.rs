@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use tessifc_step::{ParseOptions, SchemaId, parse};
+use tessifc_step::{ParseOptions, SchemaId};
 
 #[derive(Serialize)]
 struct Report {
@@ -91,7 +91,7 @@ pub fn run(
     }
 
     let started = Instant::now();
-    let image = parse(&bytes, &options);
+    let image = tessifc_step::open(&bytes, &options);
     let elapsed = started.elapsed();
 
     let parse_ms = elapsed.as_secs_f64() * 1000.0;

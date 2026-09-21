@@ -2,8 +2,10 @@
 # embed-viewer
 
 The [`@tessifc/viewer`](../../bindings/viewer/README.md) package in one HTML
-page: a drop zone, a row of buttons and the viewer's own canvas. Parsing,
-geometry and rendering all happen in the tab; nothing is uploaded anywhere.
+page and one script: a drop zone, a row of buttons and the viewer's own
+canvas. Parsing, geometry and rendering all happen in the tab; nothing is
+uploaded anywhere. `main.js` runs under `// @ts-check` against the packages'
+declarations, so it doubles as a typed example.
 
 ## Running it
 
@@ -19,6 +21,9 @@ python -m http.server 8000 --bind 127.0.0.1
 Then open <http://127.0.0.1:8000/examples/embed-viewer/> and drop a `.ifc`
 file on it. The import map at the top of the page points the package names
 at the checkout; with a bundler, install the packages and delete the map.
+`?worker=1` runs the kernel in the package's worker instead of on the page
+(`&scriptTimeoutMs=<ms>` sets the script limit), which is what an
+application should do for large files.
 
 ## What it shows
 
@@ -33,7 +38,7 @@ Start a session host instead of the static server, for example an MCP server
 with a new model:
 
 ```sh
-npm ci --prefix bindings/mcp
+npm ci
 node bindings/mcp/src/cli.js house.ifc --new
 ```
 

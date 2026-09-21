@@ -25,7 +25,7 @@ and as a command line tool, and it ships with a viewer that uses it. Edits
 become revisions: a script, an attribute change or a saved file re-tessellates
 only the products it touched, and an agent can drive the same loop.
 
-This is the **v0.2 developer preview**.
+This is the **v0.3 developer preview**.
 
 ![The TessIFC viewer inspecting a pavilion model](docs/assets/viewer.png)
 
@@ -41,7 +41,7 @@ python scripts/build-wasm.py --target both
 
 That writes the browser module to `bindings/wasm/pkg` and the Node module to
 `bindings/wasm/pkg-node`. Each release also carries the npm packages as
-tarballs, so `npm install ./tessifc-core-0.2.0.tgz` works without a build.
+tarballs, so `npm install ./tessifc-core-0.3.0.tgz` works without a build.
 Once the preview is published, `npm install @tessifc/core` gives you the same
 API.
 
@@ -102,7 +102,7 @@ An agent edits or creates a model through the same session while the viewer
 follows. With Claude Code:
 
 ```sh
-npm ci --prefix bindings/mcp
+npm ci
 claude mcp add tessifc -- node bindings/mcp/src/cli.js --new house.ifc
 ```
 
@@ -124,17 +124,23 @@ or repaired.
 
 ## What it does
 
-* Reads IFC-SPF with IFC2X3, IFC4 and IFC4X3 schema tables.
-* Tessellates extrusions, sweeps, tessellated sets, BReps and boolean
-  operations.
+* Reads IFC-SPF and IFCZIP with IFC2X3, IFC4 and IFC4X3 schema tables.
+* Tessellates extrusions, sweeps, tessellated sets, advanced BReps, boolean
+  operations, and IFC4X3 alignments with the solids placed and swept along
+  them.
+* Stops at whole-model triangle, vertex and time budgets when asked, and
+  can write coarse levels of large meshes for viewers to draw while moving.
 * Keeps element IDs, colours, placements and reused geometry in the IGP mesh
-  container.
+  container, and materials, textures and texture coordinates on request.
 * Streams geometry and reports per product what was unsupported, repaired or
   degraded.
 * Reads attributes and writes source-preserving edits.
 * Turns scripts, attribute edits and saved snapshots into revisions that
   re-tessellate only the affected products, and reports what changed.
 * Lets agents drive the same loop over MCP, in Node or in Python.
+* Runs as a native Python extension too, with the same reports and packs.
+* Draws in the browser through an embeddable viewer that runs the kernel in
+  a worker and keeps moving frames light.
 
 Schema recognition is broader than geometry support, and complex trims,
 booleans and malformed topology still have limits. Read the conversion report
@@ -147,7 +153,7 @@ These are needed only to build from source.
 
 1. Rust, the version pinned in `rust-toolchain.toml`, installed through rustup
 2. The `wasm32-unknown-unknown` target, for the browser and Node packages
-3. Python 3.11 or later, for the build scripts
+3. Python 3.10 or later, for the build scripts, the wheel and the IfcOpenShell session
 4. Node 20 or later, for the Node package and the JavaScript tests
 
 `scripts/build-wasm.py` checks `wasm-bindgen-cli` against the lockfile and
@@ -158,9 +164,11 @@ prints the exact command to install the matching version. A current
 
 ```sh
 cargo test --workspace
+npm ci                                  # once, at the root: links the packages to each other
+npm run types && npm run typecheck      # the TypeScript declarations, after the WASM build
 npm --prefix bindings/wasm test
 npm --prefix bindings/edit test
-npm ci --prefix bindings/mcp && npm --prefix bindings/mcp test
+npm --prefix bindings/mcp test
 node examples/agent-building/build-house.test.mjs
 node adapters/three/test/build.test.mjs
 node viewer/test/igp.test.mjs
@@ -170,14 +178,16 @@ These need only Node. The viewer's pixel tests and the embedded viewer
 package need a headless browser:
 
 ```sh
-npm ci --prefix viewer
-cd viewer && npx playwright install chromium && npm test
+npx playwright install chromium
+npm --prefix viewer test
 npm --prefix bindings/viewer test
 ```
 
 The Python session's tests run with `python -m unittest discover -s
 adapters/ifcopenshell/tests`; the ones that need IfcOpenShell or the `mcp`
-package skip when those are not installed.
+package skip when those are not installed. The Python wheel's tests run
+against an installed build (`cd bindings/python && maturin develop --release`)
+with `python -m unittest discover -s bindings/python/tests`.
 
 ## Documentation
 

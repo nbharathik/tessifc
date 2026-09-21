@@ -10,6 +10,8 @@ import { createScriptEngine, runScript as runEngineScript } from "./script-engin
 const HISTORY_LIMIT = 10;
 const HISTORY_BYTES = 256 << 20;
 
+/** @typedef {ReturnType<typeof createEditingSession>} Session */
+
 /**
  * Open an editing session over a model the kernel already holds.
  *
@@ -17,6 +19,9 @@ const HISTORY_BYTES = 256 << 20;
  * the kernel refuses a patch evaluated with different ones. Either call
  * `evaluate()` here to produce the initial scene, or `adopt()` the model
  * offset and next geometry id of a scene the host built itself.
+ * @param {import("./types.js").Kernel} kernel
+ * @param {number} modelId
+ * @param {{ settings?: import("./types.js").GeometrySettings, label?: string | null, modelOffset?: number[] | null, firstGeometryId?: number | null, historyLimit?: number, historyBytes?: number }} [options]
  */
 export function createEditingSession(kernel, modelId, options = {}) {
   const settings = { ...(options.settings ?? {}) };
@@ -24,6 +29,7 @@ export function createEditingSession(kernel, modelId, options = {}) {
   let modelOffset = options.modelOffset ?? null;
   let nextGeometryId = options.firstGeometryId ?? null;
   const limits = { count: options.historyLimit ?? HISTORY_LIMIT, bytes: options.historyBytes ?? HISTORY_BYTES };
+  /** @type {{ undo: Uint8Array[], redo: Uint8Array[] }} */
   const history = { undo: [], redo: [] };
   let closed = false;
 
@@ -33,6 +39,7 @@ export function createEditingSession(kernel, modelId, options = {}) {
 
   function ready() {
     open();
+    if (typeof kernel.prepareRevision !== "function") throw new Error("This kernel build has no editing support.");
     if (!modelOffset || nextGeometryId === null) {
       throw new Error("Establish the scene first: call evaluate() or adopt({ modelOffset, nextGeometryId }).");
     }
@@ -80,6 +87,9 @@ export function createEditingSession(kernel, modelId, options = {}) {
    * Stage, evaluate, check and commit one candidate; the delta describes what
    * changed. An error thrown after the commit carries `committed: true` and the
    * new `revision`: the model moved on even though no delta was returned.
+   * @param {(baseRevision: string) => string} prepare
+   * @param {{ before?: Uint8Array, afterCommit?: () => void, result?: object }} [extra]
+   * @returns {import("./types.js").Delta}
    */
   function publish(prepare, extra = {}) {
     ready();
@@ -95,6 +105,7 @@ export function createEditingSession(kernel, modelId, options = {}) {
       const geometryMs = now() - geometryStarted;
       const impact = JSON.parse(kernel.getPreparedRevisionInfo(modelId));
       if (!impact.evaluationAccepted) {
+        /** @type {import("./types.js").SessionError} */
         const error = new Error(rejectionMessage(impact));
         error.impact = impact;
         throw error;
@@ -135,8 +146,8 @@ export function createEditingSession(kernel, modelId, options = {}) {
       };
     } catch (error) {
       if (committed && error instanceof Error) {
-        error.committed = true;
-        error.revision = revision;
+        /** @type {import("./types.js").SessionError} */ (error).committed = true;
+        /** @type {import("./types.js").SessionError} */ (error).revision = revision;
       }
       throw error;
     } finally {
@@ -144,21 +155,34 @@ export function createEditingSession(kernel, modelId, options = {}) {
     }
   }
 
-  /** Publish an externally edited copy of the whole file. */
+  /**
+   * Publish an externally edited copy of the whole file.
+   * @param {Uint8Array | ArrayBuffer | string} bytes
+   */
   function applySnapshot(bytes) {
+    ready();
     const before = kernel.exportModel(modelId);
     return publish((base) => kernel.prepareRevision(modelId, asBytes(bytes), base), { before });
   }
 
-  /** Publish attribute edits, each `{ expressId, attribute, value, raw }`, preserving unrelated bytes. */
+  /**
+   * Publish attribute edits, each `{ expressId, attribute, value, raw }`, preserving unrelated bytes.
+   * @param {Array<{ expressId: number, attribute?: string, index?: number, value?: unknown, raw?: string }>} edits
+   */
   function setAttributes(edits) {
+    ready();
     const before = kernel.exportModel(modelId);
     return publish((base) => kernel.prepareAttributeEdits(modelId, JSON.stringify(edits), base), { before });
   }
 
   /**
-   * Run a script; `report` is the script's own result and `delta` the published
-   * revision, or null when nothing changed. `commit: false` runs it read-only.
+   * Run a script in this thread, without a time limit; `report` is the script's
+   * own result and `delta` the published revision, or null when nothing
+   * changed. `commit: false` runs it read-only.
+   * @param {string} source
+   * @param {import("./types.js").Selection | null} [selection]
+   * @param {{ commit?: boolean }} [options]
+   * @returns {{ report: import("./types.js").ScriptReport, delta: import("./types.js").Delta | null }}
    */
   function runScript(source, selection = null, { commit = true } = {}) {
     ready();
@@ -175,8 +199,35 @@ export function createEditingSession(kernel, modelId, options = {}) {
   }
 
   /**
+   * Run a script through a runner that isolates it, such as `createScriptRunner`
+   * from `@tessifc/edit/script-runner`. Same result as `runScript`; a script
+   * the runner stopped reports `ok: false` with `timedOut` or `aborted`.
+   * @param {import("./types.js").ScriptRunner} runner
+   * @param {string} source
+   * @param {import("./types.js").Selection | null} [selection]
+   * @param {{ commit?: boolean, signal?: AbortSignal | null }} [options]
+   * @returns {Promise<{ report: import("./types.js").ScriptReport, delta: import("./types.js").Delta | null }>}
+   */
+  async function runScriptWith(runner, source, selection = null, { commit = true, signal = null } = {}) {
+    ready();
+    const baseRevision = kernel.getModelRevision(modelId);
+    const before = kernel.exportModel(modelId);
+    const { snapshot, ...report } = await runner.run(before, String(source ?? ""), selection, { commit, signal });
+    if (!report.ok || !report.changed || !commit || !snapshot) {
+      if (!commit) report.changed = false;
+      return { report, delta: null };
+    }
+    ready();
+    if (kernel.getModelRevision(modelId) !== baseRevision) throw new Error("The model changed while the script ran; run it again.");
+    const delta = publish((base) => kernel.prepareRevision(modelId, snapshot, base), { before });
+    return { report, delta };
+  }
+
+  /**
    * Re-tessellate the named products without changing the model: the host
    * decides the set, for example after a settings change it made elsewhere.
+   * @param {Iterable<number>} expressIds
+   * @returns {import("./types.js").Delta}
    */
   function refreshProducts(expressIds) {
     ready();
@@ -249,6 +300,7 @@ export function createEditingSession(kernel, modelId, options = {}) {
     applySnapshot,
     setAttributes,
     runScript,
+    runScriptWith,
     refreshProducts,
     undo: () => restore(history.undo, history.redo, "undo"),
     redo: () => restore(history.redo, history.undo, "redo"),
@@ -273,6 +325,7 @@ export function createEditingSession(kernel, modelId, options = {}) {
   };
 }
 
+/** @param {import("./types.js").RevisionImpact} impact */
 function rejectionMessage(impact) {
   const diagnostics = Array.isArray(impact.diagnostics) ? impact.diagnostics : [];
   const first = diagnostics.find((item) => item?.severity === "error") ?? diagnostics[0];
@@ -285,6 +338,7 @@ function rejectionMessage(impact) {
   return "The candidate revision was rejected by the kernel.";
 }
 
+/** @param {Uint8Array | ArrayBuffer | string} input */
 function asBytes(input) {
   if (input instanceof Uint8Array) return input;
   if (input instanceof ArrayBuffer) return new Uint8Array(input);

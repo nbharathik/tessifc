@@ -8,6 +8,7 @@ use core::fmt;
 use core::ops::Range;
 
 /// One source-level argument replacement.
+#[cfg(feature = "edit")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct AttributeEdit {
     /// The `#n` entity to edit.
@@ -22,6 +23,7 @@ pub struct AttributeEdit {
 }
 
 /// A STEP value accepted by the lossless editor.
+#[cfg(feature = "edit")]
 #[derive(Clone, Debug, PartialEq)]
 pub enum EditValue {
     /// `$`, an unset optional value.
@@ -145,6 +147,7 @@ pub fn leaf_argument_source<'a>(
 
 /// Apply edits together and return a new IFC source buffer.
 /// Replacements are applied back-to-front so edits never invalidate each other's offsets.
+#[cfg(feature = "edit")]
 pub fn apply_edits(
     source: &[u8],
     image: &ModelImage,
@@ -337,6 +340,7 @@ fn leaf_argument_span(
     })
 }
 
+#[cfg(feature = "edit")]
 fn encode_value(value: &EditValue) -> Result<Vec<u8>, EditError> {
     let encoded = match value {
         EditValue::Null => "$".to_owned(),
@@ -377,6 +381,7 @@ fn encode_value(value: &EditValue) -> Result<Vec<u8>, EditError> {
     Ok(encoded.into_bytes())
 }
 
+#[cfg(feature = "edit")]
 fn encode_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -412,6 +417,7 @@ fn encode_string(value: &str) -> String {
     out
 }
 
+#[cfg(feature = "edit")]
 fn validate_raw(value: &[u8]) -> Result<(), EditError> {
     let start = skip_trivia(value, 0, value.len());
     let Some(end) = scan_value(value, start, value.len(), 0, Origin::Replacement) else {
@@ -447,6 +453,7 @@ fn skip_trivia(source: &[u8], mut at: usize, limit: usize) -> usize {
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Origin {
     Source,
+    #[cfg(feature = "edit")]
     Replacement,
 }
 
@@ -607,7 +614,7 @@ fn scan_list(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "edit"))]
 mod tests {
     use super::*;
     use crate::{ParseOptions, parse};

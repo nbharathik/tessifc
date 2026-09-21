@@ -61,6 +61,9 @@ pub struct Polyline3 {
     pub points: Vec<DVec3>,
     /// Whether the last point joins the first.
     pub closed: bool,
+    /// The curve's own parameter at each point, when the evaluator knows it;
+    /// empty otherwise.
+    pub parameters: Vec<f64>,
 }
 
 /// Produces a solid, or a surface, from a representation item.
@@ -136,6 +139,8 @@ pub enum SurfaceKind {
         along: DVec3,
         /// How far it is swept.
         depth: f64,
+        /// The swept curve's own parameter at each outline point, or empty.
+        knots: Vec<f64>,
     },
     /// A profile turned about an axis; u is the angle, v the profile parameter.
     Revolution {
@@ -149,6 +154,8 @@ pub enum SurfaceKind {
         axis: DVec3,
         /// The radial direction at u = 0, unit length and across the axis.
         reference: DVec3,
+        /// The swept curve's own parameter at each section point, or empty.
+        knots: Vec<f64>,
     },
     /// A tensor-product B-spline, rational when any weight is not one.
     BSpline(Box<BSplineSurface>),
@@ -291,6 +298,7 @@ impl Surface {
                 origin,
                 axis,
                 reference,
+                ..
             } => {
                 let at = point_on_outline(section, *closed, uv.y);
                 let side = axis.cross(*reference);
@@ -352,6 +360,7 @@ impl Surface {
                 origin,
                 axis,
                 reference,
+                ..
             } => {
                 let offset = local - *origin;
                 let height = offset.dot(*axis);
@@ -364,6 +373,27 @@ impl Surface {
             SurfaceKind::BSpline(surface) => surface.invert(local, tol),
         }
     }
+}
+
+/// The outline parameter (one unit per segment) for a swept curve's own
+/// parameter, read through the knots recorded at each outline point.
+pub fn outline_parameter_at_knot(knots: &[f64], value: f64) -> Option<f64> {
+    if knots.len() < 2 || !value.is_finite() {
+        return None;
+    }
+    for (index, pair) in knots.windows(2).enumerate() {
+        let (low, high) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
+        if value >= low && value <= high {
+            let span = pair[1] - pair[0];
+            let fraction = if span.abs() > 0.0 {
+                (value - pair[0]) / span
+            } else {
+                0.0
+            };
+            return Some(index as f64 + fraction);
+        }
+    }
+    None
 }
 
 /// How long an outline's parameter runs: one unit per segment.

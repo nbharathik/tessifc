@@ -5,24 +5,29 @@
 
 use crate::registry::Registry;
 
+pub mod alignment;
 pub mod curves;
 mod pcurves;
 pub mod primitives;
 pub mod profiles;
+pub mod sectioned;
 pub mod solids;
 mod surface_regions;
 pub mod surfaces;
 pub mod sweeps;
 pub mod tessellated;
+pub(crate) mod uv;
 
 /// Register everything TessIFC implements.
 pub fn register_defaults(registry: &mut Registry) {
     curves::register(registry);
+    alignment::register(registry);
     surfaces::register(registry);
     primitives::register(registry);
     profiles::register(registry);
     solids::register(registry);
     sweeps::register(registry);
+    sectioned::register(registry);
     tessellated::register(registry);
 }
 
@@ -36,10 +41,15 @@ pub(crate) mod tests {
     use tessifc_model::Model;
     use tessifc_step::{Diagnostic, ParseOptions, parse};
 
-    /// Build a model from a DATA section.
+    /// Build an IFC4 model from a DATA section.
     pub(crate) fn model_of(data: &str) -> Model {
+        model_of_schema("IFC4", data)
+    }
+
+    /// Build a model from a DATA section under the named schema, such as `IFC4X3_ADD2`.
+    pub(crate) fn model_of_schema(schema: &str, data: &str) -> Model {
         let source = format!(
-            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}ENDSEC;\n"
+            "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n{data}ENDSEC;\n"
         );
         let image = parse(source.as_bytes(), &ParseOptions::default());
         assert!(
@@ -77,6 +87,23 @@ pub(crate) mod tests {
         with_ctx(model, |registry, ctx| {
             registry.solid(ctx, model.entity(id).expect("no such instance"))
         })
+    }
+
+    /// Evaluate a solid with the `textures` setting on.
+    pub(crate) fn eval_textured_solid(
+        model: &Model,
+        id: u32,
+    ) -> (Result<Mesh64, GeomError>, Vec<Diagnostic>) {
+        let units = Units::from_model(model);
+        let settings = Settings {
+            textures: true,
+            ..Settings::default()
+        };
+        let sink = DiagnosticSink::default();
+        let ctx = EvalCtx::new(model, units, Tolerances::default(), &settings, &sink);
+        let registry = Registry::defaults(model.image().schema);
+        let value = registry.solid(&ctx, model.entity(id).expect("no such instance"));
+        (value, sink.take())
     }
 
     pub(crate) fn eval_profile(model: &Model, id: u32) -> Result<Profile2D, GeomError> {

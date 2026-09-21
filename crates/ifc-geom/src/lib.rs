@@ -48,5 +48,8 @@ pub use registry::{
     BSplineSurface, CurveEvaluator, Polyline3, Profile2D, ProfileEvaluator, Registry,
     SolidEvaluator, Surface, SurfaceEvaluator, SurfaceKind,
 };
-pub use style::{Rgba, class_colour, item_colour};
+pub use style::{
+    Material, Rgba, Texture, TextureGenerator, TextureSource, class_colour, decode_step_binary,
+    item_colour,
+};
 pub use units::Units;

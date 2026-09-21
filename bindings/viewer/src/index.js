@@ -9,6 +9,7 @@ import { DEFAULT_LOD_PIXELS, IfcRenderer } from "./renderer.js";
 import { createPackAssembler } from "./stream.js";
 import { createFrameScheduler, createTaskQueue } from "./scheduler.js";
 import { createSessionClient } from "./session-client.js";
+import { createKernelClient } from "./kernel-client.js";
 
 export { IfcRenderer, DEFAULT_LOD_PIXELS } from "./renderer.js";
 export { createPackAssembler } from "./stream.js";
@@ -17,6 +18,8 @@ export { frameSphere, wheelZoomFactor, zoomCamera } from "./navigation.js";
 export { projectPoint, snapToTriangle, measurementBetween } from "./measure.js";
 export { findContestedTriangles, planeKey } from "./depth-planes.js";
 export { createSessionClient } from "./session-client.js";
+export { createKernelClient, DEFAULT_SCRIPT_TIMEOUT_MS } from "./kernel-client.js";
+export { createTextureCache, resolveTextureUrl, pixelsToRgba, uvMatrix } from "./textures.js";
 
 /** Helper geometry is kept in the pack so a host can reveal it without converting again. */
 export const GEOMETRY_SETTINGS = {
@@ -27,9 +30,9 @@ export const GEOMETRY_SETTINGS = {
 };
 
 /** Display styles the renderer understands. */
-export const STYLES = ["shaded", "xray", "wire"];
+export const STYLES = /** @type {ReadonlyArray<"shaded" | "xray" | "wire">} */ (["shaded", "xray", "wire"]);
 /** Camera modes `setView` accepts. */
-export const VIEWS = ["perspective", "top", "front", "right"];
+export const VIEWS = /** @type {ReadonlyArray<"perspective" | "top" | "front" | "right">} */ (["perspective", "top", "front", "right"]);
 
 // A small first chunk for an early paint; later chunks grow to amortise overhead.
 const FIRST_CHUNK_MS = 45;
@@ -37,6 +40,75 @@ const CHUNK_MS = 220;
 const CHUNK_TRIANGLES = 600_000;
 // A release that travelled further than this is a drag, not a click.
 const CLICK_TRAVEL_PX = 4;
+
+/** @typedef {import("@tessifc/edit/types").Kernel} Kernel */
+/** @typedef {import("@tessifc/edit/types").Delta} Delta */
+/** @typedef {import("./stream.js").AssembledPack} AssembledPack */
+
+/**
+ * The options of `createViewer`.
+ * @typedef {object} ViewerOptions
+ * @property {Kernel} [kernel] A kernel from `@tessifc/core/web`; `open` needs one.
+ * @property {number} [hiddenFlags] Instance flag bits hidden at load; spaces, openings and references by default.
+ * @property {number} [lodPixels] Skip products smaller than this on screen; 0 draws everything.
+ * @property {"light" | "dark"} [theme]
+ * @property {string} [background] A CSS hex colour for the canvas.
+ * @property {boolean} [requireGeometry] Refuse a model with no drawable product instead of showing it empty.
+ * @property {boolean} [selectOnClick] Off leaves clicks to the host.
+ * @property {boolean} [focusOnDoubleClick]
+ * @property {boolean} [coincidence] Off skips the shared-plane overlay analysis.
+ * @property {boolean | WorkerOptions} [worker] Run the kernel in a Web Worker instead of on the page: `true` for the package's worker next to the checkout's kernel, or where to find things.
+ * @property {boolean} [occlusion] Leave product groups hidden behind the model's largest faces out of moving frames; on by default.
+ * @property {boolean} [motionLod] Draw the coarse levels a pack carries (the `lodLevels` setting) on moving frames; on by default.
+ * @property {boolean} [textures] Ask the kernel for materials and textures and draw them; off by default.
+ * @property {boolean} [allowRemoteTextures] Fetch image textures from other origins too; off, only the page's own.
+ * @property {string} [textureBaseUrl] Where a texture's relative path resolves; the page's URL by default.
+ */
+
+/**
+ * Where worker mode finds its pieces; every field is optional.
+ * @typedef {object} WorkerOptions
+ * @property {URL | string} [url] The worker script; the package's `kernel-worker.js` by default.
+ * @property {URL | string} [wasmUrl] The `@tessifc/core/web` module the default worker loads.
+ * @property {URL | string} [editUrl] The directory the default worker finds `@tessifc/edit`'s sources in.
+ * @property {number} [scriptTimeoutMs] The script limit; 0 runs scripts without one.
+ */
+
+/**
+ * The options of `viewer.open`.
+ * @typedef {object} OpenOptions
+ * @property {Kernel} [kernel]
+ * @property {Record<string, unknown>} [settings] Geometry settings merged over `GEOMETRY_SETTINGS`.
+ * @property {Record<string, unknown>} [modelSettings] Parse settings for `openModel`.
+ * @property {boolean} [requireGeometry]
+ */
+
+/**
+ * What `open` resolves with: the kernel's model id and reports.
+ * @typedef {object} OpenResult
+ * @property {number} modelId
+ * @property {Record<string, any>} info
+ * @property {Record<string, any>} summary
+ * @property {{ nodes: Array<Record<string, any>> }} hierarchy
+ * @property {boolean} empty
+ */
+
+/**
+ * The current selection: express ids and their pack records.
+ * @typedef {{ expressIds: number[], records: number[] }} ViewerSelection
+ */
+
+/**
+ * A section cut; see `setSection`.
+ * @typedef {{ axis?: "x" | "y" | "z", value?: number, fraction?: number, flipped?: boolean, cap?: boolean }} SectionOptions
+ */
+
+/**
+ * What `applyDelta` returns and the `revision` event carries.
+ * @typedef {{ revision: string | null, kind: string, affectedProducts: number[], removedProducts: number[], metadataProducts: number[], fullRebuild: boolean, changed: boolean }} RevisionReport
+ */
+
+/** @typedef {ReturnType<typeof createViewer>} Viewer */
 
 /**
  * Create a viewer inside `container`.
@@ -47,6 +119,8 @@ const CLICK_TRAVEL_PX = 4;
  * screen, 0 to draw everything), `theme` (`"light"` or `"dark"`),
  * `background` (a CSS hex colour for the canvas) and `requireGeometry`
  * (refuse a model with no drawable product instead of showing it empty).
+ * @param {Element} container
+ * @param {ViewerOptions} [options]
  */
 export function createViewer(container, options = {}) {
   if (!(container instanceof Element)) throw new TypeError("createViewer needs a DOM element");
@@ -55,11 +129,20 @@ export function createViewer(container, options = {}) {
   const listeners = new Map();
   const view = { renderer };
 
+  /** @type {Record<string, any> | null} */
   let model = null;
   let hiddenFlags = options.hiddenFlags ?? DEFAULT_HIDDEN_INSTANCE_FLAGS;
+  // Worker mode: the kernel lives in a worker the client owns for the viewer's life.
+  const workerOptions = options.worker === true ? {} : options.worker && typeof options.worker === "object" ? options.worker : null;
+  /** @type {import("./kernel-client.js").KernelClient | null} */
+  let kernelClient = null;
+  /** @type {Set<number>} */
   const hidden = new Set();
+  /** @type {Set<number>} */
   const shown = new Set();
+  /** @type {Set<number> | null} */
   let isolated = null;
+  /** @type {ViewerSelection | null} */
   let selection = null;
   let disposed = false;
 
@@ -91,6 +174,15 @@ export function createViewer(container, options = {}) {
 
   renderer.setLodPixels?.(options.lodPixels ?? DEFAULT_LOD_PIXELS);
   if (options.theme || options.background) renderer.setViewportTheme(options.theme ?? "dark", options.background);
+  renderer.setOcclusionCulling?.(options.occlusion !== false);
+  renderer.setMotionLod?.(options.motionLod !== false);
+  let textures = Boolean(options.textures);
+  renderer.setTextures?.(textures, { allowRemote: Boolean(options.allowRemoteTextures), baseUrl: options.textureBaseUrl ?? null });
+
+  /** The geometry settings of an open: the defaults, textures when wanted, then the caller's. */
+  function geometrySettings(overrides) {
+    return { ...GEOMETRY_SETTINGS, ...(textures ? { textures: true } : {}), ...overrides };
+  }
 
   function emit(event, detail) {
     for (const listener of listeners.get(event) ?? []) listener(detail);
@@ -114,7 +206,11 @@ export function createViewer(container, options = {}) {
     emit("visibility", { hidden: hidden.size, isolated: isolated ? isolated.size : null });
   }
 
-  /** Pack records of these express ids, in pack order. */
+  /**
+   * Pack records of these express ids, in pack order.
+   * @param {number | number[]} ids
+   * @returns {number[]}
+   */
   function recordsOf(ids) {
     if (!model) return [];
     const wanted = Array.isArray(ids) ? ids : [ids];
@@ -151,8 +247,15 @@ export function createViewer(container, options = {}) {
 
   // ------------------------------------------------------------ revisions
 
-  /** The editing session over the open model, created on first use and kept in the scene's frame. */
+  /**
+   * The editing session over the open model, created on first use and kept in the scene's frame.
+   * @returns {import("@tessifc/edit/session").Session}
+   */
   function session() {
+    if (model?.remote) {
+      model.session ??= createRemoteSession(model.remote, () => model);
+      return model.session;
+    }
     if (!model?.kernel || model.modelId === null || model.modelId === undefined) throw new Error("Open a model with the kernel first.");
     model.session ??= createEditingSession(model.kernel, model.modelId, { settings: model.settings ?? GEOMETRY_SETTINGS });
     // The assembler allocates geometry ids; the session works in the same pack space.
@@ -195,6 +298,8 @@ export function createViewer(container, options = {}) {
    * `applySnapshot`, `undo`, or a delta received from elsewhere): affected and
    * removed products are retired, the delta's instances added, unrelated GPU
    * batches kept, and selection and visibility restored by product identity.
+   * @param {Delta | (Partial<Delta> & { pack: import("@tessifc/edit/types").Pack })} delta
+   * @returns {RevisionReport}
    */
   function applyDelta(delta) {
     if (!model) throw new Error("Open a model first.");
@@ -256,6 +361,7 @@ export function createViewer(container, options = {}) {
    * at `target`, a base URL or `{ baseUrl }`; "" means the page's own origin.
    * Every published version is opened or applied as a delta and reported as a
    * `revision` event; `session` events carry the host's status. Returns the client.
+   * @param {string | { baseUrl?: string }} [target]
    */
   function follow(target = "") {
     unfollow();
@@ -263,10 +369,10 @@ export function createViewer(container, options = {}) {
     const client = createSessionClient({
       baseUrl: baseUrl.replace(/\/$/, ""),
       ready: () => !disposed && !streaming,
-      loaded: () => Boolean(model?.kernel),
+      loaded: () => Boolean(model?.kernel || model?.remote),
       open: (file) => open(file),
       update: async (file) => {
-        const delta = session().applySnapshot(new Uint8Array(await file.arrayBuffer()));
+        const delta = await session().applySnapshot(new Uint8Array(await file.arrayBuffer()));
         return applyDelta(delta);
       },
       report: (message) => emit("session", { error: message }),
@@ -356,8 +462,12 @@ export function createViewer(container, options = {}) {
    * hierarchy, or with `null` when another `open`, `loadPack`, `close` or
    * `dispose` superseded it before it finished. The kernel keeps the model
    * open for inspection until `close`.
+   * @param {Blob | ArrayBuffer | Uint8Array} source
+   * @param {OpenOptions} [openOptions]
+   * @returns {Promise<OpenResult | null>}
    */
   async function open(source, openOptions = {}) {
+    if (workerOptions && !openOptions.kernel) return openInWorker(source, openOptions);
     const kernel = openOptions.kernel ?? options.kernel;
     if (!kernel) throw new Error("open needs a kernel: pass one to createViewer or to open");
     let generation = ++loadGeneration;
@@ -375,7 +485,7 @@ export function createViewer(container, options = {}) {
         const diagnostics = JSON.parse(kernel.getDiagnostics(modelId) ?? "[]");
         throw new Error(diagnostics[0]?.message ?? "No IFC entities were found in this file.");
       }
-      const settings = JSON.stringify({ ...GEOMETRY_SETTINGS, ...openOptions.settings });
+      const settings = JSON.stringify(geometrySettings(openOptions.settings));
       const assembler = createPackAssembler();
       resetState();
       renderer.beginStream();
@@ -420,7 +530,7 @@ export function createViewer(container, options = {}) {
       // An empty scene stays open: a session or a delta adds the products.
       renderer.finishStream(pack, visibleIn(pack));
       const hierarchy = JSON.parse(kernel.getSpatialHierarchy?.(modelId) ?? '{"nodes":[]}');
-      adopt(pack, assembler, { modelId, kernel, info, summary, hierarchy, settings: { ...GEOMETRY_SETTINGS, ...openOptions.settings }, empty });
+      adopt(pack, assembler, { modelId, kernel, info, summary, hierarchy, settings: geometrySettings(openOptions.settings), empty });
       return { modelId, info, summary, hierarchy, empty };
     } catch (error) {
       if (modelId !== undefined) kernel.closeModel(modelId);
@@ -433,7 +543,82 @@ export function createViewer(container, options = {}) {
     }
   }
 
-  /** Show an IGP pack directly, for example one written by the `tessifc` CLI. No kernel needed. */
+  /** The client of worker mode, started on first use. */
+  function client() {
+    if (!kernelClient) {
+      kernelClient = createKernelClient({
+        url: workerOptions.url,
+        wasmUrl: workerOptions.wasmUrl,
+        editUrl: workerOptions.editUrl,
+        scriptTimeoutMs: workerOptions.scriptTimeoutMs,
+        onReopen: (detail) => {
+          if (!model?.remote) return;
+          model = { ...model, modelId: detail.modelId, hierarchy: detail.hierarchy ?? model.hierarchy, info: detail.info ?? model.info };
+          emit("reopen", { modelId: detail.modelId, revision: detail.revision });
+        },
+      });
+    }
+    return kernelClient;
+  }
+
+  /** `open` in worker mode: the worker parses and tessellates, the page only assembles and draws. */
+  async function openInWorker(source, openOptions) {
+    let generation = ++loadGeneration;
+    const superseded = () => disposed || generation !== loadGeneration;
+    const kernel = client();
+    await kernel.ready();
+    if (superseded()) return null;
+    close();
+    generation = loadGeneration;
+    streaming = true;
+    const settings = geometrySettings(openOptions.settings);
+    const assembler = createPackAssembler();
+    resetState();
+    renderer.beginStream();
+    let total = 0;
+    try {
+      const result = await kernel.open(source, {
+        settings,
+        onPhase: ({ progress }) => {
+          if (progress?.total) total = progress.total;
+        },
+        onChunk: ({ buffer, progress }) => {
+          if (superseded()) return;
+          const { from, to } = assembler.append(readIgp(buffer));
+          const pack = assembler.pack();
+          renderer.appendStream(pack, from, to, visibleIn(pack));
+          emit("progress", { done: progress?.done ?? to, total: progress?.total ?? total, triangles: progress?.triangles ?? 0 });
+          requestFrame();
+        },
+      });
+      if (superseded()) return null;
+      streaming = false;
+      const pack = assembler.pack();
+      const empty = !pack.instances.count || !pack.geometry.length;
+      if (empty && (openOptions.requireGeometry ?? options.requireGeometry)) {
+        renderer.clear();
+        kernel.close();
+        throw new Error("The IFC parsed correctly, but no supported product geometry was produced.");
+      }
+      renderer.finishStream(pack, visibleIn(pack));
+      adopt(pack, assembler, { modelId: result.modelId, kernel: null, remote: kernel, info: result.info, summary: result.summary,
+        hierarchy: result.hierarchy, settings, empty });
+      return { modelId: result.modelId, info: result.info, summary: result.summary, hierarchy: result.hierarchy, empty };
+    } catch (error) {
+      // A later open, a close or a dispose ended this one; the newer owner has the view.
+      if (superseded()) return null;
+      streaming = false;
+      renderer.clear();
+      model = null;
+      throw error;
+    }
+  }
+
+  /**
+   * Show an IGP pack directly, for example one written by the `tessifc` CLI. No kernel needed.
+   * @param {Uint8Array | ArrayBuffer} source
+   * @returns {{ pack: AssembledPack }}
+   */
   function loadPack(source) {
     close();
     const pack = readIgp(source instanceof Uint8Array ? source : new Uint8Array(source));
@@ -455,6 +640,7 @@ export function createViewer(container, options = {}) {
     const modelId = model?.modelId;
     model?.session?.close();
     model = null;
+    const wasStreaming = streaming;
     streaming = false;
     resetState();
     renderer.clear();
@@ -462,12 +648,20 @@ export function createViewer(container, options = {}) {
     overlayWorker?.terminate();
     overlayWorker = null;
     if (kernel && modelId !== null && modelId !== undefined) kernel.closeModel(modelId);
+    // The worker drops its model too; one still streaming is abandoned with its worker.
+    if (kernelClient && (modelId !== undefined || wasStreaming)) kernelClient.close();
     requestFrame(true);
     emit("close", null);
   }
 
   // -------------------------------------------------------------- selection
 
+  /**
+   * The product under a client point, or `null`.
+   * @param {number} clientX
+   * @param {number} clientY
+   * @returns {{ record: number, expressId: number, point: number[] | null } | null}
+   */
   function pick(clientX, clientY) {
     if (!model) return null;
     const hit = renderer.pick(clientX, clientY, true);
@@ -475,7 +669,10 @@ export function createViewer(container, options = {}) {
     return { record: hit.record, expressId: model.pack.instances.expressIds[hit.record], point: hit.point };
   }
 
-  /** Select one express id, several, or `null` to clear; every part of a product is selected together. */
+  /**
+   * Select one express id, several, or `null` to clear; every part of a product is selected together.
+   * @param {number | number[] | null | undefined} ids
+   */
   function select(ids) {
     if (!model) return;
     const list = ids === null || ids === undefined ? [] : Array.isArray(ids) ? ids : [ids];
@@ -529,6 +726,7 @@ export function createViewer(container, options = {}) {
 
   // ------------------------------------------------------------- visibility
 
+  /** @param {number | number[]} ids */
   function hide(ids) {
     for (const record of recordsOf(ids)) {
       hidden.add(record);
@@ -538,6 +736,7 @@ export function createViewer(container, options = {}) {
     refreshVisibility();
   }
 
+  /** @param {number | number[]} ids */
   function show(ids) {
     for (const record of recordsOf(ids)) {
       hidden.delete(record);
@@ -546,7 +745,10 @@ export function createViewer(container, options = {}) {
     refreshVisibility();
   }
 
-  /** Show only these products; `null` ends the isolation. */
+  /**
+   * Show only these products; `null` ends the isolation.
+   * @param {number | number[] | null | undefined} ids
+   */
   function isolate(ids) {
     isolated = ids === null || ids === undefined ? null : new Set(recordsOf(ids));
     refreshVisibility();
@@ -558,7 +760,10 @@ export function createViewer(container, options = {}) {
     refreshVisibility();
   }
 
-  /** Change which helper categories stay hidden by default, as instance flag bits. */
+  /**
+   * Change which helper categories stay hidden by default, as instance flag bits.
+   * @param {number} flags
+   */
   function setHiddenFlags(flags) {
     hiddenFlags = Number(flags) || 0;
     shown.clear();
@@ -572,7 +777,10 @@ export function createViewer(container, options = {}) {
     requestFrame(true);
   }
 
-  /** Frame these products, or the selection when called without ids. */
+  /**
+   * Frame these products, or the selection when called without ids.
+   * @param {number | number[]} [ids]
+   */
   function focus(ids) {
     const records = ids === undefined ? selection?.records ?? [] : recordsOf(ids);
     if (!records.length) return;
@@ -580,9 +788,44 @@ export function createViewer(container, options = {}) {
     requestFrame(true);
   }
 
+  /**
+   * @param {"perspective" | "top" | "front" | "right"} mode
+   * @param {boolean} [refit]
+   */
   function setView(mode, refit = true) {
     if (!VIEWS.includes(mode)) throw new RangeError(`unknown view ${mode}`);
     renderer.setView(mode, refit);
+    requestFrame(true);
+  }
+
+  /** @param {"shaded" | "xray" | "wire"} style */
+  /**
+   * Draw the pack's textures, or every product in its flat colour. Takes
+   * effect on the model in view at once; a model opened while this was off
+   * carries no textures until it is opened again.
+   * @param {boolean} active
+   */
+  function setTextures(active) {
+    textures = Boolean(active);
+    renderer.setTextures?.(textures);
+    requestFrame(true);
+  }
+
+  /**
+   * Leave product groups hidden behind the model's largest faces out of moving frames, or draw everything.
+   * @param {boolean} active
+   */
+  function setOcclusion(active) {
+    renderer.setOcclusionCulling?.(active !== false);
+    requestFrame(true);
+  }
+
+  /**
+   * Draw the pack's coarse mesh levels on moving frames, or the full meshes always.
+   * @param {boolean} active
+   */
+  function setMotionLod(active) {
+    renderer.setMotionLod?.(active !== false);
     requestFrame(true);
   }
 
@@ -596,6 +839,7 @@ export function createViewer(container, options = {}) {
    * Cut the model at `value` along `axis` (`"x"`, `"y"` or `"z"`), in IFC
    * coordinates. `fraction` between 0 and 1 places the cut across the model
    * bounds instead. `flipped` keeps the other side. `null` removes the cut.
+   * @param {SectionOptions | null} section
    */
   function setSection(section) {
     if (!model) return;
@@ -613,7 +857,11 @@ export function createViewer(container, options = {}) {
 
   // ------------------------------------------------------------------ events
 
-  /** Listen for `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`, `revision` or `session`; returns the unsubscribe function. */
+  /**
+   * Listen for `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`, `revision`, `session` or `reopen` (worker mode brought a model back after a stopped script); returns the unsubscribe function.
+   * @param {"load" | "progress" | "select" | "visibility" | "camera" | "overlay" | "close" | "revision" | "session" | "reopen"} event
+   * @param {(detail: any) => void} listener
+   */
   function on(event, listener) {
     const list = listeners.get(event) ?? [];
     list.push(listener);
@@ -639,6 +887,8 @@ export function createViewer(container, options = {}) {
     canvas.removeEventListener("dblclick", onDoubleClick);
     overlayWorker?.terminate();
     overlayWorker = null;
+    kernelClient?.dispose();
+    kernelClient = null;
     renderer.dispose();
     listeners.clear();
   }
@@ -659,8 +909,13 @@ export function createViewer(container, options = {}) {
     focus,
     setView,
     setStyle,
+    setTextures,
+    setOcclusion,
+    setMotionLod,
     setSection,
+    /** @param {number[]} point */
     setPivot: (point) => renderer.setPivot(point) && requestFrame(true),
+    /** @param {number} factor */
     zoom: (factor) => renderer.zoomAt(factor),
     render: () => requestFrame(true),
     resize: () => renderer.resize(),
@@ -671,15 +926,86 @@ export function createViewer(container, options = {}) {
     follow,
     unfollow,
     /** The assembled IGP pack of the open model, or `null`. */
-    pack: () => model?.pack ?? null,
+    pack: () => /** @type {AssembledPack | null} */ (model?.pack ?? null),
     /** The kernel's spatial hierarchy for the open model, or `null` for a pack. */
-    hierarchy: () => model?.hierarchy ?? null,
+    hierarchy: () => /** @type {{ nodes: Array<Record<string, any>> } | null} */ (model?.hierarchy ?? null),
     /** `pending`, `ready`, `exhausted`, `failed` or `off`: whether the overlay has been refined to shared planes. */
-    overlayState: () => model?.overlay ?? null,
-    modelId: () => model?.modelId ?? null,
+    overlayState: () => /** @type {"pending" | "ready" | "exhausted" | "failed" | "off" | null} */ (model?.overlay ?? null),
+    modelId: () => /** @type {number | null} */ (model?.modelId ?? null),
+    /** The coarse levels in the pack and on the GPU, and whether the last frame drew them. */
+    lodState: () => renderer.meshLevelState?.() ?? null,
+    /** Worker mode's kernel: whether its worker runs, the kernel version once it answered, and the script limit; `null` on the page-thread path. */
+    worker: () => (kernelClient ? { running: kernelClient.running, version: kernelClient.version, scriptTimeoutMs: kernelClient.scriptTimeoutMs } : workerOptions ? { running: false, version: null, scriptTimeoutMs: null } : null),
   });
 }
 
+/**
+ * The session of worker mode: the same calls as `createEditingSession`, each
+ * returning a promise, since the model lives in the worker. The scene basis a
+ * revision needs is read from the viewer's pack at each call.
+ * @param {import("./kernel-client.js").KernelClient} client
+ * @param {() => Record<string, any> | null} current the viewer's model
+ */
+function createRemoteSession(client, current) {
+  const id = () => {
+    const model = current();
+    if (!model?.remote) throw new Error("The model is no longer open.");
+    return model.modelId;
+  };
+  const patch = () => {
+    const model = current();
+    return {
+      baseRevision: client.model?.revision ?? "0",
+      modelOffset: model.pack.index.model_offset ?? [0, 0, 0],
+      firstGeometryId: model.assembler.nextGeometryId(),
+      selectedExpressId: null,
+    };
+  };
+  const deltaOf = (promise) => promise.then((result) => result.delta);
+  return {
+    /** True: every call below returns a promise. */
+    remote: true,
+    get modelId() {
+      return id();
+    },
+    get revision() {
+      return client.model?.revision ?? null;
+    },
+    get history() {
+      return client.model?.history ?? { undo: 0, redo: 0 };
+    },
+    settings: () => ({ ...(current()?.settings ?? {}) }),
+    /** The scene basis is read at each call; nothing to adopt. */
+    adopt() {},
+    /**
+     * @param {string} source
+     * @param {unknown} [selection]
+     * @param {{ commit?: boolean }} [runOptions]
+     * @returns {Promise<{ report: any, delta: any }>}
+     */
+    runScript: (source, selection = null, runOptions = {}) =>
+      client.runScript(id(), source, selection, { commit: runOptions.commit !== false, patch: patch() }),
+    /** @param {Array<Record<string, unknown>>} edits */
+    setAttributes: (edits) => deltaOf(client.setAttributes(id(), edits, patch())),
+    /** @param {Uint8Array | ArrayBuffer | string} bytes */
+    applySnapshot: (bytes) => deltaOf(client.applySnapshot(id(), typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes, patch())),
+    undo: () => deltaOf(client.undo(id(), patch())),
+    redo: () => deltaOf(client.redo(id(), patch())),
+    export: () => client.exportModel(id()),
+    /** @param {number} expressId */
+    entity: (expressId) => client.query(id(), "entity", expressId),
+    /** @param {string} className */
+    classDefinition: (className) => client.query(id(), "classDefinition", className),
+    info: () => client.query(id(), "info"),
+    /** @param {string} className */
+    idsOfType: (className) => client.query(id(), "idsOfType", className),
+    diagnostics: () => client.query(id(), "diagnostics"),
+    hierarchy: () => client.query(id(), "hierarchy"),
+    close() {},
+  };
+}
+
+/** @param {Blob | ArrayBuffer | Uint8Array} source */
 async function toBytes(source) {
   if (source instanceof Uint8Array) return source;
   if (source instanceof ArrayBuffer) return new Uint8Array(source);

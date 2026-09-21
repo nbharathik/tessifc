@@ -2,7 +2,7 @@
 # Getting started
 
 Start from the checkout for the v0.2 developer preview. Rust is pinned in
-`rust-toolchain.toml`; the helper scripts use Python 3.11 or newer. Node 20
+`rust-toolchain.toml`; the helper scripts use Python 3.10 or newer. Node 20
 or newer is needed for Node integrations and JavaScript tests.
 
 ## Build and open the viewer
@@ -16,8 +16,9 @@ python -m http.server 8000 --bind 127.0.0.1
 If `wasm-bindgen-cli` is missing or mismatched, the build script prints the
 exact installation command. It uses the version in `Cargo.lock`.
 
-Open <http://127.0.0.1:8000/viewer/> and choose an `.ifc` file. Scroll over a
-detail to zoom; **F** frames the model and **Shift F** frames the selection.
+Open <http://127.0.0.1:8000/viewer/> and choose an `.ifc` or `.ifczip` file.
+Scroll over a detail to zoom; **F** frames the model and **Shift F** frames the
+selection.
 The [viewer guide](../viewer/README.md) covers all tools and shortcuts.
 
 ## Browser API
@@ -110,9 +111,43 @@ To edit rather than only read, wrap the open model in a session from
 `bindings/edit` (`@tessifc/edit`): scripts, attribute edits, undo and a
 model built from nothing all come back as deltas that name the affected
 products. To let an agent do the editing while the viewer follows, start
-`node bindings/mcp/src/cli.js --new house.ifc` (after `npm ci --prefix
-bindings/mcp`) and register it with your MCP client; see
+`node bindings/mcp/src/cli.js --new house.ifc` (after `npm ci` at the
+repository root) and register it with your MCP client; see
 [Agents and pipelines](agents.md).
+
+## Python
+
+The kernel is also a native Python extension, built with maturin from
+`bindings/python`; the release workflow attaches wheels for Linux, macOS and
+Windows to each release. From a checkout:
+
+```sh
+pip install maturin
+cd bindings/python && maturin develop --release && cd ../..
+```
+
+```python
+import tessifc
+from tessifc import igp
+
+kernel = tessifc.Kernel()
+model = kernel.open_model(open("model.ifc", "rb").read())
+summary = kernel.evaluate_geometry(model, {"includeOpenings": False})
+outcomes = kernel.get_product_outcomes(model)      # read before take_pack
+pack = igp.read_igp(kernel.take_pack(model))       # zero-copy views over the IGP bytes
+for record in range(pack.instances.count):
+    mesh = pack.geometry_by_id(pack.instances.geometry_ids[record])
+    print(pack.class_of(record), pack.instances.express_ids[record], mesh.triangle_count)
+kernel.close_model(model)
+```
+
+Reports come back as dictionaries with the same shapes as the WebAssembly
+kernel's JSON, settings take the same fields, evaluation runs across every
+core and releases the interpreter lock, and `begin_geometry_stream` with
+`next_geometry_chunk` streams IGP chunks the way the viewer's worker does.
+`igp.to_numpy(view, columns)` turns a view into a NumPy array when NumPy is
+installed. Editing is not part of the wheel: the `tessifc-session` package
+in `adapters/ifcopenshell` is the Python editing path.
 
 ## Command line
 

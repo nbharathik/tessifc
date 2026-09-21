@@ -128,6 +128,7 @@ export function chatCompletions({ baseUrl, key = "", model, headers = {}, fetch:
   if (!model) throw new Error("chatCompletions needs a model");
   const url = `${trimSlash(baseUrl)}/chat/completions`;
   return async ({ system, tools, messages, signal = null }) => {
+    /** @type {Record<string, string>} */
     const request = { "content-type": "application/json", ...headers };
     if (key) request.authorization = `Bearer ${key}`;
     return decodeChatReply(await post(url, request, encodeChatRequest({ model, system, tools, messages, maxTokens }), { fetch: fetchImpl, signal }));

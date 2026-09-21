@@ -29,4 +29,10 @@ ISO 8859 page is approximated by Latin-1. Also `$` and `*`, typed values, nested
 lists, comments anywhere, CRLF, BOM, unknown class names, duplicate and
 out-of-range instance names, and truncation at any byte.
 
+`open` reads an IFCZIP archive as well as plain text: one stored or deflated
+`.ifc` entry, walked through the central directory without a zip crate,
+inflated within `ParseOptions::max_ifczip_bytes` and checked against its
+CRC-32. ZIP64, encryption and other methods are refused with a diagnostic.
+The `ifczip` feature, on by default, carries the inflate dependency.
+
 Licensed under Apache-2.0.

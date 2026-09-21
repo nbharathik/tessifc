@@ -34,7 +34,8 @@ const HELPER_FILTERS = [
 ];
 
 const SETTINGS_KEY = "tessifc.settings";
-const DEFAULT_SETTINGS = { scale: 1, hideSemantic: true, adaptive: false, lod: true, coincident: true };
+const DEFAULT_SETTINGS = { scale: 1, hideSemantic: true, adaptive: false, lod: true, coincident: true, occlusion: true, motionLod: true, textures: false, scriptTimeoutMs: 30_000 };
+const SCRIPT_TIMEOUTS_MS = [10_000, 30_000, 120_000, 0];
 
 /** Rendering settings from the last visit; a blocked or stale store falls back. */
 function loadSettings() {
@@ -47,6 +48,7 @@ function loadSettings() {
     }
     // The scale is a fraction of native resolution now; an older stored limit above it means native.
     settings.scale = Math.min(1, Math.max(0.25, settings.scale));
+    if (!SCRIPT_TIMEOUTS_MS.includes(settings.scriptTimeoutMs)) settings.scriptTimeoutMs = DEFAULT_SETTINGS.scriptTimeoutMs;
     return settings;
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -289,6 +291,11 @@ shell.on("canvasTheme", (theme) => {
 
 // -------------------------------------------------------------- settings
 
+/** Geometry settings the worker merges over its defaults: only what the panel turns on. */
+function geometrySettingOverrides() {
+  return state.settings.textures ? { textures: true } : {};
+}
+
 function saveSettings() {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
@@ -323,6 +330,29 @@ $("set-coincident").addEventListener("change", (event) => {
   renderer.setDepthTieBreak?.(event.target.checked);
   saveSettings();
   scheduleRender(true);
+});
+$("set-motion-lod").addEventListener("change", (event) => {
+  state.settings.motionLod = event.target.checked;
+  renderer.setMotionLod?.(event.target.checked);
+  saveSettings();
+  if (event.target.checked) requestMeshLevels();
+  scheduleRender(true);
+});
+$("set-occlusion").addEventListener("change", (event) => {
+  state.settings.occlusion = event.target.checked;
+  renderer.setOcclusionCulling?.(event.target.checked);
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-textures").addEventListener("change", (event) => {
+  state.settings.textures = event.target.checked;
+  renderer.setTextures?.(event.target.checked);
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-script-timeout").addEventListener("change", (event) => {
+  state.settings.scriptTimeoutMs = Number(event.target.value) || 0;
+  saveSettings();
 });
 // The assistant fields write straight through; the panel re-reads them on its next refresh.
 function syncAssistantFields() {
@@ -781,6 +811,8 @@ function startWorker() {
         return receiveExport(data);
       case "export-error":
         return shell.toast(data.message, "error");
+      case "script-finished":
+        return receiveScriptFinished(data);
       case "script-result":
         receiveScriptResult(data);
         break;
@@ -791,8 +823,14 @@ function startWorker() {
         return receiveRevision(data);
       case "revision-error":
         return receiveRevisionError(data);
+      case "reopened":
+        return receiveReopened(data);
+      case "reopen-error":
+        return receiveReopenError(data);
       case "contested-triangles":
         return receiveContestedTriangles(data);
+      case "mesh-levels":
+        return receiveMeshLevels(data);
       default:
         break;
     }
@@ -840,6 +878,10 @@ function workerReady(data) {
   setStatus("Kernel ready", "on");
   $("status-engine").textContent = `TessIFC ${data.version}`;
   if (!state.model) $("model-name").textContent = "No model open";
+  if (state.revisionPending?.reopen) {
+    sendReopen();
+    return;
+  }
   if (state.queuedFile) {
     const queued = state.queuedFile;
     state.queuedFile = null;
@@ -870,8 +912,8 @@ async function openFile(file, { detachSession = false } = {}) {
     shell.toast("Wait for the current IFC update to finish.", "info");
     return;
   }
-  if (!file.name.toLowerCase().endsWith(".ifc")) {
-    shell.toast("Choose an IFC-SPF file with the .ifc extension.", "error");
+  if (!/\.(ifc|ifczip)$/i.test(file.name)) {
+    shell.toast("Choose an IFC file with the .ifc or .ifczip extension.", "error");
     return;
   }
   if (!file.size) {
@@ -909,10 +951,11 @@ async function openFile(file, { detachSession = false } = {}) {
   try {
     const buffer = await file.arrayBuffer();
     if (jobId !== state.jobId) return;
-    state.pendingFile = { name: file.name, size: file.size };
+    // The handle stays so the model can be reopened after its worker was ended.
+    state.pendingFile = { name: file.name, size: file.size, handle: file };
     state.converting = true;
     state.loadOutcome = "loading";
-    state.worker.postMessage({ type: "convert", jobId, buffer }, [buffer]);
+    state.worker.postMessage({ type: "convert", jobId, buffer, settings: geometrySettingOverrides() }, [buffer]);
   } catch (error) {
     state.loadOutcome = "failed";
     finishLoading();
@@ -1001,6 +1044,67 @@ function receiveContestedTriangles(data) {
   model.overlayAnalysis = { requestId: data.requestId, state: "ready", triangles: data.triangles.length, pairs: data.pairs, elapsedMs: data.elapsedMs };
   inspector.setDisplayFacts(renderer);
   scheduleRender(true);
+  requestMeshLevels();
+}
+
+// Meshes with at least this many triangles get a coarse level for moving frames.
+const LOD_MIN_TRIANGLES = 1024;
+// Meshes per worker message, so the levels land while the worker stays answerable.
+const LOD_BATCH = 8;
+
+/**
+ * Ask the worker for coarse levels of the model's large meshes, a few meshes
+ * per message; they are added to the pack and the GPU as each reply lands.
+ */
+function requestMeshLevels() {
+  const model = state.model;
+  if (!model || !state.worker || !state.settings.motionLod || typeof renderer.applyLodLevels !== "function") return;
+  const { pack } = model;
+  const levelled = new Set(pack.geometry.filter((mesh) => mesh.lod).map((mesh) => mesh.lod.of));
+  const large = pack.geometry.filter((mesh) => !mesh.lod && !levelled.has(mesh.id) && mesh.indices.length >= LOD_MIN_TRIANGLES * 3);
+  if (!large.length) {
+    model.lodLevels = { state: "ready", requested: 0, received: 0, levels: 0, pending: 0 };
+    return;
+  }
+  const generation = (model.lodLevels?.generation ?? 0) + 1;
+  model.lodLevels = { state: "pending", generation, requested: large.length, received: 0, levels: 0, pending: 0, workerMs: 0, mainMs: 0 };
+  const chordToleranceM = model.settings?.chordToleranceM ?? 0.002;
+  for (let at = 0; at < large.length; at += LOD_BATCH) {
+    const geometries = large.slice(at, at + LOD_BATCH).map((mesh) => ({
+      id: mesh.id,
+      positions: Float32Array.from(mesh.positions),
+      indices: Uint32Array.from(mesh.indices),
+    }));
+    const transfer = geometries.flatMap((mesh) => [mesh.positions.buffer, mesh.indices.buffer]);
+    const requestId = ++state.requestId;
+    model.lodLevels.pending += 1;
+    state.worker.postMessage({ type: "mesh-levels", requestId, modelId: model.modelId, generation, geometries, chordToleranceM, levels: 1 }, transfer);
+  }
+}
+
+/** Coarse levels from the worker: into the assembler, then onto the GPU without re-uploading vertices. */
+function receiveMeshLevels(data) {
+  const model = state.model;
+  if (!model || data.modelId !== model.modelId || !model.lodLevels || model.lodLevels.state !== "pending") return;
+  const tracker = model.lodLevels;
+  const started = performance.now();
+  tracker.pending = Math.max(0, tracker.pending - 1);
+  tracker.workerMs += data.elapsedMs ?? 0;
+  if (data.error) {
+    tracker.error = data.error;
+  } else if (data.levels?.length && model.assembler) {
+    const ids = model.assembler.addLodLevels(data.levels);
+    if (ids.length) {
+      const pack = model.assembler.pack();
+      model.pack = pack;
+      renderer.applyLodLevels(pack, ids);
+      tracker.levels += ids.length;
+      scheduleRender(true);
+    }
+  }
+  tracker.received += data.levels?.length ?? 0;
+  tracker.mainMs += performance.now() - started;
+  if (tracker.pending === 0) tracker.state = tracker.error ? "failed" : "ready";
 }
 
 /** Merge one streamed IGP chunk and draw it; the first chunk clears the previous model. */
@@ -1254,6 +1358,14 @@ function disposeModel() {
   clearModelUi();
 }
 
+/** The chrome of an empty viewer: the dropzone and a blank model chip. */
+function showNoModel() {
+  state.pendingFile = null;
+  $("dropzone").classList.remove("hidden");
+  $("model-chip").classList.add("blank");
+  $("model-name").textContent = "No model open";
+}
+
 function closeModel() {
   if (state.revisionPending) {
     shell.toast("Wait for the current IFC update to finish.", "info");
@@ -1275,10 +1387,7 @@ function closeModel() {
   state.loadOutcome = "idle";
   state.queuedFile = null;
   state.replaceApproved = null;
-  state.pendingFile = null;
-  $("dropzone").classList.remove("hidden");
-  $("model-chip").classList.add("blank");
-  $("model-name").textContent = "No model open";
+  showNoModel();
   if (state.workerReady) setStatus("Kernel ready", "on");
   else setStatus("Restarting the kernel", "busy");
   scheduleRender(true);
@@ -1310,12 +1419,93 @@ function runBrowserScript(source, selection = null, { commit = true } = {}) {
     if (state.revisionPending || state.converting) return reject(new Error("Wait for the current update to finish."));
     if (state.model.stale) return reject(new Error("Reopen the model to restore synchronization."));
     const requestId = ++state.requestId;
-    state.revisionPending = { requestId, script: true, resolve, reject };
+    const timeoutMs = state.settings.scriptTimeoutMs;
+    // The worker that runs the script also holds the model: the limit ends both.
+    const timer = timeoutMs > 0 ? setTimeout(() => scriptTimedOut(requestId), timeoutMs) : null;
+    state.revisionPending = { requestId, script: true, resolve, reject, timer, timeoutMs };
     state.worker.postMessage({
       type: "run-script", requestId, modelId: state.model.modelId, source: String(source ?? ""), selection, commit,
       patch: revisionOptions(),
     });
   });
+}
+
+/** The script returned; what follows is the kernel's bounded work, so the limit no longer applies. */
+function receiveScriptFinished(data) {
+  const pending = state.revisionPending;
+  if (!pending || data.requestId !== pending.requestId) return;
+  clearTimeout(pending.timer);
+  pending.timer = null;
+}
+
+/** Stop a script at the limit: end the worker, fail the run and reopen the model without it. */
+function scriptTimedOut(requestId) {
+  const pending = state.revisionPending;
+  if (!pending?.script || pending.requestId !== requestId || !state.model) return;
+  state.worker?.terminate();
+  state.worker = null;
+  state.workerReady = false;
+  const limit = pending.timeoutMs >= 1000 ? `${pending.timeoutMs / 1000} s` : `${pending.timeoutMs} ms`;
+  const error = new Error(`ScriptTimeout: the script ran longer than ${limit} and was stopped. The model reopens at its last revision; the undo history is cleared.`);
+  error.timedOut = true;
+  finishRevision(error);
+  state.scriptHistory = { undo: 0, redo: 0 };
+  shell.toast(error.message, "error");
+  beginReopen();
+}
+
+/** Reopen the committed source in a fresh worker while the scene stays on screen. */
+function beginReopen() {
+  const requestId = ++state.requestId;
+  state.revisionPending = { requestId, reopen: true, resolve: () => {}, reject: () => {} };
+  setStatus("Script stopped; reopening the model", "busy");
+  sessionPanel.refresh();
+  startWorker();
+}
+
+async function sendReopen() {
+  const pending = state.revisionPending;
+  const model = state.model;
+  if (!pending?.reopen || !model) return;
+  try {
+    // The last revision's source, or the file itself when nothing was committed since it was opened.
+    const buffer = model.snapshot ? model.snapshot.slice(0) : await model.file?.handle?.arrayBuffer();
+    if (!buffer) throw new Error("its source is no longer available");
+    if (state.revisionPending !== pending || !state.worker) return;
+    state.worker.postMessage({ type: "reopen", requestId: pending.requestId, buffer, settings: geometrySettingOverrides() }, [buffer]);
+  } catch (error) {
+    receiveReopenError({ requestId: pending.requestId, message: errorText(error) });
+  }
+}
+
+function receiveReopened(data) {
+  const pending = state.revisionPending;
+  if (!pending?.reopen || data.requestId !== pending.requestId || !state.model) return;
+  state.model.modelId = data.modelId;
+  state.model.revision = data.revision ?? "0";
+  state.model.info = data.info ?? state.model.info;
+  state.model.facts = data.facts ?? state.model.facts;
+  state.model.hierarchy = data.hierarchy ?? state.model.hierarchy;
+  state.model.stale = false;
+  finishRevision(null);
+  if (state.selection) {
+    // The attributes stay on screen while the fresh worker reads them again.
+    state.selection.modelId = data.modelId;
+    selectExpressId(state.selection.expressId, true);
+  }
+  setStatus(`Model reopened at revision ${state.model.revision}; undo history cleared`, "on");
+  sessionPanel.refresh();
+}
+
+function receiveReopenError(data) {
+  const pending = state.revisionPending;
+  if (!pending?.reopen || data.requestId !== pending.requestId) return;
+  finishRevision(new Error(data.message));
+  disposeModel();
+  showNoModel();
+  state.loadOutcome = "failed";
+  setStatus("The model could not be reopened", "err");
+  state.dismissLoadError = shell.toast(`The model could not be reopened after the script was stopped: ${data.message} Open the file again.`, "error", 0);
 }
 
 function browserHistoryAction(action) {
@@ -1454,6 +1644,7 @@ function detachFileSession() {
 function finishRevision(error = null, result = null) {
   const pending = state.revisionPending;
   state.revisionPending = null;
+  if (pending?.timer) clearTimeout(pending.timer);
   if (error) pending?.reject?.(error);
   else pending?.resolve?.(result);
 }
@@ -1546,7 +1737,7 @@ function receiveRevision(data) {
     const summary = { ...model.summary, products: index.recordsByExpressId.size,
       triangles: index.triangles.reduce((sum, value) => sum + value, 0) };
     state.model = { ...model, assembler, pack, index, revision: data.revision, info: data.info, facts: data.facts ?? model.facts ?? null,
-      hierarchy: data.hierarchy, summary, stale: false, file: pending.file ?? model.file };
+      hierarchy: data.hierarchy, summary, stale: false, file: pending.file ?? model.file, snapshot: data.snapshot ?? model.snapshot ?? null };
     let rendered = {};
     if (result.changed) {
       rendered = impact.fullRebuild ? renderer.reload(pack, isRecordVisible) : renderer.applyDelta(pack, result, isRecordVisible);
@@ -1596,6 +1787,7 @@ function receiveRevision(data) {
   } catch (error) {
     state.model.revision = data.revision;
     state.model.stale = true;
+    state.model.snapshot = data.snapshot ?? state.model.snapshot ?? null;
     state.dirty = data.attributeEdit || Boolean(data.script);
     setDirty(state.dirty);
     setStatus("IFC updated; the view needs reopening", "err");
@@ -1638,7 +1830,8 @@ function requestExport() {
 function receiveExport(data) {
   if (!state.model || data.requestId !== state.model.exportRequestId) return;
   const original = state.pendingFile?.name ?? "model.ifc";
-  const stem = original.replace(/\.ifc$/i, "");
+  // An archive is exported as the plain IFC it held.
+  const stem = original.replace(/\.(ifc|ifczip)$/i, "");
   const name = state.dirty ? `${stem}.edited.ifc` : `${stem}.copy.ifc`;
   const url = URL.createObjectURL(new Blob([data.buffer], { type: "application/octet-stream" }));
   const link = document.createElement("a");
@@ -1698,6 +1891,13 @@ renderer.setLodPixels?.(state.settings.lod ? LOD_PIXELS : 0);
 $("set-lod").checked = state.settings.lod;
 renderer.setDepthTieBreak?.(state.settings.coincident);
 $("set-coincident").checked = state.settings.coincident;
+renderer.setOcclusionCulling?.(state.settings.occlusion);
+$("set-occlusion").checked = state.settings.occlusion;
+renderer.setMotionLod?.(state.settings.motionLod);
+$("set-motion-lod").checked = state.settings.motionLod;
+renderer.setTextures?.(state.settings.textures);
+$("set-textures").checked = state.settings.textures;
+$("set-script-timeout").value = String(state.settings.scriptTimeoutMs);
 tools.reset(false);
 tree.clear();
 enableModelCommands(false);

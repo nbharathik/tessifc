@@ -8,7 +8,9 @@ optional assistant answers questions about the model and proposes edit scripts.
 
 The kernel stays a geometry engine: this package is an optional integration
 that talks to the viewer over a loopback HTTP protocol. IfcOpenShell and the
-assistant SDK are installed separately by you.
+assistant SDK are installed separately by you. For reading and tessellating
+from Python without IfcOpenShell, the `tessifc` wheel in `bindings/python`
+is the kernel itself.
 
 ```sh
 pip install -e "adapters/ifcopenshell[authoring,assistant,mcp]"

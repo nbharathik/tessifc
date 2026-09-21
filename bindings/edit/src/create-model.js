@@ -14,9 +14,25 @@ const SCHEMAS = {
 const real = (value) => formatValue(Number(value));
 
 /**
+ * @typedef {object} ModelOptions
+ * @property {"IFC2X3" | "IFC4" | "IFC4X3" | string} [schema]
+ * @property {string} [name]
+ * @property {"m" | "mm" | string} [units]
+ * @property {string} [site]
+ * @property {string} [building]
+ * @property {Array<{ name: string, elevation: number }>} [storeys]
+ * @property {string} [author]
+ * @property {string} [organisation]
+ * @property {string} [producer]
+ * @property {string | null} [timestamp]
+ * @property {() => string} [guid]
+ */
+
+/**
  * The text of a new IFC file. Lengths in `units` ("m" or "mm"); every storey
  * is `{ name, elevation }`. `guid` and `timestamp` are injectable so tests
  * get deterministic output.
+ * @param {ModelOptions} [options]
  */
 export function createModelText({
   schema = "IFC4",
@@ -95,7 +111,10 @@ export function createModelText({
   return `${header.join("\n")}\n${lines.join("\n")}\nENDSEC;\nEND-ISO-10303-21;\n`;
 }
 
-/** The bytes of a new IFC file; see `createModelText` for the options. */
+/**
+ * The bytes of a new IFC file; see `createModelText` for the options.
+ * @param {ModelOptions} [options]
+ */
 export function createModel(options = {}) {
   return new TextEncoder().encode(createModelText(options));
 }

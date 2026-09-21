@@ -403,7 +403,7 @@
               <div class="dz-actions">
                 <button class="btn primary lg" id="dz-open" type="button">Open IFC file</button>
               </div>
-              <p class="dz-hint">or drop an .ifc file anywhere · IFC2X3, IFC4 and IFC4X3</p>
+              <p class="dz-hint">or drop an .ifc or .ifczip file anywhere · IFC2X3, IFC4 and IFC4X3</p>
               <div class="dz-caps" aria-label="What this viewer does">
                 <span>Orbit</span><span>Select</span><span>Inspect</span><span>Measure</span><span>Section</span><span>Edit</span>
               </div>
@@ -721,9 +721,32 @@
           <span class="field-label">Resolve coincident surfaces<span class="hint">Stops touching faces flickering against each other by redrawing only the faces that share a plane. Turning it off draws large models slightly faster.</span></span>
         </label>
         <label class="field check">
+          <input type="checkbox" id="set-motion-lod" checked />
+          <span class="field-label">Coarser meshes while moving<span class="hint">Large meshes are simplified after the model loads and the simpler version is drawn while you move the view; the frame at rest shows the full detail.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-occlusion" checked />
+          <span class="field-label">Skip hidden geometry while moving<span class="hint">While you orbit from inside a model, groups of products entirely behind its largest walls and slabs are left out of the frame; the frame at rest always draws everything.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-textures" />
+          <span class="field-label">Show textures<span class="hint">Reads the file's surface textures and paints them on products that carry texture coordinates. Applies to files opened after it is switched on; images referenced by path load only from this page's own origin.</span></span>
+        </label>
+        <label class="field check">
           <input type="checkbox" id="set-hidden" checked />
           <span class="field-label">Start with model helpers hidden<span class="hint">Spaces, openings, guides and reference geometry stay out of the first view.</span></span>
         </label>
+
+        <div class="group-title">Scripts</div>
+        <div class="field">
+          <span class="field-label">Stop a browser script after<span class="hint">A script still running at the limit is stopped with its kernel worker; the model reopens at its last revision and the undo history is cleared.</span></span>
+          <select id="set-script-timeout">
+            <option value="10000">10 seconds</option>
+            <option value="30000" selected>30 seconds</option>
+            <option value="120000">2 minutes</option>
+            <option value="0">Never</option>
+          </select>
+        </div>
 
         <div class="group-title">Interface</div>
         <div class="field">
@@ -844,7 +867,7 @@
       </div>
     </div>
 
-    <input id="file-input" type="file" accept=".ifc" hidden />
+    <input id="file-input" type="file" accept=".ifc,.ifczip" hidden />
     <input id="revision-input" type="file" accept=".ifc" hidden />
 
     <script type="module" src="./src/main.js"></script>

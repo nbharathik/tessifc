@@ -61,6 +61,10 @@ impl DiagCode {
     pub const NESTING_TOO_DEEP: DiagCode = DiagCode("E_NESTING_TOO_DEEP");
     /// No `DATA` section was found.
     pub const NO_DATA_SECTION: DiagCode = DiagCode("E_NO_DATA_SECTION");
+    /// An IFCZIP archive this reader cannot walk; nothing was read.
+    pub const IFCZIP_MALFORMED: DiagCode = DiagCode("E_IFCZIP_MALFORMED");
+    /// An IFCZIP entry larger than the configured limit; nothing was read.
+    pub const IFCZIP_TOO_LARGE: DiagCode = DiagCode("E_IFCZIP_TOO_LARGE");
 
     /// The same express id was defined more than once; the first won.
     pub const DUPLICATE_ID: DiagCode = DiagCode("W_DUPLICATE_ENTITY_ID");
@@ -80,6 +84,8 @@ impl DiagCode {
     pub const NUMBER_OUT_OF_RANGE: DiagCode = DiagCode("W_NUMBER_OUT_OF_RANGE");
     /// A complex instance was read; its leaves are all kept.
     pub const COMPLEX_INSTANCE: DiagCode = DiagCode("I_COMPLEX_INSTANCE");
+    /// An IFCZIP archive holds several `.ifc` entries; only the first was read.
+    pub const IFCZIP_MULTIPLE_ENTRIES: DiagCode = DiagCode("W_IFCZIP_MULTIPLE_ENTRIES");
 
     /// The code text, for serialisation.
     pub const fn as_str(self) -> &'static str {

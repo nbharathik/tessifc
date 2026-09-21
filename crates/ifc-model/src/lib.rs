@@ -3,8 +3,6 @@
 //! and the inverse relationships IFC does not store directly. Nothing here
 //! allocates per access except string decoding.
 //!
-//! # Example
-//!
 //! ```no_run
 //! use tessifc_model::Model;
 //! use tessifc_step::{ParseOptions, parse};
@@ -18,21 +16,6 @@
 //!     println!("#{} {name}: {openings} openings", wall.id());
 //! }
 //! # Ok::<(), std::io::Error>(())
-//! ```
-//!
-//! # Attribute access and hot loops
-//!
-//! [`Entity::attr`] resolves the name every call; in loops resolve the index
-//! once with [`Model::attr_index`] and use [`Entity::attr_at`]:
-//!
-//! ```no_run
-//! # use tessifc_model::Model;
-//! # let model: Model = unimplemented!();
-//! let point_class = model.schema().class_by_name("IfcCartesianPoint").unwrap();
-//! let coordinates = model.attr_index(point_class, "Coordinates").unwrap();
-//! for point in model.entities_of_class(point_class) {
-//!     let xyz = point.attr_at(coordinates).as_floats::<3>();
-//! }
 //! ```
 
 #![deny(unsafe_code)]
@@ -313,8 +296,8 @@ impl<'a> Entity<'a> {
         out
     }
 
-    /// The value of an attribute by name; resolves the name every call, so not for hot loops.
-    /// For a complex instance every leaf is searched.
+    /// The value of an attribute by name; for a complex instance every leaf is searched.
+    /// The name is resolved every call: in loops use [`Model::attr_index`] and [`Entity::attr_at`].
     pub fn attr(&self, name: &str) -> Value<'a> {
         if self.is_complex() {
             return self.complex_attr(name);

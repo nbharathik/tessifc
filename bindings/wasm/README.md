@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # @tessifc/core
 
-**v0.1 developer preview.** The TessIFC IFC geometry kernel as WebAssembly,
+**v0.2 developer preview.** The TessIFC IFC geometry kernel as WebAssembly,
 with browser and Node builds and generated TypeScript declarations.
 IFC-SPF in, render-ready meshes out. Apache-2.0.
 
@@ -64,7 +64,11 @@ Use a worker and terminate it for cancellation or a host-enforced deadline.
 Recoverable parse and geometry problems are diagnostics. Invalid settings
 can throw, and host resource failures can trap. Inspect product outcomes,
 warnings and errors before accepting output. Reading IFC2X3, IFC4 and IFC4X3
-schemas does not imply support for every representation.
+schemas does not imply support for every representation. `openModel` takes
+plain IFC or an IFCZIP archive; whole-model triangle, vertex and time
+budgets are opt-in settings that stop a run between products and say so.
+The `lodLevels` setting adds coarse levels of large meshes to the pack, and
+the module-level `simplifyMesh` computes one for a mesh a host already holds.
 
 The [SDK guide](https://github.com/nbharathik/tessifc/blob/main/docs/sdk.md)
 documents settings, streaming, editing, memory and workers.
@@ -95,3 +99,19 @@ schema:
 ```sh
 python scripts/build-wasm.py --target both --no-default-features --features tessifc-wasm/schema-ifc4
 ```
+
+The `edit` feature (on by default) carries attribute edits, revisions and
+patches: `setAttribute`, `exportModel`, `getModelRevision`,
+`prepareRevision`, `prepareAttributeEdits`, `evaluatePreparedRevision`,
+`commitRevision`, `discardRevision` and `evaluateProducts`. A viewer that
+only reads and draws can leave it out, together with `ifczip`; the methods
+are then absent and `createEditingSession` from `@tessifc/edit` says so:
+
+```sh
+python scripts/build-wasm.py --target both --no-default-features --features schema-ifc2x3,schema-ifc4,schema-ifc4x3
+```
+
+`--sections` prints what the module's bytes are spent on, `--keep-names`
+keeps symbol names for a profiler such as twiggy, and `--budget-bytes` and
+`--budget-raw-bytes` fail the build over a gzipped or raw size. Shipped
+modules carry no name or producers section.

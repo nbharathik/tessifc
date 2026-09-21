@@ -68,19 +68,31 @@ pub(crate) fn edge_run(
     )
     .with_registry(ctx.registry());
     let line = ctx.registry().curve(&parameters, reference)?;
+    // A swept surface's u or v is the swept curve's own parameter, read through
+    // the parameters recorded at its outline points.
+    let unknown_swept = || {
+        GeomError::Unsupported(
+            "pcurve on a swept surface whose curve parameterisation is not recorded".into(),
+        )
+    };
     let convert = |point: DVec3| -> Result<DVec2, GeomError> {
         let at = point.truncate();
-        Ok(match surface.kind {
+        Ok(match &surface.kind {
             SurfaceKind::BSpline(_) => at,
             SurfaceKind::Plane => at * ctx.units.length_to_m,
             SurfaceKind::Cylinder { .. } => {
                 DVec2::new(ctx.units.angle(at.x), ctx.units.length(at.y))
             }
             SurfaceKind::Sphere { .. } | SurfaceKind::Torus { .. } => at * ctx.units.angle_to_rad,
-            _ => {
-                return Err(GeomError::Unsupported(
-                    "pcurve on a swept surface parameterisation".into(),
-                ));
+            SurfaceKind::Extrusion { depth, knots, .. } => {
+                let u = crate::registry::outline_parameter_at_knot(knots, at.x)
+                    .ok_or_else(unknown_swept)?;
+                DVec2::new(u, at.y * depth)
+            }
+            SurfaceKind::Revolution { knots, .. } => {
+                let v = crate::registry::outline_parameter_at_knot(knots, at.y)
+                    .ok_or_else(unknown_swept)?;
+                DVec2::new(ctx.units.angle(at.x), v)
             }
         })
     };

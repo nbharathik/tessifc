@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "tessifc-python"
+description = "Python bindings for TessIFC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+# Built into a wheel by maturin, never published to crates.io.
+publish = false
+
+[lib]
+name = "tessifc_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+tessifc-step = { workspace = true }
+tessifc-model = { workspace = true }
+tessifc-geom = { workspace = true }
+tessifc-engine = { workspace = true, features = ["parallel"] }
+tessifc-pack = { workspace = true }
+serde_json = { workspace = true }
+pyo3 = { version = "0.29", features = ["abi3-py310"] }   # MIT OR Apache-2.0
+
+# `extension-module` is what a wheel needs and what `cargo test` must not
+# have, since a test binary links the interpreter; maturin turns it on.
+[features]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3", "ifczip"]
+extension-module = ["pyo3/extension-module"]
+ifczip = ["tessifc-step/ifczip"]
+schema-ifc2x3 = ["tessifc-step/schema-ifc2x3", "tessifc-model/schema-ifc2x3", "tessifc-geom/schema-ifc2x3", "tessifc-engine/schema-ifc2x3"]
+schema-ifc4 = ["tessifc-step/schema-ifc4", "tessifc-model/schema-ifc4", "tessifc-geom/schema-ifc4", "tessifc-engine/schema-ifc4"]
+schema-ifc4x3 = ["tessifc-step/schema-ifc4x3", "tessifc-model/schema-ifc4x3", "tessifc-geom/schema-ifc4x3", "tessifc-engine/schema-ifc4x3"]

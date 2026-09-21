@@ -38,6 +38,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # clippy builds the Python binding's build script, which asks the interpreter how to link.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: cargo fmt
         run: cargo fmt --all --check
 
@@ -52,6 +57,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # The Python binding's test binary links the interpreter, so a
+      # workspace test needs one; the wheel itself is built by wheels.yml.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: cargo test
         run: cargo test --locked --workspace
 
@@ -61,7 +72,7 @@ jobs:
       - name: cargo test (single schema)
         run: >
           cargo test --locked --workspace --no-default-features
-          --features tessifc-step/schema-ifc4,tessifc-model/schema-ifc4,tessifc-wasm/schema-ifc4,tessifc-cli/schema-ifc4
+          --features tessifc-step/schema-ifc4,tessifc-model/schema-ifc4,tessifc-wasm/schema-ifc4,tessifc-cli/schema-ifc4,tessifc-python/schema-ifc4
 
   wasm:
     name: wasm32 build
@@ -88,6 +99,14 @@ jobs:
       - name: install the website dependencies
         run: python -m pip install -r requirements-site.txt
 
+      # IfcOpenShell is an optional authoring runtime, installed here only so
+      # the editing session tests can run scripts against a model. The MCP
+      # package is the optional agent transport of the Python session.
+      - name: install the optional authoring runtime
+        run: |
+          python -m pip install "mcp>=1.12,<2"
+          python -m pip install ifcopenshell || echo "IfcOpenShell is unavailable here; the adapter tests that need it will skip"
+
       - name: add the wasm target
         run: rustup target add wasm32-unknown-unknown
 
@@ -110,6 +129,18 @@ jobs:
       - name: build the packages
         run: python scripts/build-wasm.py --target both
 
+      # One workspace install links the packages to each other, so the bare
+      # specifiers between them resolve the way they do from a tarball.
+      - name: install the npm workspace
+        run: npm ci
+
+      # The declarations are generated from the JSDoc and the kernel's own
+      # declarations, so they follow the wasm build.
+      - name: generate and check the TypeScript declarations
+        run: |
+          npm run types
+          npm run typecheck
+
       # The Node suites run on IFC fragments embedded in the tests, so they
       # assert on a plain checkout. A whole model is an optional extra.
       - name: run the Node smoke test
@@ -118,27 +149,47 @@ jobs:
       - name: run the viewer and edit round-trip tests
         run: node viewer/test/igp.test.mjs
 
+      - name: run the editing SDK tests
+        run: npm --prefix bindings/edit test
+
+      - name: test the MCP server package
+        run: npm --prefix bindings/mcp test
+
+      - name: build the demo house deterministically
+        run: node examples/agent-building/build-house.test.mjs
+
       # The three.js adapter runs against the same package. Its batching is
       # what a viewer actually draws, so a break there is a break in the
       # product even though no Rust changed.
       - name: run the three.js adapter tests
-        run: node adapters/three/test/build.test.mjs
-
-      - name: install browser test tools
-        working-directory: viewer
         run: |
-          npm ci
-          npx playwright install --with-deps chromium
+          node adapters/three/test/build.test.mjs
+          node adapters/three/test/retained.test.mjs
+
+      - name: install the browser for the pixel tests
+        run: npx playwright install --with-deps chromium
 
       - name: run navigation and browser pixel tests
         run: npm --prefix viewer test
+
+      # The package test needs the browser the viewer suite installed.
+      - name: run the embedded viewer package test
+        run: npm --prefix bindings/viewer test
 
       - name: test and build the static website
         run: |
           python -m unittest discover -s scripts -p 'test_*.py'
           python scripts/build-site.py
 
+      - name: test the editing session package
+        run: python -m unittest discover -s adapters/ifcopenshell/tests -p 'test_*.py'
+
       - name: inspect the npm packages
+        run: npm run pack:all -- --dry-run
+
+      # A read-only build without the edit and ifczip features, last because
+      # it replaces the Node package the steps above tested.
+      - name: build and smoke-test the slim kernel
         run: |
-          npm pack ./bindings/wasm --dry-run
-          npm pack ./adapters/three --dry-run
+          python scripts/build-wasm.py --target nodejs --no-default-features --features schema-ifc2x3,schema-ifc4,schema-ifc4x3
+          TESSIFC_SLIM=1 node bindings/wasm/test/smoke.mjs

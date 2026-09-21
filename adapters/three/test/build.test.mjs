@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-/**
- * Tests for the batching: draw-call grouping, express-id recovery, index types
- * and transparent shapes. Not rendering.
- *
- * The first half drives buildBatches from a stub kernel, so the batch limits
- * and the wide-index path are exercised without a model. The second half runs
- * the real kernel over an embedded IFC fragment, or over TESSIFC_TEST_MODEL
- * when one is given.
- */
+// The batching, not rendering: a stub kernel reaches the batch limits and the
+// wide-index path, then the real kernel runs over an embedded IFC fragment.
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";

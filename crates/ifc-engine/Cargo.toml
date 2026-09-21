@@ -21,15 +21,15 @@ tessifc-geom = { workspace = true }
 tessifc-mesh = { workspace = true }
 tessifc-pack = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 glam = { workspace = true }
 rayon = { workspace = true, optional = true }
 
-[dev-dependencies]
-serde_json = { workspace = true }
-
 # Schema selection forwards down the whole dependency chain.
 [features]
-default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3", "revision"]
+# Compare two revisions of a model and find the products a change touches.
+revision = []
 # Evaluate products across a rayon pool. Native only: the wasm build stays
 # single-threaded and streams through `Engine::session` instead.
 parallel = ["dep:rayon"]

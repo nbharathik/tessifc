@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc-cli
 
-Version 0.1 is a developer preview. Review the [coverage](../../docs/coverage.md)
+Version 0.2 is a developer preview. Review the [coverage](../../docs/coverage.md)
 and [preview contract](../../docs/preview.md) before accepting conversion output.
 
 The `tessifc` command line tool. Build locally with
@@ -32,11 +32,16 @@ tessifc convert model.ifc -o model.igp --jobs 1  # serial, identical output
 tessifc convert model.ifc --json --diagnostics   # measure without writing
 tessifc convert model.ifc -o model.igp --no-spaces --openings --circle-segments 16
 tessifc convert model.ifc -o model.igp --annotations --references
+tessifc convert model.ifczip -o model.igp        # an archive is inflated first
+tessifc convert model.ifc --settings '{"maxTotalTriangles":2000000}'
 ```
 
 `convert` evaluates products across every core by default. The pack is
 byte-identical whatever `--jobs` says, apart from the timing statistics in
-its index. Family geometry placed many times is written once, with one
+its index. A whole-model budget (`maxTotalTriangles`, `maxTotalVertices`,
+`maxGeometryMs` in `--settings`) stops the run between products; the report
+then says what stopped it and how many products were skipped, and `--strict`
+refuses the output. Family geometry placed many times is written once, with one
 transform per placement; the report says how many records that covered.
 The output is IGP v0, specified in `docs/igp-format.md`.
 Openings, annotations and non-physical references are independent opt-in

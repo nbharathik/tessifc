@@ -11,7 +11,7 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%230f1115'/><polygon points='32,6 56,19 32,32 8,19' fill='%2393b9fb'/><polygon points='8,19 32,32 32,58 8,45' fill='%233b82f6'/><polygon points='56,19 56,45 32,58 32,32' fill='%231e5bd0'/></svg>" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://openrouter.ai https://api.anthropic.com http://127.0.0.1:* http://localhost:*; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'"
     />
     <script src="./src/boot.js"></script>
     <link rel="stylesheet" href="./src/styles.css" />
@@ -33,7 +33,6 @@
           <button class="rib-tab active" type="button" role="tab" aria-selected="true" aria-controls="rib-home" data-tab="home">Home</button>
           <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-view" tabindex="-1" data-tab="view">View</button>
           <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-analyze" tabindex="-1" data-tab="analyze">Analyze</button>
-          <button class="rib-tab" type="button" role="tab" aria-selected="false" aria-controls="rib-review" tabindex="-1" data-tab="review">Review</button>
         </nav>
 
         <button class="rib-toggle" id="ribbon-toggle" type="button" aria-expanded="true" title="Collapse the ribbon (Ctrl F1)">
@@ -49,6 +48,9 @@
             <span class="name" id="model-name">Starting the geometry kernel</span>
             <span class="tag hidden" id="model-schema"></span>
           </span>
+          <button class="icon-btn save-chip hidden" id="save-revision" type="button" title="Unsaved IFC edits: download the IFC (Ctrl S)" aria-label="Download the edited IFC">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5" /><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2" /></svg>
+          </button>
           <span class="bar-sep" aria-hidden="true"></span>
           <span class="local-badge" title="Files are read in this browser and are never uploaded">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></svg>
@@ -80,6 +82,10 @@
               <button class="rib-btn lg" id="cmd-export" type="button" disabled title="Download the IFC source (Ctrl S)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h12l2 2v14H5z" /><path d="M8 4v6h8V4M8 16h8" /></svg>
                 <span class="rib-label">Export IFC</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-update" type="button" disabled title="Apply an edited version of this IFC and refresh affected objects">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1" /></svg>
+                <span class="rib-label">Update IFC</span>
               </button>
               <button class="rib-btn lg" id="cmd-close" type="button" disabled title="Close the model and release its memory">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
@@ -113,6 +119,10 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5m13 5h5v-5" /></svg>
                 <span class="rib-label">Fit model</span>
               </button>
+              <button class="rib-btn lg" id="cmd-focus" type="button" disabled title="Frame the selection (Shift F)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 3v3m0 12v3M3 12h3m12 0h3" /></svg>
+                <span class="rib-label">Focus</span>
+              </button>
               <button class="rib-btn lg" id="cmd-plan" type="button" disabled aria-pressed="false" title="Sectioned plan view, press again for 3D (P)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="14" /><path d="M9 5v5h6v9" /></svg>
                 <span class="rib-label">Plan</span>
@@ -123,68 +133,30 @@
           <span class="rib-sep" aria-hidden="true"></span>
           <div class="rib-group">
             <div class="rib-items">
-              <button class="rib-btn lg" id="cmd-style" type="button" disabled title="Cycle the display style (D)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4z" /><path d="M4 12l8 4 8-4M4 17l8 4 8-4" /></svg>
-                <span class="rib-label" id="style-label">Shaded</span>
-              </button>
-              <button class="rib-btn lg" id="cmd-theme" type="button" title="Interface theme: system, light or dark">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" /></svg>
-                <span class="rib-label" id="theme-label">System</span>
-              </button>
-            </div>
-            <span class="rib-glabel">Display</span>
-          </div>
-          <span class="rib-sep" aria-hidden="true"></span>
-          <div class="rib-group">
-            <div class="rib-items">
-              <button class="rib-btn lg" id="cmd-spaces" type="button" disabled aria-pressed="false" title="Show space and zone volumes">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 7-4 7 4-7 4z" /><path d="m5 8v8l7 4 7-4V8M12 12v8" /></svg>
-                <span class="rib-label">Show spaces</span>
-              </button>
-              <button class="rib-btn lg" id="cmd-openings" type="button" disabled aria-pressed="false" title="Show opening and void volumes">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="18" /><path d="M8 21V7h8v14M13 14h.01" /></svg>
-                <span class="rib-label">Show openings</span>
-              </button>
-              <button class="rib-btn lg" id="cmd-references" type="button" disabled aria-pressed="false" title="Show grids, annotations and reference geometry">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16M7 4v16M12 4v16M17 4v16" /></svg>
-                <span class="rib-label">Show guides</span>
-              </button>
-            </div>
-            <span class="rib-glabel">Model helpers</span>
-          </div>
-          <span class="rib-sep" aria-hidden="true"></span>
-          <div class="rib-group">
-            <div class="rib-items">
               <div class="rib-stack">
                 <button class="rib-btn sm" id="cmd-isolate" type="button" disabled title="Isolate the selection (I)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12" /></svg>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12" /></svg>
                   <span class="rib-label">Isolate</span>
                 </button>
                 <button class="rib-btn sm" id="cmd-hide" type="button" disabled title="Hide the selection (H)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l16 16" /><path d="M9.9 5.8A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3.3 4M6.6 7.9A16 16 0 0 0 2.5 12S6 18.5 12 18.5a9 9 0 0 0 3.2-.6" /></svg>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l16 16" /><path d="M9.9 5.8A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-3.3 4M6.6 7.9A16 16 0 0 0 2.5 12S6 18.5 12 18.5a9 9 0 0 0 3.2-.6" /></svg>
                   <span class="rib-label">Hide</span>
                 </button>
               </div>
               <div class="rib-stack">
                 <button class="rib-btn sm" id="cmd-show-all" type="button" disabled title="Show every element again (A)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 12h16M12 4v16" /></svg>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12" /><circle cx="12" cy="12" r="3" /><path d="M17 3.5l2 2 3-3" /></svg>
                   <span class="rib-label">Show all</span>
                 </button>
                 <button class="rib-btn sm" id="cmd-clear" type="button" disabled title="Clear the selection (Esc)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
                   <span class="rib-label">Deselect</span>
                 </button>
               </div>
-              <div class="rib-stack">
-                <button class="rib-btn sm" id="cmd-focus" type="button" disabled title="Frame the selection (Shift F)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M12 3v3m0 12v3M3 12h3m12 0h3" /></svg>
-                  <span class="rib-label">Focus</span>
-                </button>
-                <button class="rib-btn sm" id="cmd-edit" type="button" disabled title="Edit the selected element (E)">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
-                  <span class="rib-label">Edit</span>
-                </button>
-              </div>
+              <button class="rib-btn lg" id="cmd-edit" type="button" disabled title="Edit the selected element (E)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
+                <span class="rib-label">Edit</span>
+              </button>
             </div>
             <span class="rib-glabel">Selection</span>
           </div>
@@ -202,6 +174,16 @@
             </div>
             <span class="rib-glabel">Tools</span>
           </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-style" type="button" disabled title="Cycle the display style (D)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4z" /><path d="M4 12l8 4 8-4M4 17l8 4 8-4" /></svg>
+                <span class="rib-label" id="style-label">Shaded</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Display</span>
+          </div>
         </div>
 
         <div class="rib-strip" id="rib-view" role="tabpanel" aria-label="View">
@@ -217,9 +199,27 @@
           <span class="rib-sep" aria-hidden="true"></span>
           <div class="rib-group">
             <div class="rib-items">
-              <button class="rib-btn lg" id="cmd-theme-2" type="button" title="Interface theme: system, light or dark">
+              <button class="rib-btn lg" id="cmd-spaces" type="button" disabled aria-pressed="false" title="Show space and zone volumes">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 7-4 7 4-7 4z" /><path d="m5 8v8l7 4 7-4V8M12 12v8" /></svg>
+                <span class="rib-label">Spaces</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-openings" type="button" disabled aria-pressed="false" title="Show opening and void volumes">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="3" width="16" height="18" /><path d="M8 21V7h8v14M13 14h.01" /></svg>
+                <span class="rib-label">Openings</span>
+              </button>
+              <button class="rib-btn lg" id="cmd-references" type="button" disabled aria-pressed="false" title="Show grids, annotations and reference geometry">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16M7 4v16M12 4v16M17 4v16" /></svg>
+                <span class="rib-label">Guides</span>
+              </button>
+            </div>
+            <span class="rib-glabel">Model helpers</span>
+          </div>
+          <span class="rib-sep" aria-hidden="true"></span>
+          <div class="rib-group">
+            <div class="rib-items">
+              <button class="rib-btn lg" id="cmd-theme" type="button" title="Interface theme: system, light or dark">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" /></svg>
-                <span class="rib-label" id="theme-label-2">System</span>
+                <span class="rib-label" id="theme-label">System</span>
               </button>
               <button class="rib-btn lg" id="cmd-canvas-theme" type="button" title="Viewport background: match the theme, light or dark">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m6 16 4-5 3 3.5L16 11l2 5z" /></svg>
@@ -233,16 +233,16 @@
         <div class="rib-strip" id="rib-analyze" role="tabpanel" aria-label="Analyze">
           <div class="rib-group">
             <div class="rib-items">
-              <button class="rib-btn lg" id="cmd-measure-2" type="button" disabled aria-pressed="false" title="Measure point to point (M)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 17 12-12 2 2L7 19z" /><path d="M9 15l-2-2m5-1-2-2m5-1-2-2" /></svg>
-                <span class="rib-label">Measure</span>
+              <button class="rib-btn lg" id="cmd-properties" type="button" disabled title="Open the properties panel">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2" /><path d="M8 9h8M8 13h8M8 17h5" /></svg>
+                <span class="rib-label">Properties</span>
               </button>
-              <button class="rib-btn lg" id="cmd-section-2" type="button" disabled aria-pressed="false" title="Section the model (X)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19 19 5" /><path d="M8 5h11v11M5 8v11h11" /></svg>
-                <span class="rib-label">Section</span>
+              <button class="rib-btn lg" id="cmd-element" type="button" disabled title="Open the element details">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 11v6M12 7h.01" /></svg>
+                <span class="rib-label">Element</span>
               </button>
             </div>
-            <span class="rib-glabel">Inspect geometry</span>
+            <span class="rib-glabel">Inspect</span>
           </div>
           <span class="rib-sep" aria-hidden="true"></span>
           <div class="rib-group">
@@ -251,43 +251,14 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 19V9h4v10M10 19V5h4v14M15 19v-7h4v7M4 20h16" /></svg>
                 <span class="rib-label">Statistics</span>
               </button>
-            </div>
-            <span class="rib-glabel">Report</span>
-          </div>
-        </div>
-
-        <div class="rib-strip" id="rib-review" role="tabpanel" aria-label="Review">
-          <div class="rib-group">
-            <div class="rib-items">
               <button class="rib-btn lg" id="cmd-quality" type="button" disabled title="Open the conversion report">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6M4 20h16" /></svg>
                 <span class="rib-label">Quality</span>
               </button>
-              <button class="rib-btn lg" id="cmd-properties" type="button" disabled title="Open the properties panel">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 11v6M12 7h.01" /></svg>
-                <span class="rib-label">Properties</span>
-              </button>
             </div>
-            <span class="rib-glabel">Inspect</span>
-          </div>
-          <span class="rib-sep" aria-hidden="true"></span>
-          <div class="rib-group">
-            <div class="rib-items">
-              <button class="rib-btn lg" id="cmd-export-2" type="button" disabled title="Download the IFC source (Ctrl S)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h12l2 2v14H5z" /><path d="M8 4v6h8V4M8 16h8" /></svg>
-                <span class="rib-label">Export IFC</span>
-              </button>
-            </div>
-            <span class="rib-glabel">Deliver</span>
+            <span class="rib-glabel">Report</span>
           </div>
         </div>
-      </div>
-
-      <div id="pending-bar" class="hidden">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01" /><path d="M10.3 4.3 2.6 18a1.9 1.9 0 0 0 1.7 2.9h15.4a1.9 1.9 0 0 0 1.7-2.9L13.7 4.3a1.9 1.9 0 0 0-3.4 0z" /></svg>
-        <span class="summary">Unsaved IFC edits</span>
-        <span class="detail grow" id="pending-detail">Download the IFC to keep this revision.</span>
-        <button class="btn sm" id="pending-export" type="button">Export IFC</button>
       </div>
 
       <main id="workspace">
@@ -372,6 +343,10 @@
               <button class="icon-btn" id="dock-style" type="button" disabled title="Display style (D)" aria-label="Display style">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 8 4-8 4-8-4z" /><path d="M4 12l8 4 8-4" /></svg>
               </button>
+              <span class="dock-sep" aria-hidden="true"></span>
+              <button class="icon-btn" id="dock-show-all" type="button" disabled title="Show every element again (A)" aria-label="Show every element again">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12" /><circle cx="12" cy="12" r="3" /><path d="M17 3.5l2 2 3-3" /></svg>
+              </button>
             </div>
             <div id="dock-selection" class="hidden" role="toolbar" aria-label="Selection tools">
               <button class="icon-btn" id="dock-focus" type="button" disabled title="Frame the selection (Shift F)" aria-label="Frame the selection">
@@ -390,7 +365,7 @@
             </div>
           </div>
 
-          <p class="hint-bar hidden" id="hint-bar">Drag to orbit · Scroll at a detail to zoom · Double-click to frame</p>
+          <p class="hint-bar hidden" id="hint-bar">Drag to orbit · Click an element to zoom and orbit around it · Double-click to frame</p>
 
           <div class="card hidden" id="measure-card" role="region" aria-label="Measurements">
             <div class="card-head">
@@ -423,12 +398,12 @@
             <div class="dz-card">
               <div class="dz-mark" aria-hidden="true"></div>
               <h1 class="dz-title">TessIFC viewer</h1>
-              <p class="preview-label">v0.1 developer preview</p>
+              <p class="preview-label">v0.2 developer preview</p>
               <p class="dz-sub">Open, inspect and measure your IFC model. Files stay in this browser.</p>
               <div class="dz-actions">
                 <button class="btn primary lg" id="dz-open" type="button">Open IFC file</button>
               </div>
-              <p class="dz-hint">or drop an .ifc file anywhere · IFC2X3, IFC4 and IFC4X3</p>
+              <p class="dz-hint">or drop an .ifc or .ifczip file anywhere · IFC2X3, IFC4 and IFC4X3</p>
               <div class="dz-caps" aria-label="What this viewer does">
                 <span>Orbit</span><span>Select</span><span>Inspect</span><span>Measure</span><span>Section</span><span>Edit</span>
               </div>
@@ -468,6 +443,68 @@
                 <div class="edit-actions">
                   <button class="btn accent grow" id="edit-apply" type="button" disabled>Apply changes</button>
                   <button class="btn" id="edit-revert" type="button" disabled>Revert</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <aside id="session" class="collapsed" aria-label="Session">
+          <div class="panel-head">
+            <span class="panel-title">Session</span>
+            <div class="seg" id="session-switch" role="tablist" aria-label="Session view">
+              <button type="button" role="tab" aria-selected="true" aria-controls="session-script" data-session="script">Script</button>
+              <button type="button" role="tab" aria-selected="false" aria-controls="session-assistant" tabindex="-1" data-session="assistant">Assistant</button>
+            </div>
+            <span class="grow"></span>
+            <button class="icon-btn sm" id="session-close" type="button" title="Close the session panel" aria-label="Close the session panel">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+          <div class="session-state"><span class="dot" id="session-dot" aria-hidden="true"></span><span id="session-status">JavaScript · in this browser</span></div>
+          <div class="panel-body scroll">
+            <div class="page">
+              <div id="session-script">
+                <div class="script-head">
+                  <span class="group-title"><span><span id="script-language">JavaScript</span> script</span></span>
+                  <select id="script-example" aria-label="Example scripts"><option value="" selected>Examples</option></select>
+                </div>
+                <textarea id="script-editor" class="script-editor" rows="10" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Script"></textarea>
+                <div class="edit-actions session-toolbar">
+                  <button class="btn accent sm" id="script-run" type="button" disabled title="Run the script against the model (Ctrl Enter)">Run</button>
+                  <button class="btn sm" id="script-undo" type="button" disabled title="Restore the model as it was before the last script">Undo</button>
+                  <button class="btn sm" id="script-redo" type="button" disabled title="Reapply the undone script">Redo</button>
+                  <button class="btn sm" id="script-insert" type="button" disabled title="Insert a line that fetches the selected element">Selection</button>
+                  <span class="grow"></span>
+                  <button class="icon-btn sm" id="script-clear" type="button" title="Clear the output" aria-label="Clear the output"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button>
+                </div>
+                <p class="note" id="script-note"></p>
+                <div class="session-output hidden" id="script-output" aria-live="polite"></div>
+                <details class="session-hint" id="session-python-hint">
+                  <summary>Python with IfcOpenShell instead</summary>
+                  <p class="note">Start a local session on your machine and open the address it prints. Scripts then run there in Python, and every saved revision updates this view.</p>
+                  <pre class="session-command" id="session-command"></pre>
+                </details>
+              </div>
+              <div id="session-assistant" class="hidden">
+                <div class="assistant-head">
+                  <div class="seg" id="assistant-mode" role="tablist" aria-label="Assistant mode">
+                    <button type="button" role="tab" aria-selected="true" data-mode="ask">Ask</button>
+                    <button type="button" role="tab" aria-selected="false" tabindex="-1" data-mode="edit">Edit</button>
+                  </div>
+                  <label class="field check hidden" id="assistant-policy" title="Run proposed scripts without reviewing them first">
+                    <input type="checkbox" id="assistant-auto" />
+                    <span class="field-label">Run edits automatically</span>
+                  </label>
+                  <span class="grow"></span>
+                  <button class="icon-btn sm" id="assistant-settings" type="button" title="Assistant settings" aria-label="Assistant settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" /></svg></button>
+                  <button class="icon-btn sm" id="assistant-clear" type="button" title="Clear the conversation" aria-label="Clear the conversation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg></button>
+                </div>
+                <p class="note" id="assistant-note"></p>
+                <div class="chat" id="assistant-log" aria-live="polite"></div>
+                <div class="assistant-compose">
+                  <textarea id="assistant-prompt" rows="3" placeholder="Ask about the model" aria-label="Message the assistant" disabled></textarea>
+                  <button class="btn accent sm" id="assistant-send" type="button" disabled>Send</button>
                 </div>
               </div>
             </div>
@@ -627,6 +664,12 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6M4 20h16" /></svg>
             <span class="badge" id="quality-badge" data-count="0"></span>
           </button>
+          <button class="rail-btn" id="rail-script" type="button" aria-pressed="false" title="Python script" aria-label="Python script">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14" /></svg>
+          </button>
+          <button class="rail-btn" id="rail-assistant" type="button" aria-pressed="false" title="Assistant" aria-label="Assistant">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.2 2.2M16.2 16.2l2.2 2.2M5.6 18.4l2.2-2.2M16.2 7.8l2.2-2.2" /><circle cx="12" cy="12" r="3.5" /></svg>
+          </button>
           <button class="rail-btn" id="rail-editor" type="button" aria-pressed="false" title="Edit attributes (E)" aria-label="Edit attributes">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 20 1-4L16 5l3 3L8 19z" /><path d="M14 7l3 3" /></svg>
           </button>
@@ -658,12 +701,11 @@
       <div class="dlg-body">
         <div class="group-title">Rendering</div>
         <div class="field">
-          <span class="field-label">Render scale<span class="hint">Lower draws fewer pixels. Higher sharpens edges.</span></span>
+          <span class="field-label">Render scale<span class="hint">100% draws at the display's native resolution. Lower draws fewer pixels on a fill-limited machine.</span></span>
           <select id="set-scale">
+            <option value="0.5">50%</option>
             <option value="0.75">75%</option>
-            <option value="1">100%</option>
-            <option value="1.5" selected>150%</option>
-            <option value="2">200%</option>
+            <option value="1" selected>100%</option>
           </select>
         </div>
         <label class="field check">
@@ -676,12 +718,35 @@
         </label>
         <label class="field check">
           <input type="checkbox" id="set-coincident" checked />
-          <span class="field-label">Resolve coincident surfaces<span class="hint">Stops touching faces flickering against each other. Turning it off draws large models faster.</span></span>
+          <span class="field-label">Resolve coincident surfaces<span class="hint">Stops touching faces flickering against each other by redrawing only the faces that share a plane. Turning it off draws large models slightly faster.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-motion-lod" checked />
+          <span class="field-label">Coarser meshes while moving<span class="hint">Large meshes are simplified after the model loads and the simpler version is drawn while you move the view; the frame at rest shows the full detail.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-occlusion" checked />
+          <span class="field-label">Skip hidden geometry while moving<span class="hint">While you orbit from inside a model, groups of products entirely behind its largest walls and slabs are left out of the frame; the frame at rest always draws everything.</span></span>
+        </label>
+        <label class="field check">
+          <input type="checkbox" id="set-textures" />
+          <span class="field-label">Show textures<span class="hint">Reads the file's surface textures and paints them on products that carry texture coordinates. Applies to files opened after it is switched on; images referenced by path load only from this page's own origin.</span></span>
         </label>
         <label class="field check">
           <input type="checkbox" id="set-hidden" checked />
           <span class="field-label">Start with model helpers hidden<span class="hint">Spaces, openings, guides and reference geometry stay out of the first view.</span></span>
         </label>
+
+        <div class="group-title">Scripts</div>
+        <div class="field">
+          <span class="field-label">Stop a browser script after<span class="hint">A script still running at the limit is stopped with its kernel worker; the model reopens at its last revision and the undo history is cleared.</span></span>
+          <select id="set-script-timeout">
+            <option value="10000">10 seconds</option>
+            <option value="30000" selected>30 seconds</option>
+            <option value="120000">2 minutes</option>
+            <option value="0">Never</option>
+          </select>
+        </div>
 
         <div class="group-title">Interface</div>
         <div class="field">
@@ -701,8 +766,31 @@
           </select>
         </div>
 
+        <div class="group-title">Assistant</div>
+        <div class="field">
+          <span class="field-label">Provider<span class="hint">Called from this browser. Keys stay in this browser's storage.</span></span>
+          <select id="set-assistant-provider">
+            <option value="off" selected>Off</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="compatible">OpenAI-compatible URL</option>
+          </select>
+        </div>
+        <div class="field" id="set-assistant-model-row">
+          <span class="field-label">Model<span class="hint">The provider's model id.</span></span>
+          <input type="text" id="set-assistant-model" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="field hidden" id="set-assistant-url-row">
+          <span class="field-label">Base URL<span class="hint">A chat-completions endpoint, such as Ollama or LM Studio on this machine.</span></span>
+          <input type="text" id="set-assistant-url" autocomplete="off" spellcheck="false" placeholder="Chat completions base URL" />
+        </div>
+        <div class="field" id="set-assistant-key-row">
+          <span class="field-label">API key<span class="hint">Sent only to the provider above.</span></span>
+          <input type="password" id="set-assistant-key" autocomplete="off" spellcheck="false" />
+        </div>
+
         <div class="group-title">Your data</div>
-        <p class="note">Every file is read in this tab. Nothing is uploaded, and the only thing kept between sessions is the choices on this page.</p>
+        <p class="note">Every file is read in this tab. Nothing is uploaded unless you configure an assistant, and the only things kept between sessions are the choices on this page.</p>
       </div>
       <div class="dlg-foot"><button class="btn primary" id="settings-done" type="button">Done</button></div>
     </dialog>
@@ -753,6 +841,7 @@
 
             <div class="group-title">Workspace</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>K</kbd></span>Command palette</div>
+            <div class="key-row"><span><kbd>Ctrl</kbd><kbd>Enter</kbd></span>Run the session script</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>O</kbd></span>Open a file</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>S</kbd></span>Export the IFC</div>
             <div class="key-row"><span><kbd>Ctrl</kbd><kbd>F</kbd></span>Search the structure</div>
@@ -778,7 +867,8 @@
       </div>
     </div>
 
-    <input id="file-input" type="file" accept=".ifc" hidden />
+    <input id="file-input" type="file" accept=".ifc,.ifczip" hidden />
+    <input id="revision-input" type="file" accept=".ifc" hidden />
 
     <script type="module" src="./src/main.js"></script>
   </body>

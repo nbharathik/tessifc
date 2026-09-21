@@ -9,10 +9,10 @@ const $ = (id) => document.getElementById(id);
 // Button id to command; buttons sharing a command share its state.
 const BUTTON_COMMANDS = {
   "cmd-open": "open",
+  "cmd-update": "update-ifc",
   "dz-open": "open",
   "cmd-export": "export",
-  "cmd-export-2": "export",
-  "pending-export": "export",
+  "save-revision": "export",
   "cmd-close": "close",
   "cmd-settings": "settings",
   "open-settings": "settings",
@@ -26,7 +26,6 @@ const BUTTON_COMMANDS = {
   "cmd-style": "style",
   "dock-style": "style",
   "cmd-theme": "theme",
-  "cmd-theme-2": "theme",
   "cmd-canvas-theme": "canvas-theme",
   "cmd-spaces": "spaces",
   "cmd-openings": "openings",
@@ -40,22 +39,24 @@ const BUTTON_COMMANDS = {
   "cmd-edit": "edit",
   "dock-edit": "edit",
   "rail-editor": "toggle-editor",
+  "rail-script": "session-script",
+  "rail-assistant": "session-assistant",
   "selection-details": "element",
   "cmd-show-all": "show-all",
+  "dock-show-all": "show-all",
   "tree-restore": "show-all",
   "cmd-clear": "clear-selection",
   "selection-clear": "clear-selection",
   "cmd-measure": "measure",
-  "cmd-measure-2": "measure",
   "dock-measure": "measure",
   "cmd-section": "section",
-  "cmd-section-2": "section",
   "dock-section": "section",
   "outliner-close": "toggle-outliner",
   "outliner-open": "toggle-outliner",
   "inspector-close": "toggle-inspector",
   "cmd-quality": "quality",
   "cmd-properties": "properties",
+  "cmd-element": "element",
   "cmd-model-stats": "model-stats",
   "tree-expand": "tree-expand",
   "tree-collapse": "tree-collapse",
@@ -74,7 +75,12 @@ const PANEL_TOGGLES = {
   outliner: "toggle-outliner",
   inspector: "toggle-inspector",
   editor: "toggle-editor",
+  session: "toggle-session",
 };
+
+// The right side shows one panel at a time; the edit and session panels
+// take the inspector's place and hand it back when they close.
+const RIGHT_PANELS = ["inspector", "editor", "session"];
 
 const THEME_MODES = ["system", "light", "dark"];
 const THEME_LABELS = { system: "System", light: "Light", dark: "Dark" };
@@ -90,7 +96,7 @@ const TOAST_ICONS = {
 export function createShell() {
   const commands = new Map();
   const buttons = new Map();
-  const listeners = { theme: [], canvasTheme: [], panel: [], resize: [] };
+  const listeners = { theme: [], canvasTheme: [], panel: [], resize: [], visibility: [] };
   const narrowScreen = matchMedia("(max-width: 860px)");
 
   let ribbonTab = "home";
@@ -116,8 +122,9 @@ export function createShell() {
   for (const element of document.querySelectorAll("[data-view]")) {
     bind(element, `view:${element.dataset.view}`);
   }
-  // The close button reaches the panel directly, whatever the command table says.
+  // The close buttons reach their panel directly, whatever the command table says.
   $("editor-close")?.addEventListener("click", () => setPanel("editor", false));
+  $("session-close")?.addEventListener("click", () => setPanel("session", false));
 
   /** Register a command so buttons, the palette and the keyboard can run it. */
   function register(list) {
@@ -196,12 +203,29 @@ export function createShell() {
     return !$(name).classList.contains("collapsed");
   }
 
+  let inspectorBehindOverlay = false;
+
   function setPanel(name, visible) {
     if (visible && narrowScreen.matches) {
       for (const other of Object.keys(PANEL_TOGGLES)) {
-        if (other !== name && panelVisible(other)) setPanel(other, false);
+        if (other !== name && panelVisible(other)) applyPanel(other, false);
+      }
+    } else if (visible && RIGHT_PANELS.includes(name)) {
+      if (name === "inspector") inspectorBehindOverlay = false;
+      else if (!panelVisible(name) && panelVisible("inspector")) inspectorBehindOverlay = true;
+      for (const other of RIGHT_PANELS) {
+        if (other !== name && panelVisible(other)) applyPanel(other, false);
       }
     }
+    applyPanel(name, visible);
+    // An overlay the user closes gives the inspector back.
+    if (!visible && name !== "inspector" && RIGHT_PANELS.includes(name) && inspectorBehindOverlay && !narrowScreen.matches) {
+      inspectorBehindOverlay = false;
+      applyPanel("inspector", true);
+    }
+  }
+
+  function applyPanel(name, visible) {
     const panel = $(name);
     // A panel already in the asked state costs nothing, so a selection cannot trigger a resize.
     if (panel.classList.contains("collapsed") === !visible) {
@@ -215,6 +239,7 @@ export function createShell() {
     panel.classList.toggle("collapsed", !visible);
     if (name === "inspector") $("rail").classList.toggle("closed", !visible);
     setPressed(PANEL_TOGGLES[name], visible);
+    emit("visibility", { name, visible });
     emit("resize");
   }
 

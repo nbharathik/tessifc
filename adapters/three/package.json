@@ -1,17 +1,29 @@
 {
   "name": "@tessifc/three",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "three.js meshes from a TessIFC model",
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
   "type": "module",
   "main": "src/index.js",
+  "types": "./types/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
-    "./build": "./src/build.js"
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./build": {
+      "types": "./types/build.d.ts",
+      "default": "./src/build.js"
+    },
+    "./retained": {
+      "types": "./types/retained.d.ts",
+      "default": "./src/retained.js"
+    }
   },
   "files": [
     "src/",
+    "types/",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -36,7 +48,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/build.test.mjs"
+    "test": "node test/build.test.mjs && node test/retained.test.mjs",
+    "types": "node ../../scripts/build-types.mjs .",
+    "typecheck": "node ../../scripts/build-types.mjs --check .",
+    "prepack": "npm run types"
   },
   "peerDependencies": {
     "three": ">=0.150.0"

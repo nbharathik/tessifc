@@ -1,18 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
-/**
- * Turning a TessIFC kernel into draw calls, with no three.js in sight. This
- * half is pure: kernel in, typed arrays out, so the batching decisions can be
- * tested. `index.js` wraps the arrays in `THREE.BufferGeometry`.
- */
+
+//! Draw batches from a TessIFC kernel, with no three.js in sight: kernel in,
+//! typed arrays out, so the batching can be tested. `index.js` wraps them.
 
 /** How many vertices before a batch is closed and a new one started. */
 export const BATCH_VERTEX_LIMIT = 65_000 * 4;
 
 /**
+ * An axis-aligned box in the model's frame.
+ * @typedef {{ min: number[], max: number[] }} Bounds
+ */
+
+/**
+ * One draw batch: a colour, its vertices and the express id of every vertex.
+ * @typedef {object} Batch
+ * @property {number[]} color
+ * @property {boolean} transparent
+ * @property {Float32Array} positions
+ * @property {Uint32Array | Uint16Array} indices
+ * @property {Uint32Array} expressIds
+ * @property {number} vertexCount
+ */
+
+/**
  * Build draw batches from an evaluated model, grouped by colour so one batch is one material.
- * @param kernel a TessIFC `Kernel` with `evaluateGeometry` already called
- * @param modelId the model id
- * @returns `{ batches, shapes, bounds }`
+ * @param {import("@tessifc/edit/types").Kernel} kernel a TessIFC `Kernel` with `evaluateGeometry` already called
+ * @param {number} modelId the model id
+ * @returns {{ batches: Batch[], shapes: Array<{ expressId: number, class: string, triangles: number }>, bounds: Bounds }}
  */
 export function buildBatches(kernel, modelId) {
   const count = kernel.shapeCount(modelId);
@@ -114,7 +128,10 @@ function* splitPart(positions, indices) {
   if (triangleIndices.length) yield finish();
 }
 
-/** The centre and radius of a bounds, for framing a camera. */
+/**
+ * The centre and radius of a bounds, for framing a camera.
+ * @param {Bounds} bounds
+ */
 export function frame(bounds) {
   const centre = [0, 1, 2].map((axis) => (bounds.min[axis] + bounds.max[axis]) / 2);
   const size = [0, 1, 2].map((axis) => bounds.max[axis] - bounds.min[axis]);

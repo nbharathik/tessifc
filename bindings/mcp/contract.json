@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "tools": {
+    "describe_model": { "input": { "properties": [], "required": [] }, "result": ["open", "name", "path", "schema", "revision", "version", "generation", "lengthUnit", "entities", "products", "storeys", "history", "saved", "viewer", "text"], "python": true },
+    "find_products": { "input": { "properties": ["class", "name", "storey", "limit"], "required": [] }, "result": ["products", "total"], "python": true },
+    "product_info": { "input": { "properties": ["id", "guid"], "required": [] }, "result": ["id", "class", "guid", "name", "attributes", "container", "propertySets", "representations", "placement"], "python": true },
+    "inspect_model": { "input": { "properties": ["code"], "required": ["code"] }, "result": ["ok", "timedOut", "stdout", "error", "traceback"], "python": true },
+    "edit_model": { "input": { "properties": ["script", "summary"], "required": ["script"] }, "result": ["ok", "timedOut", "changed", "revision", "version", "stdout", "error", "traceback", "operations", "affectedProducts", "removedProducts", "metadataProducts", "fullRebuild", "diagnostics", "history", "saved"], "python": true },
+    "undo": { "input": { "properties": [], "required": [] }, "result": ["ok", "changed", "revision", "version", "affectedProducts", "removedProducts", "history", "saved", "label"], "python": true },
+    "redo": { "input": { "properties": [], "required": [] }, "result": ["ok", "changed", "revision", "version", "affectedProducts", "removedProducts", "history", "saved", "label"], "python": true },
+    "export_model": { "input": { "properties": ["path"], "required": [] }, "result": ["path", "bytes", "version"], "python": true },
+    "new_model": { "input": { "properties": ["schema", "name", "units", "site", "building", "storeys", "path", "force"], "required": [] }, "result": ["revision", "version", "generation", "storeys", "products"], "python": true },
+    "open_model": { "input": { "properties": ["path"], "required": ["path"] }, "result": ["revision", "version", "generation", "products"], "python": true },
+    "get_selection": { "input": { "properties": [], "required": [] }, "result": ["ids", "guids", "className", "name", "reportedAt"], "python": true },
+    "verify_revision": { "input": { "properties": [], "required": [] }, "result": ["ok", "revision", "products", "mismatches", "elapsedMs"], "python": false },
+    "list_examples": { "input": { "properties": [], "required": [] }, "result": ["examples"], "python": true }
+  },
+  "resources": ["tessifc://script-api", "tessifc://model/summary"],
+  "prompts": ["build-a-building"]
+}

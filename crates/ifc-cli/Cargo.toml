@@ -18,11 +18,12 @@ name = "tessifc"
 path = "src/main.rs"
 
 [dependencies]
-tessifc-step = { workspace = true }
+# The workspace entry turns the crates' defaults off so a schema feature can be
+# chosen; `tessifc edit` needs the step crate's editor on.
+tessifc-step = { workspace = true, features = ["edit"] }
 tessifc-schema = { workspace = true }
 tessifc-model = { workspace = true }
 tessifc-engine = { workspace = true, features = ["parallel"] }
-tessifc-pack = { workspace = true }
 tessifc-geom = { workspace = true }
 rayon = { workspace = true }
 clap = { workspace = true }
@@ -32,7 +33,8 @@ serde_json = { workspace = true }
 # Schema features must forward down the dependency chain, or a
 # --no-default-features build still pulls in all three schemas.
 [features]
-default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3"]
-schema-ifc2x3 = ["tessifc-schema/schema-ifc2x3", "tessifc-step/schema-ifc2x3", "tessifc-model/schema-ifc2x3"]
-schema-ifc4 = ["tessifc-schema/schema-ifc4", "tessifc-step/schema-ifc4", "tessifc-model/schema-ifc4"]
-schema-ifc4x3 = ["tessifc-schema/schema-ifc4x3", "tessifc-step/schema-ifc4x3", "tessifc-model/schema-ifc4x3"]
+default = ["schema-ifc2x3", "schema-ifc4", "schema-ifc4x3", "ifczip"]
+ifczip = ["tessifc-step/ifczip"]
+schema-ifc2x3 = ["tessifc-schema/schema-ifc2x3", "tessifc-step/schema-ifc2x3", "tessifc-model/schema-ifc2x3", "tessifc-geom/schema-ifc2x3", "tessifc-engine/schema-ifc2x3"]
+schema-ifc4 = ["tessifc-schema/schema-ifc4", "tessifc-step/schema-ifc4", "tessifc-model/schema-ifc4", "tessifc-geom/schema-ifc4", "tessifc-engine/schema-ifc4"]
+schema-ifc4x3 = ["tessifc-schema/schema-ifc4x3", "tessifc-step/schema-ifc4x3", "tessifc-model/schema-ifc4x3", "tessifc-geom/schema-ifc4x3", "tessifc-engine/schema-ifc4x3"]

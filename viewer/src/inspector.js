@@ -33,12 +33,12 @@ export function createInspector({ onApplyEdits }) {
 
   // ---------------------------------------------------------- selection
 
-  /** Show the selected element and put the properties list into a loading state. */
-  function showSelection({ className, expressId, geometryId, triangles, materials, position, size, shared, extent, path, state }) {
+  /** Show the selected element and put the properties list into a loading state; `quiet` keeps the current list. */
+  function showSelection({ className, expressId, geometryId, triangles, materials, position, size, shared, extent, path, state, quiet = false }) {
     const swatch = classLabelColor(className);
     const label = `${className.toUpperCase()} #${expressId}`;
     $("properties-empty").classList.add("hidden");
-    replay($("selection-card"), swatch);
+    replay($("selection-card"), swatch, quiet);
     $("property-search-box").classList.remove("hidden");
     $("property-heading").classList.remove("hidden");
     $("selection-name").textContent = humanizeIfcClass(className);
@@ -46,7 +46,7 @@ export function createInspector({ onApplyEdits }) {
 
     $("element-empty").classList.add("hidden");
     $("element-body").classList.remove("hidden");
-    replay($("element-card"), swatch);
+    replay($("element-card"), swatch, quiet);
     $("element-name").textContent = humanizeIfcClass(className);
     $("element-class").textContent = label;
     $("element-centre").textContent = `${position.map(coordinate).join(" / ")} m`;
@@ -63,6 +63,7 @@ export function createInspector({ onApplyEdits }) {
       tag.textContent = `#${expressId}`;
       tag.classList.remove("hidden");
     }
+    if (quiet) return;
     propertySearch.value = "";
     propertySearch.disabled = true;
     $("property-count").textContent = "reading";
@@ -107,10 +108,11 @@ export function createInspector({ onApplyEdits }) {
   // The entrance runs through the animation API, so restarting it forces no layout.
   let entrance = null;
 
-  /** Show the card again with its class colour and a short entrance. */
-  function replay(card, swatch) {
+  /** Show the card again with its class colour and a short entrance, unless `quiet`. */
+  function replay(card, swatch, quiet = false) {
     card.classList.remove("hidden");
     card.style.setProperty("--sel-swatch", swatch);
+    if (quiet) return;
     if (!entrance) {
       const tokens = getComputedStyle(document.documentElement);
       entrance = {

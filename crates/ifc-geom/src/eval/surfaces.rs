@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Parametric surfaces, and the inversion that puts a point back on one.
-//!
-//! An advanced face is a region of a surface cut out by 3D edge curves. To
-//! tessellate it, the edges are put back into the surface's own two
-//! parameters, the region is triangulated there, and the result is lifted onto
-//! the surface again. Everything in this module exists to serve that: a point
-//! at (u, v), and the (u, v) of a point.
+//! Parametric surfaces and their inversion: a point at (u, v), and the (u, v)
+//! of a point. Advanced faces are trimmed and triangulated in the surface's own
+//! parameters and lifted back onto it.
 
 use crate::context::EvalCtx;
 use crate::error::GeomError;
@@ -120,7 +116,7 @@ impl SurfaceEvaluator for Swept {
             .attr("SweptCurve")
             .as_entity()
             .ok_or_else(|| GeomError::missing("SweptCurve"))?;
-        let (points, open) = swept_curve_points(ctx, swept)?;
+        let (points, open, knots) = swept_curve_points(ctx, swept)?;
         if points.len() < 2 {
             return Err(GeomError::Degenerate("a swept curve of one point".into()));
         }
@@ -147,6 +143,7 @@ impl SurfaceEvaluator for Swept {
                     closed: !open,
                     along,
                     depth,
+                    knots,
                 },
                 frame,
             ));
@@ -172,9 +169,8 @@ impl SurfaceEvaluator for Swept {
                 "a revolution about an axis of no length".into(),
             ));
         }
-        // The profile in the half-plane it spans: radius from the axis and
-        // height along it. A profile that does not lie in one half-plane is
-        // not a surface of revolution and is refused rather than guessed at.
+        // The profile as radius from the axis and height along it; one that does not
+        // lie in a single half-plane is not a surface of revolution and is refused.
         let flat = &points;
         let mut reference = DVec3::ZERO;
         for point in flat {
@@ -210,6 +206,7 @@ impl SurfaceEvaluator for Swept {
                 origin,
                 axis,
                 reference,
+                knots,
             },
             frame,
         ))
@@ -359,17 +356,24 @@ impl SurfaceEvaluator for BSpline {
 /// surface of revolution it usually is: the profile lies in a plane containing
 /// the axis, which is not the profile evaluator's z = 0 plane. Reading it as a
 /// 2D profile would flatten the surface into an annulus.
+/// The swept curve's points, whether it is open, and its own parameter at
+/// each point when the curve evaluator recorded one.
 fn swept_curve_points(
     ctx: &EvalCtx<'_>,
     swept: Entity<'_>,
-) -> Result<(Vec<DVec3>, bool), GeomError> {
+) -> Result<(Vec<DVec3>, bool, Vec<f64>), GeomError> {
     for (attribute, open) in [("Curve", true), ("OuterCurve", false)] {
         let Some(curve) = swept.attr(attribute).as_entity() else {
             continue;
         };
         let polyline = ctx.registry().curve(ctx, curve)?;
         if polyline.points.len() >= 2 {
-            return Ok((polyline.points, open && !polyline.closed));
+            let knots = if polyline.parameters.len() == polyline.points.len() {
+                polyline.parameters
+            } else {
+                Vec::new()
+            };
+            return Ok((polyline.points, open && !polyline.closed, knots));
         }
     }
     // Anything else is a parametric profile, which is genuinely two-dimensional.
@@ -381,6 +385,7 @@ fn swept_curve_points(
             .map(|point| DVec3::new(point.x, point.y, 0.0))
             .collect(),
         profile.open,
+        Vec::new(),
     ))
 }
 

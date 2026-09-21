@@ -1,0 +1,112 @@
+{
+  "name": "@tessifc/viewer",
+  "version": "0.2.0",
+  "description": "A minimal WebGL2 IFC viewer over the TessIFC kernel: open a file, stream its geometry, select, hide, section and frame; build your own interface on top",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./renderer": {
+      "types": "./types/renderer.d.ts",
+      "default": "./src/renderer.js"
+    },
+    "./stream": {
+      "types": "./types/stream.d.ts",
+      "default": "./src/stream.js"
+    },
+    "./navigation": {
+      "types": "./types/navigation.d.ts",
+      "default": "./src/navigation.js"
+    },
+    "./measure": {
+      "types": "./types/measure.d.ts",
+      "default": "./src/measure.js"
+    },
+    "./picking": {
+      "types": "./types/picking.d.ts",
+      "default": "./src/picking.js"
+    },
+    "./culling": {
+      "types": "./types/culling.d.ts",
+      "default": "./src/culling.js"
+    },
+    "./scheduler": {
+      "types": "./types/scheduler.d.ts",
+      "default": "./src/scheduler.js"
+    },
+    "./depth-planes": {
+      "types": "./types/depth-planes.d.ts",
+      "default": "./src/depth-planes.js"
+    },
+    "./session-client": {
+      "types": "./types/session-client.d.ts",
+      "default": "./src/session-client.js"
+    },
+    "./kernel-client": {
+      "types": "./types/kernel-client.d.ts",
+      "default": "./src/kernel-client.js"
+    },
+    "./kernel-worker": {
+      "types": "./types/kernel-worker.d.ts",
+      "default": "./src/kernel-worker.js"
+    },
+    "./kernel-worker-core": {
+      "types": "./types/kernel-worker-core.d.ts",
+      "default": "./src/kernel-worker-core.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "src/",
+    "types/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "ifc",
+    "bim",
+    "viewer",
+    "webgl",
+    "tessifc"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/viewer"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/embed.test.mjs",
+    "types": "node ../../scripts/build-types.mjs .",
+    "typecheck": "node ../../scripts/build-types.mjs --check .",
+    "prepack": "npm run types"
+  },
+  "dependencies": {
+    "@tessifc/edit": "0.2.0"
+  },
+  "peerDependencies": {
+    "@tessifc/core": "0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@tessifc/core": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

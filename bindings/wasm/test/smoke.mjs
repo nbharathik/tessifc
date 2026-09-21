@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // The WASM smoke test: IFC crosses the boundary and comes back as meshes.
-// Build with python scripts/build-wasm.py, then run this file; it exits
-// non-zero on any mismatch. Set TESSIFC_TEST_MODEL to an IFC file to add a
-// whole-model comparison against the native CLI.
+// TESSIFC_TEST_MODEL names an optional IFC file to compare against the CLI.
+// TESSIFC_SLIM=1 expects a build without the edit and ifczip features.
 
 import { execFileSync } from "node:child_process";
+import { deflateRawSync } from "node:zlib";
 import { existsSync, readFileSync, statSync, mkdtempSync, unlinkSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 import { readIgp } from "../../../viewer/src/igp.js";
 import { createPackAssembler } from "../../../viewer/src/stream.js";
+import { createEditingSession } from "../../edit/src/session.js";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,9 +36,10 @@ if (!existsSync(join(pkg, "tessifc_wasm.js"))) {
 
 // The nodejs target is CommonJS; accept a default export or named exports.
 const loaded = await import(`file://${join(pkg, "tessifc_wasm.js").replaceAll("\\", "/")}`);
-const { Kernel, version } = loaded.Kernel ? loaded : loaded.default;
+const { Kernel, version, simplifyMesh } = loaded.Kernel ? loaded : loaded.default;
+const SLIM = process.env.TESSIFC_SLIM === "1";
 
-console.log(`tessifc-wasm ${version()}`);
+console.log(`tessifc-wasm ${version()}${SLIM ? " (slim build expected)" : ""}`);
 
 // ---------------------------------------------------------------- unit checks
 
@@ -60,6 +62,17 @@ if (kernel.getProductCategory(tinyId, 1) !== "physical") {
 }
 console.log("ok    a minimal file parses through wasm");
 
+// Schema introspection answers by class name in the model's schema, in argument order.
+const doorDefinition = JSON.parse(kernel.getClassAttributes(tinyId, "IfcDoor"));
+check(doorDefinition.class === "IfcDoor" && !doorDefinition.abstract, "getClassAttributes names the class");
+check(doorDefinition.attributes[0].name === "GlobalId" && !doorDefinition.attributes[0].optional, "GlobalId is the first required attribute");
+check(doorDefinition.attributes.find((a) => a.name === "OverallHeight")?.base === "real", "attribute bases are reported");
+check(JSON.parse(kernel.getClassAttributes(tinyId, "IfcProduct")).abstract === true, "abstract classes are flagged");
+check(kernel.getClassAttributes(tinyId, "IfcSpaceship") === undefined, "an unknown class is undefined");
+const doorChain = JSON.parse(kernel.getClassSupertypes(tinyId, "IfcDoor"));
+check(doorChain[0] === "IfcDoor" && doorChain.includes("IfcProduct") && doorChain.at(-1) === "IfcRoot", "getClassSupertypes walks to IfcRoot");
+check(kernel.getClassSupertypes(tinyId, "IfcSpaceship") === undefined, "supertypes of an unknown class are undefined");
+
 // Garbage must not throw, and must be reported rather than swallowed.
 const junkId = kernel.openModel(new Uint8Array([0, 1, 2, 3, 255, 254]));
 const junkInfo = JSON.parse(kernel.getModelInfo(junkId));
@@ -78,7 +91,7 @@ console.log(`ok    garbage is diagnosed, not thrown (${junkDiagnostics[0].code})
 for (const settings of ['{', '[]', '{"circleSegments":4294967297}', '{"chordToleranceM":0}', '{"includeSpaces":"yes"}', '{"maxSurfaceVertices":0}', '{"repairSurfaceCurves":1}']) {
   assert.throws(() => kernel.evaluateGeometry(tinyId, settings), /settings/);
   assert.throws(() => kernel.beginGeometryStream(tinyId, settings), /settings/);
-  assert.throws(() => kernel.evaluateProducts(tinyId, Uint32Array.of(1), settings), /settings/);
+  if (!SLIM) assert.throws(() => kernel.evaluateProducts(tinyId, Uint32Array.of(1), settings), /settings/);
 }
 kernel.beginGeometryStream(junkId, '{}');
 const emptyChunk = readIgp(kernel.nextGeometryChunk(junkId, 0, 1, 0));
@@ -159,6 +172,289 @@ const fragment = new TextEncoder().encode(FRAGMENT);
   );
   check(kernel.shapeCount(id) === 0, "taking the pack releases the geometry");
   kernel.closeAll();
+}
+
+// ----------------------------------------------------- IFCZIP archives
+
+if (!SLIM) {
+  // A minimal ZIP writer: one deflated entry, a central directory, the end record.
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc32 = bytes => {
+    let c = 0xffffffff;
+    for (const b of bytes) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const le16 = v => [v & 0xff, (v >>> 8) & 0xff];
+  const le32 = v => [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff];
+  const zipOf = (name, data) => {
+    const deflated = deflateRawSync(data);
+    const nameBytes = new TextEncoder().encode(name);
+    const crc = crc32(data);
+    const local = [0x50, 0x4b, 3, 4, ...le16(20), ...le16(0), ...le16(8), ...le16(0), ...le16(0),
+      ...le32(crc), ...le32(deflated.length), ...le32(data.length), ...le16(nameBytes.length), ...le16(0),
+      ...nameBytes, ...deflated];
+    const central = [0x50, 0x4b, 1, 2, ...le16(20), ...le16(20), ...le16(0), ...le16(8), ...le16(0), ...le16(0),
+      ...le32(crc), ...le32(deflated.length), ...le32(data.length), ...le16(nameBytes.length), ...le16(0), ...le16(0),
+      ...le16(0), ...le16(0), ...le32(0), ...le32(0), ...nameBytes];
+    const end = [0x50, 0x4b, 5, 6, ...le16(0), ...le16(0), ...le16(1), ...le16(1), ...le32(central.length),
+      ...le32(local.length), ...le16(0)];
+    return new Uint8Array([...local, ...central, ...end]);
+  };
+  const kernel = new Kernel();
+  const archive = zipOf("model.ifc", fragment);
+  const id = kernel.openModel(archive);
+  const info = JSON.parse(kernel.getModelInfo(id));
+  check(info.entities > 0 && !JSON.parse(kernel.getDiagnostics(id)).some(d => d.code.startsWith("E_IFCZIP")),
+    "an IFCZIP archive opens to the model inside it");
+  check(new TextDecoder().decode(kernel.exportModel(id)) === FRAGMENT,
+    "the export of an archive is the plain IFC it held");
+  const summary = JSON.parse(kernel.evaluateGeometry(id, JSON.stringify({ includeOpenings: true })));
+  check(summary.products === 2, "and its geometry evaluates as usual");
+  const truncated = kernel.openModel(archive.slice(0, archive.length - 5));
+  check(JSON.parse(kernel.getDiagnostics(truncated)).some(d => d.code === "E_IFCZIP_MALFORMED"),
+    "a truncated archive says so");
+  const tooBig = kernel.openModel(archive, JSON.stringify({ maxIfczipBytes: 16 }));
+  check(JSON.parse(kernel.getDiagnostics(tooBig)).some(d => d.code === "E_IFCZIP_TOO_LARGE"),
+    "an archive over the configured size is refused");
+  kernel.closeAll();
+}
+
+// ----------------------------------------------------- global budgets
+
+{
+  const kernel = new Kernel();
+  const id = kernel.openModel(fragment);
+  const settings = JSON.stringify({ includeOpenings: true, maxTotalTriangles: 1 });
+  const summary = JSON.parse(kernel.evaluateGeometry(id, settings));
+  check(summary.products === 1 && summary.limitReached?.which === "maxTotalTriangles",
+    "a triangle budget stops the whole-model evaluation after one product");
+  check(summary.limitReached.productsSkipped === 1, "the other product is skipped");
+  const outcomes = JSON.parse(kernel.getProductOutcomes(id));
+  check(outcomes.some(o => o.state === "skipped_by_limit"), "the skipped product says so");
+  const pack = readIgp(kernel.takePack(id));
+  check(pack.index.stats.limit_reached === 1 && pack.index.stats.products_skipped === 1,
+    "the pack's stats carry the stop");
+  check(pack.index.diagnostics.some(d => d.code === "E_GEOMETRY_LIMIT_REACHED"),
+    "and the model-level diagnostic");
+  assert.throws(() => kernel.evaluateGeometry(id, '{"maxGeometryMs":0}'), /maxGeometryMs/);
+
+  kernel.beginGeometryStream(id, settings);
+  let last;
+  for (let chunk; (chunk = kernel.nextGeometryChunk(id, 0, 1, 0)) !== undefined;) last = readIgp(chunk);
+  const progress = JSON.parse(kernel.streamProgress(id));
+  check(progress.finished && progress.limitReached?.productsSkipped === 1,
+    "a stream reports the stop in its progress");
+  check(last.index.stats.limit_reached === 1, "and in its final chunk");
+  kernel.closeAll();
+}
+
+// ------------------------------------------------------ textures on request
+
+{
+  // A textured quad: an image texture by path, mapped by an indexed triangle texture map.
+  const TEXTURED = [
+    "ISO-10303-21;",
+    "HEADER;",
+    "FILE_SCHEMA(('IFC4'));",
+    "ENDSEC;",
+    "DATA;",
+    "#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(1.,1.,0.),(0.,1.,0.)));",
+    "#2=IFCTRIANGULATEDFACESET(#1,$,.F.,((1,2,3),(1,3,4)),$);",
+    "#3=IFCTEXTUREVERTEXLIST(((0.,0.),(1.,0.),(1.,1.),(0.,1.)));",
+    "#4=IFCINDEXEDTRIANGLETEXTUREMAP((#10),#2,#3,((1,2,3),(1,3,4)));",
+    "#10=IFCIMAGETEXTURE(.T.,.F.,$,$,$,'textures/brick.png');",
+    "#13=IFCCOLOURRGB($,0.8,0.2,0.1);",
+    "#14=IFCSURFACESTYLERENDERING(#13,0.,$,$,$,$,$,IFCSPECULAREXPONENT(32.),.BLINN.);",
+    "#16=IFCSURFACESTYLEWITHTEXTURES((#10));",
+    "#17=IFCSURFACESTYLE('brick',.BOTH.,(#14,#16));",
+    "#18=IFCSTYLEDITEM(#2,(#17),$);",
+    "#20=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#2));",
+    "#21=IFCPRODUCTDEFINITIONSHAPE($,$,(#20));",
+    "#22=IFCWALL('w',$,$,$,$,$,#21,$,$);",
+    "ENDSEC;",
+    "END-ISO-10303-21;",
+  ].join("\n");
+  const kernel = new Kernel();
+  const id = kernel.openModel(new TextEncoder().encode(TEXTURED));
+  const flat = JSON.parse(kernel.evaluateGeometry(id, "{}"));
+  check(flat.products === 1 && !flat.materials && !flat.textures, "textures off: the summary counts none");
+  check(kernel.shapeUv(id, 0, 0) === undefined, "textures off: a part carries no texture coordinates");
+  const flatPack = readIgp(kernel.takePack(id));
+  check(flatPack.instances.material === null && flatPack.index.materials === undefined && flatPack.geometry[0].uv === null,
+    "textures off: the pack has none of the optional members");
+
+  const summary = JSON.parse(kernel.evaluateGeometry(id, JSON.stringify({ textures: true })));
+  check(summary.materials === 1 && summary.textures === 1, `textures on: the summary counts the material and its texture (${summary.materials}, ${summary.textures})`);
+  const uv = kernel.shapeUv(id, 0, 0);
+  check(uv instanceof Float32Array && uv.length === 8, "textures on: the array path hands out two floats per vertex");
+  check(uv && uv[2] === 1 && uv[3] === 0 && uv[4] === 1 && uv[5] === 1, "the coordinates are the file's texture vertices");
+  const pack = readIgp(kernel.takePack(id));
+  check(pack.geometry[0].uv?.length === 8, "textures on: the pack's geometry carries uv");
+  check(pack.instances.material?.[0] === 0, "the instance names its material row");
+  const material = pack.index.materials?.[0];
+  check(material?.texture === 10 && material.shininess === 32 && material.reflectance === "BLINN", "the material row carries the rendering extras");
+  const texture = pack.index.textures?.[0];
+  check(texture?.id === 10 && texture.uri === "textures/brick.png" && texture.mime === "image/png", "an image texture keeps its path and media type; nothing is fetched");
+  check(Array.isArray(texture?.repeat) && texture.repeat[0] === true && texture.repeat[1] === false, "repeat flags follow the file");
+  kernel.closeAll();
+  console.log("ok    textures are read, packed and handed out only when the setting asks");
+}
+
+// -------------------------------------------------------- coarse mesh levels
+
+{
+  // A column with hundreds of segments is large enough for a level; a quad is not.
+  const COLUMN = [
+    "ISO-10303-21;", "HEADER;", "FILE_SCHEMA(('IFC4'));", "ENDSEC;", "DATA;",
+    "#1=IFCCIRCLEPROFILEDEF(.AREA.,$,$,1.);",
+    "#2=IFCDIRECTION((0.,0.,1.));",
+    "#3=IFCEXTRUDEDAREASOLID(#1,$,#2,3.);",
+    "#4=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#3));",
+    "#5=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));",
+    "#6=IFCCOLUMN('c',$,$,$,$,$,#5,$,$);",
+    "ENDSEC;", "END-ISO-10303-21;",
+  ].join("\n");
+  const kernel = new Kernel();
+  const id = kernel.openModel(new TextEncoder().encode(COLUMN));
+  kernel.evaluateGeometry(id, JSON.stringify({ circleSegments: 512 }));
+  const plain = readIgp(kernel.takePack(id));
+  check(plain.geometry.length === 1 && plain.geometry[0].lod === null, "without lodLevels the pack has no level");
+  kernel.evaluateGeometry(id, JSON.stringify({ circleSegments: 512, lodLevels: 1 }));
+  const levelled = readIgp(kernel.takePack(id));
+  const level = levelled.geometry.find((mesh) => mesh.lod);
+  check(levelled.geometry.length === 2 && level?.lod.of === levelled.geometry[0].id && level.lod.level === 1, "lodLevels: 1 writes one level per large mesh");
+  check(level && level.indices.length * 4 <= levelled.geometry[0].indices.length * 3, `the level holds at most three quarters of the triangles (${level?.indices.length / 3} of ${levelled.geometry[0].indices.length / 3})`);
+  check(level && level.positions.byteOffset === levelled.geometry[0].positions.byteOffset, "the level shares the base's positions");
+  check(levelled.instances.count === 1 && levelled.index.stats.triangles === plain.index.stats.triangles, "no instance places the level and the stats count the base");
+  assert.throws(() => kernel.evaluateGeometry(id, JSON.stringify({ lodLevels: 3 })), /lodLevels/);
+  const fine = levelled.geometry[0];
+  const coarse = simplifyMesh(fine.positions, Uint32Array.from(fine.indices), JSON.stringify({ level: 1 }));
+  check(coarse instanceof Uint32Array && coarse.length === level.indices.length, "simplifyMesh computes the same level the pack carries");
+  check(simplifyMesh(new Float32Array(9), new Uint32Array([0, 1, 2]), undefined) === undefined, "a small mesh has no level");
+  assert.throws(() => simplifyMesh(fine.positions, Uint32Array.from(fine.indices), JSON.stringify({ level: 5 })), /level/);
+  kernel.closeAll();
+  console.log("ok    coarse levels are written on request and computed on demand");
+}
+
+// ----------------------------------------------------- staged live revisions
+
+if (SLIM) {
+  // A build without the edit feature reads and draws; the session says so.
+  const kernel = new Kernel();
+  const id = kernel.openModel(fragment);
+  for (const name of ["prepareRevision", "prepareAttributeEdits", "commitRevision", "setAttribute", "exportModel", "getModelRevision", "evaluateProducts"]) {
+    check(typeof kernel[name] === "undefined", `the slim build has no ${name}`);
+  }
+  check(JSON.parse(kernel.evaluateGeometry(id, "{}")).products === 2, "the slim build still evaluates geometry");
+  const session = createEditingSession(kernel, id, { modelOffset: [0, 0, 0], firstGeometryId: 1 });
+  assert.throws(() => session.runScript("print(1)"), /no editing support/);
+  assert.throws(() => session.applySnapshot(fragment), /no editing support/);
+  console.log("ok    a slim build has no editing methods and the session refuses to edit on it");
+  kernel.closeAll();
+} else {
+  const kernel = new Kernel();
+  const encode = text => new TextEncoder().encode(text);
+  const id = kernel.openModel(fragment);
+  const candidateToken = () => JSON.parse(kernel.getPreparedRevisionInfo(id)).candidateToken;
+  assert.equal(kernel.getModelRevision(id), '0');
+  kernel.evaluateGeometry(id);
+  const originalPack = readIgp(kernel.takePack(id));
+  const changed = FRAGMENT.replace('#2,2.5)', '#2,4.)');
+  const impact = JSON.parse(kernel.prepareRevision(id, encode(changed), '0'));
+  assert.deepEqual(impact.affectedProducts, [6]);
+  assert.equal(impact.revision, '1');
+  assert.equal(new TextDecoder().decode(kernel.exportModel(id)), FRAGMENT);
+  assert.throws(() => kernel.commitRevision(id, '0', impact.candidateToken), /evaluation/);
+  assert.throws(() => kernel.prepareRevision(id, fragment, '0'), /discard/);
+  assert.throws(() => kernel.evaluatePreparedRevision(id, impact.candidateToken,
+    '{"circleSegments":40}'), /settings differ/);
+  assert.throws(() => kernel.evaluatePreparedRevision(id, impact.candidateToken,
+    '{"modelOffset":[1e300,0,0]}'), /modelOffset differs/);
+  const patch = readIgp(kernel.evaluatePreparedRevision(id, impact.candidateToken, JSON.stringify({
+    modelOffset: originalPack.index.model_offset, firstGeometryId: 100,
+  })));
+  assert.deepEqual([...patch.instances.expressIds], [6]);
+  assert.equal(patch.geometry[0].id, 100);
+  assert.equal(Math.max(...patch.geometry[0].positions.filter((_, i) => i % 3 === 2)), 4);
+  const evaluated = JSON.parse(kernel.getPreparedRevisionInfo(id));
+  assert.equal(evaluated.evaluationAccepted, true);
+  assert.deepEqual(evaluated.productOutcomes.map(o => [o.express_id, o.state]), [[6, 'emitted']]);
+  assert.equal(kernel.commitRevision(id, '0', impact.candidateToken), '1');
+  assert.equal(kernel.getModelRevision(id), '1');
+  assert.equal(new TextDecoder().decode(kernel.exportModel(id)), changed);
+  assert.throws(() => kernel.prepareRevision(id, fragment, '0'), /stale/);
+  assert.throws(() => kernel.commitRevision(id, '0', impact.candidateToken), /prepared|stale/);
+
+  const names = JSON.parse(kernel.prepareAttributeEdits(id, JSON.stringify([
+    { expressId: 6, attribute: 'Name', value: "O'Brien wall" },
+    { expressId: 15, attribute: 'Name', value: 'Renamed slab' },
+  ]), '1'));
+  assert.deepEqual(names.affectedProducts, []);
+  const metadataPack = readIgp(kernel.evaluatePreparedRevision(id, names.candidateToken));
+  assert.equal(metadataPack.instances.count, 0);
+  assert.equal(kernel.commitRevision(id, '1', names.candidateToken), '2');
+  assert.equal(JSON.parse(kernel.getProductOutcomes(id)).filter(o => o.state === 'emitted').length, 2);
+  assert.equal(JSON.parse(kernel.getSpatialHierarchy(id)).nodes.filter(n => n.rendered).length, 2);
+  const namedSource = new TextDecoder().decode(kernel.exportModel(id));
+  assert(namedSource.includes("'O''Brien wall'"));
+  assert(namedSource.includes("'Renamed slab'"));
+
+  // A new product may share an existing representation. Deletion changes count too.
+  const added = namedSource.replace('ENDSEC;\nEND-ISO',
+    "#25=IFCWALL('new-wall',$,'New wall',$,$,$,#5,$,$);\nENDSEC;\nEND-ISO");
+  const creation = JSON.parse(kernel.prepareRevision(id, encode(added), '2'));
+  assert.deepEqual(creation.createdEntities, [25]);
+  assert(creation.affectedProducts.includes(25));
+  kernel.evaluatePreparedRevision(id, creation.candidateToken);
+  assert.equal(kernel.commitRevision(id, '2', creation.candidateToken), '3');
+  const removal = JSON.parse(kernel.prepareRevision(id, encode(namedSource), '3'));
+  assert.deepEqual(removal.deletedEntities, [25]);
+  assert(removal.removedProducts.includes(25));
+  kernel.evaluatePreparedRevision(id, removal.candidateToken);
+  assert.equal(kernel.commitRevision(id, '3', removal.candidateToken), '4');
+
+  for (const malformed of [
+    namedSource.replace('END-ISO-10303-21;', ''),
+    namedSource.replace('ENDSEC;\nEND-ISO', 'END-ISO'),
+    namedSource.replace('END-ISO-10303-21;', '/* END-ISO-10303-21; */'),
+    namedSource.replace('#2,4.)', '#999,4.)'),
+    namedSource.replace('#2,4.)', '#2,4.,5.)'),
+  ]) {
+    assert.throws(() => kernel.prepareRevision(id, encode(malformed), '4'), /candidate/);
+    assert.equal(kernel.getModelRevision(id), '4');
+    assert.equal(new TextDecoder().decode(kernel.exportModel(id)), namedSource);
+  }
+
+  // Valid STEP can still have failed geometry: source and revision remain unchanged.
+  const broken = namedSource.replace('#1,$,#2,4.', '$,$,#2,4.');
+  kernel.prepareRevision(id, encode(broken), '4');
+  kernel.evaluatePreparedRevision(id, candidateToken());
+  const refused = JSON.parse(kernel.getPreparedRevisionInfo(id));
+  assert.equal(refused.evaluationAccepted, false);
+  assert(refused.productOutcomes.some(o => o.state === 'empty_or_failed'));
+  assert.throws(() => kernel.commitRevision(id, '4', candidateToken()), /evaluation/);
+  assert.equal(new TextDecoder().decode(kernel.exportModel(id)), namedSource);
+  assert.equal(kernel.discardRevision(id, candidateToken()), true);
+
+  const abandoned = JSON.parse(kernel.prepareRevision(id, encode(namedSource), '4'));
+  kernel.discardRevision(id, abandoned.candidateToken);
+  kernel.prepareRevision(id, encode(namedSource), '4');
+  assert.throws(() => kernel.evaluatePreparedRevision(id, abandoned.candidateToken), /stale candidate/);
+  assert.throws(() => kernel.commitRevision(id, '4', abandoned.candidateToken), /stale candidate/);
+  assert.throws(() => kernel.discardRevision(id, abandoned.candidateToken), /stale candidate/);
+  assert(kernel.getPreparedRevisionInfo(id), 'stale cleanup preserves the newer candidate');
+  kernel.setAttribute(id, 6, 'Name', 'Legacy edit', false);
+  assert.equal(kernel.getModelRevision(id), '5');
+  assert.equal(kernel.getPreparedRevisionInfo(id), undefined);
+  assert.equal(kernel.discardRevision(id, abandoned.candidateToken), false);
+  kernel.closeAll();
+  assert.equal(kernel.getModelRevision(id), undefined);
+  assert.equal(kernel.getPreparedRevisionInfo(id), undefined);
+  console.log('ok    staged revisions publish only affected geometry, batch metadata, create/delete, and reject stale or failed updates');
 }
 
 // -------------------------------------------------- agreement with the CLI

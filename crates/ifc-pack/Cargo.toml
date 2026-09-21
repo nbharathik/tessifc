@@ -16,9 +16,3 @@ readme = "README.md"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-# The tests read the pack back the way the format document says to, which is
-# the only way to know the document and the writer agree.
-serde_json = { workspace = true }

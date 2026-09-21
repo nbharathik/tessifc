@@ -29,6 +29,8 @@ pub struct ParseOptions {
     pub schema_override: Option<SchemaId>,
     /// Check each record argument count against the schema; cheap, on by default.
     pub check_arity: bool,
+    /// Refuse an IFCZIP entry that declares, or inflates to, more than this many bytes.
+    pub max_ifczip_bytes: usize,
 }
 
 impl Default for ParseOptions {
@@ -41,6 +43,7 @@ impl Default for ParseOptions {
             max_diagnostics: 10_000,
             schema_override: None,
             check_arity: true,
+            max_ifczip_bytes: 1 << 30,
         }
     }
 }

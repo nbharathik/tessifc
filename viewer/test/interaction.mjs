@@ -35,6 +35,20 @@ export async function checkInteraction(page, check) {
     r.fit(); r.render(true);
     for (let step = 0; step < 25; step++) r.zoomAt(0.7);
     const closeDistance = r.camera.distance;
+    // A click pivots at the depth of the surface it hit without turning the camera,
+    // so zooming afterwards reaches that surface rather than the model centre.
+    r.fit(); r.render(true);
+    const forwardBefore = r.cameraBasis().forward;
+    const positionBefore = r.camera.position.slice();
+    const pivoted = r.setPivot(pointer.point);
+    const forwardAfter = r.cameraBasis().forward;
+    const pivotTurn = Math.hypot(...forwardBefore.map((value, axis) => value - forwardAfter[axis]));
+    const pivotCameraMoved = Math.hypot(...positionBefore.map((value, axis) => value - r.camera.position[axis]));
+    const hitLocal = pointer.point.map((value, axis) => value - r.renderOrigin[axis]);
+    const hitDepth = hitLocal.reduce((sum, value, axis) => sum + (value - r.camera.position[axis]) * forwardAfter[axis], 0);
+    const pivotDepthError = Math.abs(hitDepth - r.camera.distance);
+    for (let step = 0; step < 40; step++) r.zoomAt(0.7);
+    const reachedDistance = hitLocal.reduce((sum, value, axis) => sum + (value - r.camera.position[axis]) * forwardAfter[axis], 0);
     r.fit(); r.render(true);
     const saved = JSON.parse(JSON.stringify(r.camera));
     const height = r.canvas.height;
@@ -47,13 +61,52 @@ export async function checkInteraction(page, check) {
     r.canvas.height = height;
     r.resizeDirty = true;
     r.fit(); r.render(true);
-    return { pivotMoved, pivotDrift, orbitDrift, closeDistance, panDifference: Math.hypot(...firstPan.map((value, i) => value - secondPan[i])) };
+    return { pivotMoved, pivotDrift, orbitDrift, closeDistance, pivoted, pivotTurn, pivotCameraMoved, pivotDepthError, reachedDistance,
+      panDifference: Math.hypot(...firstPan.map((value, i) => value - secondPan[i])) };
   });
+  check(navigation.pivoted && navigation.pivotTurn < 1e-9 && navigation.pivotCameraMoved < 1e-9, `a click pivot keeps the camera and its direction (turn ${navigation.pivotTurn.toExponential(1)})`);
+  check(navigation.pivotDepthError < 1e-6, `the pivot sits at the depth of the clicked surface (${navigation.pivotDepthError.toExponential(1)} m off)`);
+  check(navigation.reachedDistance < 0.05, `zooming after a click reaches the depth of the clicked surface (${navigation.reachedDistance.toFixed(3)} m short)`);
   check(navigation.pivotMoved < 1e-9, `zooming out leaves the orbit target where it was (${navigation.pivotMoved.toExponential(1)} m)`);
   check(navigation.pivotDrift < 0.5, `the orbit target holds its place on screen through a zoom (${navigation.pivotDrift.toFixed(3)} px)`);
   check(navigation.orbitDrift < 0.5, `a zoomed-out orbit turns about the target instead of swinging it (${navigation.orbitDrift.toFixed(3)} px)`);
   check(navigation.closeDistance < 0.01, "zoom reaches small details below the old one-centimetre pivot limit");
   check(navigation.panDifference < 1e-9, "pan distance is independent of drawing-buffer resolution");
+  // The right side holds one panel at a time on wide layouts: the edit and session
+  // panels take the inspector's place and give it back when they close.
+  const originalViewport = page.viewportSize();
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.waitForTimeout(100);
+  const panels = await page.evaluate(() => {
+    const { shell } = window.__tessifc;
+    const visible = () => ["inspector", "editor", "session"].filter((name) => shell.panelVisible(name));
+    shell.setPanel("inspector", true);
+    shell.setPanel("editor", true);
+    const editorOnly = visible();
+    shell.setPanel("session", true);
+    const sessionOnly = visible();
+    shell.setPanel("session", false);
+    const inspectorBack = visible();
+    shell.setPanel("editor", true);
+    shell.setPanel("inspector", true);
+    const inspectorWins = visible();
+    // Every right-side panel is the same width, so swapping them leaves the viewport alone.
+    const widths = {};
+    const canvasWidths = {};
+    for (const name of ["inspector", "editor", "session"]) {
+      shell.setPanel(name, true);
+      widths[name] = document.getElementById(name).getBoundingClientRect().width;
+      canvasWidths[name] = document.getElementById("viewport").getBoundingClientRect().width;
+    }
+    shell.setPanel("inspector", true);
+    return { editorOnly, sessionOnly, inspectorBack, inspectorWins, widths, canvasWidths };
+  });
+  check(JSON.stringify(panels.editorOnly) === '["editor"]' && JSON.stringify(panels.sessionOnly) === '["session"]', `an edit or session panel replaces the inspector (${panels.editorOnly}, ${panels.sessionOnly})`);
+  check(JSON.stringify(panels.inspectorBack) === '["inspector"]' && JSON.stringify(panels.inspectorWins) === '["inspector"]', `closing the overlay gives the inspector back (${panels.inspectorBack}, ${panels.inspectorWins})`);
+  const sameWidth = new Set(Object.values(panels.widths)).size === 1 && new Set(Object.values(panels.canvasWidths)).size === 1;
+  check(sameWidth && panels.widths.inspector > 0, `right-side panels share one width and the viewport keeps its size (${JSON.stringify(panels.widths)}, viewport ${JSON.stringify(panels.canvasWidths)})`);
+  await page.setViewportSize(originalViewport);
+  await page.waitForTimeout(100);
   await page.waitForTimeout(150);
   const unchanged = await page.evaluate(() => {
     const r = window.__tessifc.renderer;

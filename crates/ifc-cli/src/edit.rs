@@ -29,7 +29,8 @@ pub(crate) fn run(input: &Path, output: &Path, options: Options<'_>) -> ExitCode
             return ExitCode::from(2);
         }
     };
-    let image = parse(&source, &ParseOptions::default());
+    // An archive is edited as the text inside it and written back as plain IFC.
+    let (image, source) = tessifc_step::open_source(source, &ParseOptions::default());
     let model = Model::new(image);
     let Some(entity) = model.entity(options.id) else {
         eprintln!("IFC entity #{} does not exist", options.id);

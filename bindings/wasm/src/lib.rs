@@ -15,110 +15,23 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-use glam::DVec3;
+#[cfg(feature = "edit")]
+mod edit;
+
 use std::collections::{BTreeMap, BTreeSet};
-use tessifc_engine::pack::{PackState, Packer};
-use tessifc_engine::{Engine, EvaluationResult, Session};
-use tessifc_geom::{Settings as Settings3d, product_category};
+use tessifc_engine::report::{self, GeometryStream, OpenOptions};
+use tessifc_engine::{Engine, EvaluationResult, ProductOutcome, ProductState};
+use tessifc_geom::Settings as Settings3d;
 use tessifc_model::Model;
-use tessifc_pack::StreamPosition;
-use tessifc_step::{
-    AttributeEdit, EditValue, ParseOptions, SchemaId, apply_edits, argument_source,
-    leaf_argument_source, parse,
-};
 use wasm_bindgen::prelude::*;
 
-fn pack_evaluation(schema: &str, result: &EvaluationResult) -> Vec<u8> {
-    let mut packer = Packer::new(schema, result.units.length_to_m, result.model_offset);
-    packer.set_georef(result.georef.clone());
-    for shape in &result.shapes {
-        packer.add_shape_ref(shape);
-    }
-    packer.add_diagnostics(&result.diagnostics);
-    packer.set_stat("products", result.shapes.len() as f64);
-    packer.set_stat("triangles", packer.triangles() as f64);
-    packer.finish()
-}
+#[cfg(feature = "edit")]
+pub(crate) use tessifc_engine::report::diagnostics_json;
+pub(crate) use tessifc_engine::report::{GeometrySettings, effective_settings};
 
-fn pack_evaluation_owned(schema: &str, result: EvaluationResult) -> Vec<u8> {
-    let EvaluationResult {
-        shapes,
-        diagnostics,
-        units,
-        model_offset,
-        georef,
-        ..
-    } = result;
-    let products = shapes.len();
-    let mut packer = Packer::new(schema, units.length_to_m, model_offset);
-    packer.set_georef(georef);
-    for shape in shapes {
-        packer.add_shape(shape);
-    }
-    packer.add_diagnostics(&diagnostics);
-    packer.set_stat("products", products as f64);
-    packer.set_stat("triangles", packer.triangles() as f64);
-    packer.finish()
-}
-
-/// Settings accepted by geometry entry points; unknown fields are ignored.
-#[derive(Default, Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GeometrySettings {
-    #[serde(flatten)]
-    geometry: Settings3d,
-    model_offset: Option<[f64; 3]>,
-    first_geometry_id: Option<u32>,
-}
-
-impl GeometrySettings {
-    fn from_json(text: &str) -> Result<Self, String> {
-        let settings: Self = serde_json::from_str(text)
-            .map_err(|error| format!("invalid geometry settings: {error}"))?;
-        settings
-            .geometry
-            .validate()
-            .map_err(|error| error.to_string())?;
-        // Ids are handed out upwards from here; leave room for a patch's meshes.
-        if settings
-            .first_geometry_id
-            .is_some_and(|first| first > u32::MAX - (1 << 24))
-        {
-            return Err(
-                "invalid geometry settings: firstGeometryId leaves no room for new ids".into(),
-            );
-        }
-        Ok(settings)
-    }
-
-    fn parse(text: Option<String>) -> Result<Self, JsValue> {
-        text.map(|text| Self::from_json(&text))
-            .transpose()
-            .map(|settings| settings.unwrap_or_default())
-            .map_err(|error| JsValue::from_str(&error))
-    }
-}
-
-fn effective_settings(settings: &Settings3d) -> serde_json::Value {
-    serde_json::to_value(settings).expect("validated geometry settings are serialisable")
-}
-
-/// A finite f64 as JSON, since JSON has no NaN and no infinity.
-fn json_number(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value}")
-    } else {
-        "null".into()
-    }
-}
-
-fn json_vector(vector: DVec3) -> String {
-    format!(
-        "[{},{},{}]",
-        json_number(vector.x),
-        json_number(vector.y),
-        json_number(vector.z)
-    )
+/// Geometry settings from the host's JSON, or the JavaScript error naming the field.
+pub(crate) fn parse_geometry_settings(text: Option<String>) -> Result<GeometrySettings, JsValue> {
+    GeometrySettings::parse(text.as_deref()).map_err(|error| JsValue::from_str(&error))
 }
 
 /// Milliseconds on a monotonic-enough clock, for chunk budgets.
@@ -127,12 +40,43 @@ fn now_ms() -> f64 {
     js_sys::Date::now()
 }
 
+/// An engine whose time budget runs on the host clock, since the module has none.
+fn engine_for(settings: Settings3d) -> Engine {
+    Engine::with_settings(settings).with_clock(std::sync::Arc::new(now_ms))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn now_ms() -> f64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Sub-millisecond time for stage reports: `performance.now()` where the host has it.
+#[cfg(all(feature = "edit", target_arch = "wasm32"))]
+fn precise_now_ms() -> f64 {
+    use std::cell::OnceCell;
+    thread_local! {
+        static CLOCK: OnceCell<Option<(js_sys::Object, js_sys::Function)>> = const { OnceCell::new() };
+    }
+    CLOCK.with(|clock| {
+        let clock = clock.get_or_init(|| {
+            let performance =
+                js_sys::Reflect::get(&js_sys::global(), &"performance".into()).ok()?;
+            let now = js_sys::Reflect::get(&performance, &"now".into()).ok()?;
+            Some((performance.dyn_into().ok()?, now.dyn_into().ok()?))
+        });
+        clock
+            .as_ref()
+            .and_then(|(performance, now)| now.call0(performance).ok()?.as_f64())
+            .unwrap_or_else(js_sys::Date::now)
+    })
+}
+
+#[cfg(all(feature = "edit", not(target_arch = "wasm32")))]
+fn precise_now_ms() -> f64 {
+    now_ms()
 }
 
 /// Version of the TessIFC crates this module was built from.
@@ -148,56 +92,63 @@ pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-/// Settings accepted by [`Kernel::open_model`], as JSON; unknown fields are ignored.
-///
-/// Kept per model, so an edit reparses the file exactly as it was opened.
-#[derive(Clone, Default)]
-struct OpenOptions {
-    schema_override: Option<SchemaId>,
-    max_entities: Option<usize>,
-}
-
-impl OpenOptions {
-    /// The two fields the kernel understands; malformed JSON or an unknown schema name is an error.
-    fn from_json(text: &str) -> Result<OpenOptions, String> {
-        let value: serde_json::Value = serde_json::from_str(text)
-            .map_err(|error| format!("invalid open settings: {error}"))?;
-        let mut options = OpenOptions::default();
-        if let Some(name) = value.get("schemaOverride") {
-            let name = name
-                .as_str()
-                .ok_or("invalid open settings: schemaOverride must be a string")?;
-            options.schema_override = Some(
-                SchemaId::detect(name)
-                    .map(|(id, _)| id)
-                    .ok_or_else(|| format!("invalid open settings: unknown schema {name}"))?,
-            );
-        }
-        if let Some(max) = value.get("maxEntities") {
-            let max = max
-                .as_u64()
-                .ok_or("invalid open settings: maxEntities must be a non-negative integer")?;
-            options.max_entities = Some(usize::try_from(max).unwrap_or(usize::MAX));
-        }
-        Ok(options)
+/// A coarse level of a mesh: the triangles that survive a quadric
+/// simplification to about a quarter, as indices over the same `positions`
+/// (three f32 per vertex), or `undefined` when the mesh is too small, the
+/// input invalid, or too little could go within the tolerance. `settings` is
+/// JSON with `chordToleranceM` (the kernel's default when absent) and
+/// `level` (1 or 2, 2 being four times the tolerance); the tolerance is the
+/// larger of twice the chord tolerance and a 256th of the mesh's diagonal,
+/// the same rule the kernel's `lodLevels` setting applies when it packs.
+#[wasm_bindgen(js_name = simplifyMesh)]
+pub fn simplify_mesh(
+    positions: &[f32],
+    indices: &[u32],
+    settings: Option<String>,
+) -> Result<Option<Vec<u32>>, JsValue> {
+    let value: serde_json::Value = match settings {
+        Some(text) => serde_json::from_str(&text)
+            .map_err(|error| JsValue::from_str(&format!("invalid simplify settings: {error}")))?,
+        None => serde_json::Value::Null,
+    };
+    let chord = value
+        .get("chordToleranceM")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(Settings3d::default().chord_tolerance_m);
+    let level = value
+        .get("level")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if !(chord > 0.0 && chord.is_finite() && (1..=2).contains(&level)) {
+        return Err(JsValue::from_str(
+            "invalid simplify settings: chordToleranceM must be positive and level 1 or 2",
+        ));
     }
-
-    fn parse_options(&self) -> ParseOptions {
-        let defaults = ParseOptions::default();
-        ParseOptions {
-            schema_override: self.schema_override,
-            max_entities: self.max_entities.unwrap_or(defaults.max_entities),
-            ..defaults
+    if indices.len() < tessifc_mesh::LOD_MIN_TRIANGLES * 3 || !positions.len().is_multiple_of(3) {
+        return Ok(None);
+    }
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for vertex in positions.chunks_exact(3) {
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(vertex[axis]);
+            hi[axis] = hi[axis].max(vertex[axis]);
         }
     }
-}
-
-/// A geometry stream in progress for one model.
-struct Stream {
-    diagnostic_counts: [usize; 3],
-    session: Session,
-    state: PackState,
-    chunk: u32,
+    let diagonal = (0..3)
+        .map(|axis| ((hi[axis] - lo[axis]) as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let tolerance = (2.0 * chord).max(diagonal / 256.0) * if level == 2 { 4.0 } else { 1.0 };
+    if tolerance.is_nan() || tolerance <= 0.0 || !tolerance.is_finite() {
+        return Ok(None);
+    }
+    let options = tessifc_mesh::DecimateOptions {
+        target_ratio: tessifc_mesh::LOD_TARGET_RATIO,
+        tolerance,
+        max_triangles: tessifc_mesh::MAX_DECIMATE_TRIANGLES,
+    };
+    Ok(tessifc_mesh::decimate_f32(positions, indices, &options))
 }
 
 /// A TessIFC instance holding open models.
@@ -208,11 +159,14 @@ pub struct Kernel {
     sources: BTreeMap<u32, Vec<u8>>,
     /// What each model was opened with.
     options: BTreeMap<u32, OpenOptions>,
+    #[cfg(feature = "edit")]
+    edit: edit::EditState,
+    published_outcomes: BTreeMap<u32, Vec<ProductOutcome>>,
     next_id: u32,
     /// The last evaluation per model, so geometry can be read in pieces.
     geometry: BTreeMap<u32, EvaluationResult>,
     /// Geometry streams in progress, or finished and kept for the hierarchy.
-    streams: BTreeMap<u32, Stream>,
+    streams: BTreeMap<u32, GeometryStream>,
 }
 
 impl Default for Kernel {
@@ -231,6 +185,9 @@ impl Kernel {
             models: BTreeMap::new(),
             options: BTreeMap::new(),
             sources: BTreeMap::new(),
+            #[cfg(feature = "edit")]
+            edit: edit::EditState::new(),
+            published_outcomes: BTreeMap::new(),
             next_id: 1,
             geometry: BTreeMap::new(),
             streams: BTreeMap::new(),
@@ -243,15 +200,12 @@ impl Kernel {
     /// `settings` throw.
     #[wasm_bindgen(js_name = openModel)]
     pub fn open_model(&mut self, bytes: Vec<u8>, settings: Option<String>) -> Result<u32, JsValue> {
-        let options = settings
-            .as_deref()
-            .map(OpenOptions::from_json)
-            .transpose()
-            .map_err(|error| JsValue::from_str(&error))?
-            .unwrap_or_default();
+        let options =
+            OpenOptions::parse(settings.as_deref()).map_err(|error| JsValue::from_str(&error))?;
 
-        let source = bytes;
-        let model = Model::new(parse(&source, &options.parse_options()));
+        // An archive is kept as the text inside it, so edits and exports are plain IFC.
+        let (image, source) = tessifc_step::open_source(bytes, &options.parse_options());
+        let model = Model::new(image);
         // Skip live ids so a wrapped counter cannot rebind another caller's model.
         let mut id = self.next_id;
         while self.models.contains_key(&id) {
@@ -264,6 +218,8 @@ impl Kernel {
         self.models.insert(id, model);
         self.sources.insert(id, source);
         self.options.insert(id, options);
+        #[cfg(feature = "edit")]
+        self.edit.open(id);
         Ok(id)
     }
 
@@ -272,106 +228,52 @@ impl Kernel {
     pub fn get_model_info(&self, model_id: u32) -> Option<String> {
         let model = self.models.get(&model_id)?;
         let source_bytes = self.sources.get(&model_id).map_or(0, Vec::len);
-        let image = model.image();
-        let schema = model.schema();
-        let product = schema.class_by_name("IfcProduct");
-
-        let mut products = serde_json::Map::new();
-        let mut classes = serde_json::Map::new();
-        let mut product_total = 0u64;
-        for (class_id, count) in image.populated_classes() {
-            if class_id == tessifc_step::CLASS_UNKNOWN {
-                continue;
-            }
-            let name = schema.class(class_id).name;
-            classes.insert(name.to_string(), serde_json::json!(count));
-            if let Some(product) = product
-                && schema.is_a(class_id, product)
-            {
-                products.insert(name.to_string(), serde_json::json!(count));
-                product_total += count as u64;
-            }
-        }
-
-        let report = serde_json::json!({
-            "schema": image.schema.as_str(),
-            "schemaDeclared": image.header.schema_identifiers,
-            "schemaApproximate": image.schema_approximate,
-            "bytes": image.source_len,
-            "entities": image.len(),
-            "products": products,
-            "productTotal": product_total,
-            "classes": classes,
-            "imageBytes": image.memory_bytes(),
-            "sourceRetainedBytes": source_bytes,
-            "diagnostics": {
-                "total": image.diagnostics.total(),
-                "errors": image.diagnostics.count_of(tessifc_step::Severity::Error),
-                "warnings": image.diagnostics.count_of(tessifc_step::Severity::Warning),
-            },
-            "header": {
-                "name": image.header.name,
-                "timeStamp": image.header.time_stamp,
-                "preprocessorVersion": image.header.preprocessor_version,
-                "originatingSystem": image.header.originating_system,
-                "author": image.header.author,
-                "organization": image.header.organization,
-                "description": image.header.description,
-            },
-        });
-        Some(report.to_string())
+        Some(report::model_info(model, source_bytes).to_string())
     }
 
     /// Parse diagnostics as JSON. Geometry diagnostics are carried by IGP packs.
     #[wasm_bindgen(js_name = getDiagnostics)]
     pub fn get_diagnostics(&self, model_id: u32) -> Option<String> {
         let model = self.models.get(&model_id)?;
-        let items: Vec<_> = model
-            .image()
-            .diagnostics
-            .items()
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "code": d.code.as_str(),
-                    "severity": d.severity.as_str(),
-                    "line": d.line,
-                    "expressId": d.express_id,
-                    "message": d.message,
-                })
-            })
-            .collect();
-        Some(serde_json::Value::Array(items).to_string())
+        Some(report::parse_diagnostics(model).to_string())
     }
 
     /// The class name of one instance, or `null`.
     #[wasm_bindgen(js_name = getClassName)]
     pub fn get_class_name(&self, model_id: u32, express_id: u32) -> Option<String> {
-        let model = self.models.get(&model_id)?;
-        model.entity(express_id)?;
-        Some(model.image().class_name_of(express_id))
+        report::class_name(self.models.get(&model_id)?, express_id)
     }
 
     /// The product category: physical, space, opening, annotation or reference.
     #[wasm_bindgen(js_name = getProductCategory)]
     pub fn get_product_category(&self, model_id: u32, express_id: u32) -> Option<String> {
-        let model = self.models.get(&model_id)?;
-        let entity = model.entity(express_id)?;
-        entity
-            .is_a("IfcProduct")
-            .then(|| product_category(entity).as_str().to_owned())
+        report::product_category_name(self.models.get(&model_id)?, express_id)
     }
 
     /// Express ids of every instance of a class or its subtypes.
     #[wasm_bindgen(js_name = getIdsOfType)]
     pub fn get_ids_of_type(&self, model_id: u32, class_name: &str) -> Vec<u32> {
-        let Some(model) = self.models.get(&model_id) else {
-            return Vec::new();
-        };
-        let Some(class) = model.schema().class_by_name(class_name) else {
-            return Vec::new();
-        };
-        model.image().ids_of_type(class).collect()
+        self.models
+            .get(&model_id)
+            .map(|model| report::ids_of_type(model, class_name))
+            .unwrap_or_default()
+    }
+
+    /// The schema definition of a class as JSON: `abstract` and `attributes` in
+    /// STEP argument order with `name`, `type`, `base`, `aggDepth`, `optional`
+    /// and `derived`; `null` for a class the model's schema does not define.
+    #[wasm_bindgen(js_name = getClassAttributes)]
+    pub fn get_class_attributes(&self, model_id: u32, class_name: &str) -> Option<String> {
+        report::class_attributes(self.models.get(&model_id)?, class_name)
+            .map(|value| value.to_string())
+    }
+
+    /// The class and its supertypes up to the root, as a JSON array of names;
+    /// `undefined` for an unknown model or a class outside its schema.
+    #[wasm_bindgen(js_name = getClassSupertypes)]
+    pub fn get_class_supertypes(&self, model_id: u32, class_name: &str) -> Option<String> {
+        report::class_supertypes(self.models.get(&model_id)?, class_name)
+            .map(|value| value.to_string())
     }
 
     /// The rendered building hierarchy as a flat JSON node list of products and
@@ -379,60 +281,8 @@ impl Kernel {
     #[wasm_bindgen(js_name = getSpatialHierarchy)]
     pub fn get_spatial_hierarchy(&self, model_id: u32) -> Option<String> {
         let model = self.models.get(&model_id)?;
-        let rendered: Option<BTreeSet<u32>> =
-            match (self.geometry.get(&model_id), self.streams.get(&model_id)) {
-                (Some(result), _) => {
-                    Some(result.shapes.iter().map(|shape| shape.express_id).collect())
-                }
-                (None, Some(stream)) => Some(stream.session.emitted().iter().copied().collect()),
-                (None, None) => None,
-            };
-
-        let mut included = match &rendered {
-            Some(rendered) => rendered.clone(),
-            None => model
-                .entities_of_type("IfcProduct")
-                .map(|entity| entity.id())
-                .collect(),
-        };
-        let mut pending: Vec<u32> = included.iter().copied().collect();
-        while let Some(express_id) = pending.pop() {
-            let parents = model
-                .spatial_containers_of(express_id)
-                .iter()
-                .chain(model.aggregate_parents_of(express_id));
-            for &parent in parents {
-                if included.insert(parent) {
-                    pending.push(parent);
-                }
-            }
-        }
-
-        let nodes: Vec<_> = included
-            .iter()
-            .filter_map(|&express_id| {
-                let entity = model.entity(express_id)?;
-                let parent = model
-                    .spatial_containers_of(express_id)
-                    .first()
-                    .or_else(|| model.aggregate_parents_of(express_id).first())
-                    .copied()
-                    .filter(|candidate| included.contains(candidate));
-                let name = entity
-                    .attr("Name")
-                    .as_string()
-                    .filter(|value| !value.trim().is_empty());
-                Some(serde_json::json!({
-                    "expressId": express_id,
-                    "class": entity.class_name(),
-                    "name": name,
-                    "parentExpressId": parent,
-                    "rendered": rendered.as_ref().is_none_or(|set| set.contains(&express_id)),
-                }))
-            })
-            .collect();
-
-        Some(serde_json::json!({ "nodes": nodes }).to_string())
+        let rendered = self.rendered_products(model_id);
+        Some(report::spatial_hierarchy(model, rendered.as_ref()).to_string())
     }
 
     /// Source-level attributes for one entity, as JSON; `raw` is the exact STEP
@@ -441,233 +291,28 @@ impl Kernel {
     pub fn get_entity_info(&self, model_id: u32, express_id: u32) -> Option<String> {
         let model = self.models.get(&model_id)?;
         let source = self.sources.get(&model_id)?;
-        let entity = model.entity(express_id)?;
-        let class = entity.class_name();
-        let mut fields = Vec::new();
-
-        if entity.is_complex() {
-            for leaf in entity.leaves() {
-                let definition = model.schema().class(leaf);
-                let parent_count = definition
-                    .parent
-                    .map(|parent| model.schema().arity(parent))
-                    .unwrap_or(0);
-                for (local_index, attribute) in
-                    definition.attrs.iter().skip(parent_count).enumerate()
-                {
-                    let raw = leaf_argument_source(
-                        source,
-                        model.image(),
-                        express_id,
-                        definition.name,
-                        local_index,
-                    )
-                    .ok()
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                    .unwrap_or_default();
-                    fields.push(serde_json::json!({
-                        "name": attribute.name,
-                        "index": local_index,
-                        "leaf": definition.name,
-                        "type": attribute.type_name,
-                        "kind": format!("{:?}", attribute.base).to_ascii_lowercase(),
-                        "optional": attribute.optional,
-                        "raw": raw,
-                        "value": entity.attr(attribute.name).as_string(),
-                    }));
-                }
-            }
-            return Some(
-                serde_json::json!({
-                    "expressId": express_id,
-                    "class": class,
-                    "complex": true,
-                    "fields": fields,
-                })
-                .to_string(),
-            );
-        }
-
-        for index in 0..entity.arity() {
-            let definition = model.schema().attr(entity.class(), index);
-            let name = definition
-                .map(|attribute| attribute.name.to_owned())
-                .unwrap_or_else(|| format!("Argument {index}"));
-            let type_name = definition.map_or("unknown", |attribute| attribute.type_name);
-            let kind = definition
-                .map(|attribute| format!("{:?}", attribute.base).to_ascii_lowercase())
-                .unwrap_or_else(|| "unknown".to_owned());
-            let raw = argument_source(source, model.image(), express_id, index)
-                .ok()
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                .unwrap_or_default();
-            let value = entity.attr_at(index).as_string();
-            fields.push(serde_json::json!({
-                "name": name,
-                "index": index,
-                "type": type_name,
-                "kind": kind,
-                "optional": definition.is_some_and(|attribute| attribute.optional),
-                "raw": raw,
-                "value": value,
-            }));
-        }
-
-        Some(
-            serde_json::json!({
-                "expressId": express_id,
-                "class": class,
-                "complex": false,
-                "fields": fields,
-            })
-            .to_string(),
-        )
-    }
-
-    /// Replace one named IFC attribute and reparse; `raw` passes a complete STEP value.
-    #[wasm_bindgen(js_name = setAttribute)]
-    pub fn set_attribute(
-        &mut self,
-        model_id: u32,
-        express_id: u32,
-        attribute: &str,
-        value: &str,
-        raw: bool,
-    ) -> Result<String, JsValue> {
-        let index = {
-            let model = self
-                .models
-                .get(&model_id)
-                .ok_or_else(|| JsValue::from_str("model is not open"))?;
-            let entity = model
-                .entity(express_id)
-                .ok_or_else(|| JsValue::from_str("IFC entity does not exist"))?;
-            entity
-                .attribute_location(attribute)
-                .ok_or_else(|| JsValue::from_str("the entity has no attribute with that name"))?
-        };
-        self.replace_argument(
-            model_id,
-            express_id,
-            index.argument_index,
-            index.leaf_class.map(str::to_owned),
-            value,
-            raw,
-        )?;
-        self.get_entity_info(model_id, express_id)
-            .ok_or_else(|| JsValue::from_str("edited entity could not be read back"))
-    }
-
-    /// Replace several named attributes with one source rewrite and one reparse;
-    /// `edits` is a JSON array of `{ "attribute", "value", "raw" }` objects.
-    #[wasm_bindgen(js_name = setAttributes)]
-    pub fn set_attributes(
-        &mut self,
-        model_id: u32,
-        express_id: u32,
-        edits: &str,
-    ) -> Result<String, JsValue> {
-        let requests = serde_json::from_str::<serde_json::Value>(edits)
-            .map_err(|_| JsValue::from_str("edits must be a JSON array"))?;
-        let requests = requests
-            .as_array()
-            .ok_or_else(|| JsValue::from_str("edits must be a JSON array"))?;
-        if requests.is_empty() {
-            return self
-                .get_entity_info(model_id, express_id)
-                .ok_or_else(|| JsValue::from_str("IFC entity does not exist"));
-        }
-
-        let replacements = {
-            let model = self
-                .models
-                .get(&model_id)
-                .ok_or_else(|| JsValue::from_str("model is not open"))?;
-            let entity = model
-                .entity(express_id)
-                .ok_or_else(|| JsValue::from_str("IFC entity does not exist"))?;
-            let mut replacements = Vec::with_capacity(requests.len());
-            for request in requests {
-                let attribute = request
-                    .get("attribute")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| JsValue::from_str("every edit needs an attribute name"))?;
-                let value = request
-                    .get("value")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| JsValue::from_str("every edit needs a string value"))?;
-                let location = entity
-                    .attribute_location(attribute)
-                    .ok_or_else(|| JsValue::from_str("the entity has no requested attribute"))?;
-                let value = if request
-                    .get("raw")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    EditValue::Raw(value.to_owned())
-                } else {
-                    EditValue::String(value.to_owned())
-                };
-                replacements.push(AttributeEdit {
-                    express_id,
-                    argument_index: location.argument_index,
-                    leaf_class: location.leaf_class.map(str::to_owned),
-                    value,
-                });
-            }
-            replacements
-        };
-
-        self.replace_edits(model_id, &replacements)?;
-        self.get_entity_info(model_id, express_id)
-            .ok_or_else(|| JsValue::from_str("edited entity could not be read back"))
-    }
-
-    /// Replace one argument by its zero-based STEP position, for vendor extension classes.
-    #[wasm_bindgen(js_name = setArgument)]
-    pub fn set_argument(
-        &mut self,
-        model_id: u32,
-        express_id: u32,
-        argument: usize,
-        value: &str,
-        raw: bool,
-    ) -> Result<String, JsValue> {
-        self.replace_argument(model_id, express_id, argument, None, value, raw)?;
-        self.get_entity_info(model_id, express_id)
-            .ok_or_else(|| JsValue::from_str("edited entity could not be read back"))
-    }
-
-    /// The current IFC source, including every accepted edit.
-    #[wasm_bindgen(js_name = exportModel)]
-    pub fn export_model(&self, model_id: u32) -> Option<Vec<u8>> {
-        self.sources.get(&model_id).cloned()
+        report::entity_info(model, source, express_id).map(|value| value.to_string())
     }
 
     /// Every schema entity and its direct or inherited evaluator routes, as JSON.
     #[wasm_bindgen(js_name = getGeometryCapabilities)]
     pub fn get_geometry_capabilities(&self, model_id: u32) -> Option<String> {
-        let model = self.models.get(&model_id)?;
-        serde_json::to_string(&tessifc_geom::Registry::shared(model.image().schema).inventory())
-            .ok()
+        report::geometry_capabilities(self.models.get(&model_id)?)
     }
 
     /// Per-product evaluation outcomes; emitted products may still have diagnostics.
     #[wasm_bindgen(js_name = getProductOutcomes)]
     pub fn get_product_outcomes(&self, model_id: u32) -> Option<String> {
-        let model = self.models.get(&model_id)?;
-        let outcomes = if let Some(stream) = self.streams.get(&model_id) {
-            stream.session.outcomes(model)
-        } else {
-            let result = self.geometry.get(&model_id)?;
-            Engine::with_settings(result.settings.clone()).outcomes(model, result)
-        };
+        let outcomes = self.current_product_outcomes(model_id)?;
         serde_json::to_string(&outcomes).ok()
     }
 
     /// Stop and release a geometry stream while keeping the parsed model open.
     #[wasm_bindgen(js_name = cancelGeometryStream)]
     pub fn cancel_geometry_stream(&mut self, model_id: u32) -> bool {
+        if let Some(outcomes) = self.current_product_outcomes(model_id) {
+            self.published_outcomes.insert(model_id, outcomes);
+        }
         self.streams.remove(&model_id).is_some()
     }
 
@@ -682,50 +327,23 @@ impl Kernel {
         let Some(model) = self.models.get(&model_id) else {
             return Ok(None);
         };
-        let settings = GeometrySettings::parse(settings)?.geometry;
+        let settings = parse_geometry_settings(settings)?.geometry;
         let effective = effective_settings(&settings);
 
-        let result = Engine::with_settings(settings).evaluate(model);
-        let diagnostic_infos = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == tessifc_step::Severity::Info)
-            .count();
-        let diagnostic_warnings = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == tessifc_step::Severity::Warning)
-            .count();
-        let diagnostic_errors = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == tessifc_step::Severity::Error)
-            .count();
-        let mut summary = String::from("{\"products\":");
-        summary.push_str(&result.shapes.len().to_string());
-        summary.push_str(",\"triangles\":");
-        summary.push_str(&result.triangles().to_string());
-        summary.push_str(",\"productsConsidered\":");
-        summary.push_str(&result.products_considered.to_string());
-        summary.push_str(",\"productsFiltered\":");
-        summary.push_str(&result.products_filtered.to_string());
-        summary.push_str(",\"lengthScaleToM\":");
-        summary.push_str(&json_number(result.units.length_to_m));
-        summary.push_str(",\"modelOffset\":");
-        summary.push_str(&json_vector(result.model_offset));
-        summary.push_str(",\"diagnostics\":");
-        summary.push_str(&result.diagnostics.len().to_string());
-        summary.push_str(",\"diagnosticInfos\":");
-        summary.push_str(&diagnostic_infos.to_string());
-        summary.push_str(",\"diagnosticWarnings\":");
-        summary.push_str(&diagnostic_warnings.to_string());
-        summary.push_str(",\"diagnosticErrors\":");
-        summary.push_str(&diagnostic_errors.to_string());
-        summary.push_str(",\"effectiveSettings\":");
-        summary.push_str(&effective.to_string());
-        summary.push('}');
+        let result = engine_for(settings).evaluate(model);
+        let summary = report::evaluation_summary(&result, &effective);
 
         self.streams.remove(&model_id);
+        #[cfg(feature = "edit")]
+        self.edit.set_basis(
+            model_id,
+            effective_settings(&result.settings),
+            result.model_offset,
+        );
+        self.published_outcomes.insert(
+            model_id,
+            Engine::with_settings(result.settings.clone()).outcomes(model, &result),
+        );
         self.geometry.insert(model_id, result);
         Ok(Some(summary))
     }
@@ -741,32 +359,15 @@ impl Kernel {
         let Some(model) = self.models.get(&model_id) else {
             return Ok(None);
         };
-        let settings = GeometrySettings::parse(settings)?.geometry;
+        let settings = parse_geometry_settings(settings)?.geometry;
         let effective = effective_settings(&settings);
-        let session = Engine::with_settings(settings).session(model);
-        let summary = format!(
-            "{{\"products\":{},\"productsConsidered\":{},\"productsFiltered\":{},\
-             \"lengthScaleToM\":{},\"modelOffset\":{}}}",
-            session.total(),
-            session.products_considered(),
-            session.products_filtered(),
-            json_number(session.units().length_to_m),
-            json_vector(session.model_offset()),
-        );
-        let mut summary: serde_json::Value =
-            serde_json::from_str(&summary).expect("finite geometry summary");
-        summary["effectiveSettings"] = effective;
-        let summary = summary.to_string();
+        let session = engine_for(settings).session(model);
+        #[cfg(feature = "edit")]
+        self.edit
+            .set_basis(model_id, effective.clone(), session.model_offset());
+        let summary = report::stream_summary(&session, effective).to_string();
         self.geometry.remove(&model_id);
-        self.streams.insert(
-            model_id,
-            Stream {
-                diagnostic_counts: [0; 3],
-                session,
-                state: PackState::default(),
-                chunk: 0,
-            },
-        );
+        self.streams.insert(model_id, GeometryStream::new(session));
         Ok(Some(summary))
     }
 
@@ -782,135 +383,18 @@ impl Kernel {
     ) -> Option<Vec<u8>> {
         let model = self.models.get(&model_id)?;
         let stream = self.streams.get_mut(&model_id)?;
-        if stream.session.is_finished() && stream.chunk > 0 {
-            return None;
-        }
         let started = now_ms();
-        let batch = stream.session.next(model, |progress| {
+        stream.next_chunk(model, |progress| {
             (budget_ms > 0.0 && now_ms() - started >= budget_ms)
                 || (max_products > 0 && progress.products >= max_products as usize)
                 || (max_triangles > 0 && progress.triangles >= max_triangles as usize)
-        });
-        let session = &stream.session;
-        let mut packer = Packer::continue_stream(
-            model.image().schema.as_str(),
-            session.units().length_to_m,
-            session.model_offset(),
-            std::mem::take(&mut stream.state),
-        );
-        packer.set_georef(session.georef().map(str::to_string));
-        packer.set_stream(StreamPosition {
-            chunk: stream.chunk,
-            is_final: batch.is_final,
-            products_done: session.done(),
-            products_total: session.total(),
-        });
-        for shape in batch.shapes {
-            packer.add_shape(shape);
-        }
-        for diagnostic in &batch.diagnostics {
-            let index = match diagnostic.severity {
-                tessifc_step::Severity::Info => 0,
-                tessifc_step::Severity::Warning => 1,
-                tessifc_step::Severity::Error => 2,
-            };
-            stream.diagnostic_counts[index] += 1;
-        }
-        packer.add_diagnostics(&batch.diagnostics);
-        if batch.is_final {
-            packer.set_stat("products", session.emitted().len() as f64);
-            packer.set_stat("triangles", session.triangles() as f64);
-        }
-        let (bytes, state) = packer.finish_chunk();
-        stream.state = state;
-        stream.chunk += 1;
-        Some(bytes)
+        })
     }
 
     /// How far a stream has come, as JSON, or `null` if there is none.
     #[wasm_bindgen(js_name = streamProgress)]
     pub fn stream_progress(&self, model_id: u32) -> Option<String> {
-        let stream = self.streams.get(&model_id)?;
-        Some(serde_json::json!({
-            "done":stream.session.done(),"total":stream.session.total(),"emitted":stream.session.emitted().len(),
-            "triangles":stream.session.triangles(),"chunks":stream.chunk,
-            "finished":stream.session.is_finished() && stream.chunk > 0,
-            "diagnostics":stream.diagnostic_counts.iter().sum::<usize>(),
-            "diagnosticInfos":stream.diagnostic_counts[0],"diagnosticWarnings":stream.diagnostic_counts[1],"diagnosticErrors":stream.diagnostic_counts[2],
-        }).to_string())
-    }
-
-    /// Re-evaluate a few products into one self-contained IGP chunk for patching
-    /// a pack; `options` adds `modelOffset` and `firstGeometryId`. `null` if unknown.
-    #[wasm_bindgen(js_name = evaluateProducts)]
-    pub fn evaluate_products(
-        &self,
-        model_id: u32,
-        express_ids: &[u32],
-        options: Option<String>,
-    ) -> Result<Option<Vec<u8>>, JsValue> {
-        let Some(model) = self.models.get(&model_id) else {
-            return Ok(None);
-        };
-        let options = GeometrySettings::parse(options)?;
-        let settings = options.geometry.clone();
-        let mut session = Engine::with_settings(settings).session(model);
-        session.restrict(express_ids);
-        if let Some(offset) = options.model_offset {
-            session.set_model_offset(DVec3::from_array(offset));
-        }
-        let total = session.total();
-        let batch = if total > 0 {
-            session.next(model, |_| false)
-        } else {
-            tessifc_engine::Batch {
-                shapes: Vec::new(),
-                diagnostics: Vec::new(),
-                is_final: true,
-                timings: Default::default(),
-            }
-        };
-        let state = PackState {
-            stream: tessifc_pack::StreamState {
-                known: Default::default(),
-                next_geometry_id: options.first_geometry_id.unwrap_or(0),
-            },
-            shared: Default::default(),
-        };
-        let mut packer = Packer::continue_stream(
-            model.image().schema.as_str(),
-            session.units().length_to_m,
-            session.model_offset(),
-            state,
-        );
-        packer.set_georef(session.georef().map(str::to_string));
-        packer.set_stream(StreamPosition {
-            chunk: 0,
-            is_final: true,
-            products_done: total,
-            products_total: total,
-        });
-        for shape in batch.shapes {
-            // Baked, so the patch never refers to family meshes the pack may lack.
-            let baked: Vec<_> = shape
-                .parts
-                .into_iter()
-                .map(|part| tessifc_engine::ShapePart {
-                    geometry: tessifc_engine::PartGeometry::Unique(part.mesh()),
-                    color: part.color,
-                    provenance: part.provenance.clone(),
-                })
-                .collect();
-            packer.add_shape(tessifc_engine::Shape {
-                express_id: shape.express_id,
-                class: shape.class,
-                category: shape.category,
-                color: shape.color,
-                parts: baked,
-            });
-        }
-        packer.add_diagnostics(&batch.diagnostics);
-        Ok(Some(packer.finish()))
+        Some(self.streams.get(&model_id)?.progress().to_string())
     }
 
     /// How many shapes the last evaluation produced. `0` if there was none.
@@ -985,6 +469,19 @@ impl Kernel {
         )
     }
 
+    /// Texture coordinates of shape `index` as f32 pairs, one per vertex of
+    /// `shapePositions` for the same `part`; `None` when the part carries none
+    /// or when `part` is omitted, since merged parts do not share a mapping.
+    #[wasm_bindgen(js_name = shapeUv)]
+    pub fn shape_uv(&self, model_id: u32, index: usize, part: Option<usize>) -> Option<Vec<f32>> {
+        let shape = self.geometry.get(&model_id)?.shapes.get(index)?;
+        let mesh = shape.parts.get(part?)?.geometry.local_mesh();
+        if !mesh.has_uvs() {
+            return None;
+        }
+        Some(mesh.uvs.iter().flat_map(|uv| [uv[0], uv[1]]).collect())
+    }
+
     /// Triangle indices of shape `index`; `part` selects one coloured part, omitted merges them.
     #[wasm_bindgen(js_name = shapeIndices)]
     pub fn shape_indices(
@@ -1005,7 +502,10 @@ impl Kernel {
     pub fn get_pack(&self, model_id: u32) -> Option<Vec<u8>> {
         let model = self.models.get(&model_id)?;
         let result = self.geometry.get(&model_id)?;
-        Some(pack_evaluation(model.image().schema.as_str(), result))
+        Some(report::pack_evaluation(
+            model.image().schema.as_str(),
+            result,
+        ))
     }
 
     /// The whole evaluation as one IGP v0 pack, releasing the geometry without cloning it.
@@ -1019,12 +519,15 @@ impl Kernel {
             .as_str()
             .to_owned();
         let result = self.geometry.remove(&model_id)?;
-        Some(pack_evaluation_owned(&schema, result))
+        Some(report::pack_evaluation_owned(&schema, result))
     }
 
     /// Drop the geometry for a model, keeping the model itself open.
     #[wasm_bindgen(js_name = releaseGeometry)]
     pub fn release_geometry(&mut self, model_id: u32) -> bool {
+        if let Some(outcomes) = self.current_product_outcomes(model_id) {
+            self.published_outcomes.insert(model_id, outcomes);
+        }
         self.streams.remove(&model_id);
         self.geometry.remove(&model_id).is_some()
     }
@@ -1032,6 +535,9 @@ impl Kernel {
     /// Close a model and free it. `false` if the id was not open.
     #[wasm_bindgen(js_name = closeModel)]
     pub fn close_model(&mut self, model_id: u32) -> bool {
+        #[cfg(feature = "edit")]
+        self.edit.close(model_id);
+        self.published_outcomes.remove(&model_id);
         self.geometry.remove(&model_id);
         self.streams.remove(&model_id);
         self.sources.remove(&model_id);
@@ -1048,6 +554,9 @@ impl Kernel {
     /// Close every open model.
     #[wasm_bindgen(js_name = closeAll)]
     pub fn close_all(&mut self) {
+        #[cfg(feature = "edit")]
+        self.edit.close_all();
+        self.published_outcomes.clear();
         self.geometry.clear();
         self.streams.clear();
         self.sources.clear();
@@ -1057,73 +566,31 @@ impl Kernel {
 }
 
 impl Kernel {
-    fn replace_argument(
-        &mut self,
-        model_id: u32,
-        express_id: u32,
-        argument: usize,
-        leaf_class: Option<String>,
-        value: &str,
-        raw: bool,
-    ) -> Result<(), JsValue> {
-        let replacement = if raw {
-            EditValue::Raw(value.to_owned())
+    fn current_product_outcomes(&self, model_id: u32) -> Option<Vec<ProductOutcome>> {
+        let model = self.models.get(&model_id)?;
+        if let Some(stream) = self.streams.get(&model_id) {
+            Some(stream.session().outcomes(model))
+        } else if let Some(result) = self.geometry.get(&model_id) {
+            Some(Engine::with_settings(result.settings.clone()).outcomes(model, result))
         } else {
-            EditValue::String(value.to_owned())
-        };
-        self.replace_edits(
-            model_id,
-            &[AttributeEdit {
-                express_id,
-                argument_index: argument,
-                leaf_class,
-                value: replacement,
-            }],
-        )
+            self.published_outcomes.get(&model_id).cloned()
+        }
     }
 
-    fn replace_edits(
-        &mut self,
-        model_id: u32,
-        replacements: &[AttributeEdit],
-    ) -> Result<(), JsValue> {
-        let source = self
-            .sources
-            .get(&model_id)
-            .ok_or_else(|| JsValue::from_str("model source is not retained"))?;
-        let model = self
-            .models
-            .get(&model_id)
-            .ok_or_else(|| JsValue::from_str("model is not open"))?;
-        let edited = apply_edits(source, model.image(), replacements)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        // Reparsed the way it was opened, or a limited or overridden model would not verify.
-        let options = self
-            .options
-            .get(&model_id)
-            .cloned()
-            .unwrap_or_default()
-            .parse_options();
-        let reparsed = Model::new(parse(&edited, &options));
-        if reparsed.len() != model.len()
-            || replacements
-                .iter()
-                .any(|edit| reparsed.entity(edit.express_id).is_none())
-        {
-            return Err(JsValue::from_str(
-                "edited IFC failed structural verification; the edit was not applied",
-            ));
+    /// The products that produced geometry, from the evaluation, the stream or
+    /// the outcomes kept after either was released; `None` before any of them.
+    fn rendered_products(&self, model_id: u32) -> Option<BTreeSet<u32>> {
+        match (self.geometry.get(&model_id), self.streams.get(&model_id)) {
+            (Some(result), _) => Some(result.shapes.iter().map(|shape| shape.express_id).collect()),
+            (None, Some(stream)) => Some(stream.session().emitted().iter().copied().collect()),
+            (None, None) => self.published_outcomes.get(&model_id).map(|outcomes| {
+                outcomes
+                    .iter()
+                    .filter(|outcome| outcome.state == ProductState::Emitted)
+                    .map(|outcome| outcome.express_id)
+                    .collect()
+            }),
         }
-        self.geometry.remove(&model_id);
-        // A finished stream still describes the pack the viewer holds; keep it.
-        if let Some(stream) = self.streams.get(&model_id)
-            && !stream.session.is_finished()
-        {
-            self.streams.remove(&model_id);
-        }
-        self.sources.insert(model_id, edited);
-        self.models.insert(model_id, reparsed);
-        Ok(())
     }
 }
 
@@ -1132,6 +599,8 @@ mod tests {
     use super::*;
     use tessifc_engine::pack::instance_flags;
     use tessifc_pack::{INSTANCE_OPENING, INSTANCE_SPACE, INSTANCE_TRANSPARENT};
+    #[cfg(feature = "edit")]
+    use tessifc_step::SchemaId;
 
     const TINY: &[u8] = b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
                           #1=IFCWALL('g',$,'W',$,$,$,$,$,$);\nENDSEC;\nEND-ISO-10303-21;\n";
@@ -1371,6 +840,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(rendered, 4);
     }
 
+    #[cfg(feature = "edit")]
     #[test]
     fn a_few_products_can_be_re_evaluated_into_a_patch() {
         let mut kernel = Kernel::new();
@@ -1394,6 +864,24 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(patch["stream"]["final"], true);
         let none = json_of(&kernel.evaluate_products(id, &[999], None).unwrap().unwrap());
         assert_eq!(none["instances"]["count"], 0);
+    }
+
+    #[test]
+    fn class_supertypes_walk_to_the_root() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(TINY.to_vec(), None).unwrap();
+        let chain: Vec<String> = serde_json::from_str(
+            &kernel
+                .get_class_supertypes(id, "IfcWallStandardCase")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chain[0], "IfcWallStandardCase");
+        assert_eq!(chain[1], "IfcWall");
+        assert!(chain.iter().any(|name| name == "IfcProduct"));
+        assert_eq!(chain.last().map(String::as_str), Some("IfcRoot"));
+        assert!(kernel.get_class_supertypes(id, "IfcSpaceship").is_none());
+        assert!(kernel.get_class_supertypes(99, "IfcWall").is_none());
     }
 
     #[test]
@@ -1422,6 +910,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         );
     }
 
+    #[cfg(feature = "edit")]
     #[test]
     fn text_edits_reparse_and_export_without_rewriting_the_file() {
         let mut kernel = Kernel::new();
@@ -1441,6 +930,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(kernel.model_count(), 1);
     }
 
+    #[cfg(feature = "edit")]
     #[test]
     fn complex_leaf_edits_use_named_schema_locations() {
         let source = b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
@@ -1501,6 +991,7 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(kernel.get_class_name(id, 99), None);
     }
 
+    #[cfg(feature = "edit")]
     #[test]
     fn a_limited_model_is_edited_with_the_options_it_was_opened_with() {
         let mut kernel = Kernel::new();
@@ -1525,9 +1016,456 @@ ENDSEC;\nEND-ISO-10303-21;\n";
         assert_eq!(options.max_entities, Some(7));
     }
 
+    #[cfg(feature = "edit")]
+    #[test]
+    fn a_patch_keeps_shared_families_and_carries_stats() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(FOUR_PRODUCTS.to_vec(), None).unwrap();
+        let options = r#"{"firstGeometryId":40}"#;
+        let patch = json_of(
+            &kernel
+                .evaluate_products(id, &[33, 43], Some(options.into()))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(patch["instances"]["count"], 2);
+        assert_eq!(patch["geometries"].as_array().unwrap().len(), 1);
+        assert_eq!(patch["geometries"][0]["id"], 40);
+        assert_eq!(patch["stats"]["products"], 2.0);
+        assert!(patch["stats"]["triangles"].as_f64().unwrap() > 0.0);
+
+        // A full rebuild through the revision path shares what the stream shares.
+        kernel.evaluate_geometry(id, None).unwrap();
+        let whole = json_of(&kernel.take_pack(id).unwrap());
+        let renamed_guid = String::from_utf8_lossy(FOUR_PRODUCTS)
+            .replace("IFCWALL('a'", "IFCWALL('z'")
+            .into_bytes();
+        let report: serde_json::Value = serde_json::from_str(
+            &kernel
+                .prepare_revision_inner(id, renamed_guid, "0")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["fullRebuild"], true);
+        let settings = GeometrySettings::from_json(r#"{"firstGeometryId":100}"#).unwrap();
+        let rebuilt = json_of(
+            &kernel
+                .evaluate_prepared_revision_inner(id, settings)
+                .unwrap(),
+        );
+        assert_eq!(rebuilt["instances"]["count"], whole["instances"]["count"]);
+        assert_eq!(
+            rebuilt["geometries"].as_array().unwrap().len(),
+            whole["geometries"].as_array().unwrap().len()
+        );
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn dangling_references_are_checked_against_the_committed_model() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let renamed = String::from_utf8_lossy(BOX)
+            .replace("'W1'", "'W2'")
+            .into_bytes();
+        kernel
+            .prepare_revision_inner(id, renamed.clone(), "0")
+            .unwrap();
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+        assert!(kernel.edit.dangling.contains_key(&id));
+        let dangling = String::from_utf8_lossy(&renamed)
+            .replace("#8=IFCLOCALPLACEMENT($,#7)", "#8=IFCLOCALPLACEMENT($,#77)")
+            .into_bytes();
+        let refused = kernel
+            .prepare_revision_inner(id, dangling, "1")
+            .unwrap_err();
+        assert!(
+            refused.contains("dangling reference #8 -> #77"),
+            "{refused}"
+        );
+        // A legacy edit replaces the model; the next comparison starts from a fresh scan.
+        kernel.set_attribute(id, 9, "Name", "W3", false).unwrap();
+        assert!(!kernel.edit.dangling.contains_key(&id));
+        let again = String::from_utf8_lossy(&kernel.export_model(id).unwrap())
+            .replace("'W3'", "'W4'")
+            .into_bytes();
+        kernel.prepare_revision_inner(id, again, "2").unwrap();
+        assert!(kernel.edit.dangling.contains_key(&id));
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn the_prepared_report_carries_stage_timings() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let edited = String::from_utf8_lossy(BOX)
+            .replace("#2,3.)", "#2,5.)")
+            .into_bytes();
+        let report: serde_json::Value =
+            serde_json::from_str(&kernel.prepare_revision_inner(id, edited, "0").unwrap()).unwrap();
+        let timings = &report["timings"];
+        let stage = |name: &str| timings[name].as_f64().unwrap();
+        assert!(stage("prepareMs") >= stage("parseMs") && stage("parseMs") >= 0.0);
+        assert_eq!(stage("evaluateTotalMs"), 0.0);
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::from_json("{}").unwrap())
+            .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&kernel.get_prepared_revision_info(id).unwrap()).unwrap();
+        let after = &report["timings"];
+        assert!(
+            after["evaluateTotalMs"].as_f64().unwrap() >= after["evaluateMs"].as_f64().unwrap()
+        );
+        assert!(
+            after["sessionMs"].as_f64().unwrap() >= 0.0 && after["packMs"].as_f64().unwrap() >= 0.0
+        );
+    }
+
     #[test]
     fn a_patch_id_without_headroom_is_refused() {
         assert!(GeometrySettings::from_json(r#"{"firstGeometryId":4294967295}"#).is_err());
         assert!(GeometrySettings::from_json(r#"{"firstGeometryId":1000}"#).is_ok());
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn revisions_stage_geometry_before_publishing_and_enforce_the_base() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let edited = String::from_utf8_lossy(BOX)
+            .replace("#2,3.)", "#2,5.)")
+            .into_bytes();
+        let report: serde_json::Value = serde_json::from_str(
+            &kernel
+                .prepare_revision_inner(id, edited.clone(), "0")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["affectedProducts"], serde_json::json!([9]));
+        assert_eq!(report["revision"], "1");
+        assert_eq!(kernel.export_model(id).unwrap(), BOX);
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+        assert!(
+            kernel
+                .prepare_revision_inner(id, edited.clone(), "0")
+                .is_err()
+        );
+        let options =
+            GeometrySettings::from_json(r#"{"modelOffset":[100,200,300],"firstGeometryId":400}"#)
+                .unwrap();
+        let pack = json_of(
+            &kernel
+                .evaluate_prepared_revision_inner(id, options)
+                .unwrap(),
+        );
+        assert_eq!(pack["model_offset"], serde_json::json!([100, 200, 300]));
+        assert_eq!(pack["geometries"][0]["id"], 400);
+        let report: serde_json::Value =
+            serde_json::from_str(&kernel.get_prepared_revision_info(id).unwrap()).unwrap();
+        assert_eq!(report["evaluationAccepted"], true);
+        assert_eq!(report["productOutcomes"][0]["state"], "emitted");
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+        assert_eq!(kernel.export_model(id).unwrap(), edited);
+        assert_eq!(kernel.get_model_revision(id).as_deref(), Some("1"));
+        assert!(
+            kernel
+                .prepare_revision_inner(id, BOX.to_vec(), "0")
+                .is_err()
+        );
+        assert!(kernel.get_prepared_revision_info(id).is_none());
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn revision_attribute_batches_are_source_preserving_and_legacy_edits_invalidate_them() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[
+            {"expressId":9,"attribute":"Name","value":"O'Brien"},
+            {"expressId":3,"attribute":"Depth","value":"4.","raw":true}
+        ]"#,
+                "0",
+            )
+            .unwrap();
+        let staged = &kernel.edit.prepared[&id].source;
+        assert_eq!(
+            String::from_utf8_lossy(staged),
+            String::from_utf8_lossy(BOX)
+                .replace("'W1'", "'O''Brien'")
+                .replace("#2,3.)", "#2,4.)")
+        );
+        assert_eq!(kernel.export_model(id).unwrap(), BOX);
+        kernel
+            .set_attribute(id, 9, "Name", "legacy", false)
+            .unwrap();
+        assert_eq!(kernel.get_model_revision(id).as_deref(), Some("1"));
+        assert!(kernel.get_prepared_revision_info(id).is_none());
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn candidate_source_validation_rejects_truncation_hidden_markers_and_duplicate_ids() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let text = String::from_utf8_lossy(BOX);
+        let malformed = [
+            text.replace("END-ISO-10303-21;", ""),
+            text.replace("ENDSEC;\nEND-ISO", "END-ISO"),
+            text.replace("END-ISO-10303-21;", "/* END-ISO-10303-21; */"),
+            text.replace("END-ISO-10303-21;", "'END-ISO-10303-21;'"),
+            text.replace("END-ISO-10303-21;", "END-ISO-10303-21"),
+            text.replace("#2,3.)", "#999,3.)"),
+            text.replace("#2,3.)", "#2,3.,4.)"),
+            text.replace("#2,3.)", "#2,1.e999)"),
+            text.replace("#1=IFCRECTANGLE", "#2=IFCRECTANGLE"),
+            format!("{text}#99=IFCWALL($);"),
+        ];
+        for candidate in malformed {
+            assert!(
+                kernel
+                    .prepare_revision_inner(id, candidate.into_bytes(), "0")
+                    .is_err()
+            );
+            assert_eq!(kernel.export_model(id).unwrap(), BOX);
+            assert!(kernel.get_prepared_revision_info(id).is_none());
+        }
+        let commented = format!("/* leading */ {text} /* final */");
+        kernel
+            .prepare_revision_inner(id, commented.into_bytes(), "0")
+            .unwrap();
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn revisions_accept_creation_and_deletion_and_keep_open_options() {
+        let mut kernel = Kernel::new();
+        let id = kernel
+            .open_model(
+                TINY.to_vec(),
+                Some(r#"{"schemaOverride":"IFC2X3","maxEntities":2}"#.into()),
+            )
+            .unwrap();
+        let effective_schema = kernel.models[&id].image().schema;
+        let schema = kernel.models[&id].schema();
+        let wall_arity = schema.arity(schema.class_by_name("IfcWall").unwrap());
+        let wall_record = |id, guid: &str, name: &str| {
+            let mut arguments = vec![format!("'{guid}'"), "$".into(), format!("'{name}'")];
+            arguments.resize(wall_arity, "$".into());
+            format!("#{id}=IFCWALL({});\nENDSEC;\nEND-ISO", arguments.join(","))
+        };
+        let added =
+            String::from_utf8_lossy(TINY).replace("ENDSEC;\nEND-ISO", &wall_record(2, "h", "New"));
+        // Single-schema builds may approximate the override. New records must
+        // match the effective schema; the original record remains unchanged.
+        kernel
+            .prepare_revision_inner(id, added.clone().into_bytes(), "0")
+            .unwrap();
+        assert_eq!(
+            kernel.edit.prepared[&id].model.image().schema,
+            effective_schema
+        );
+        assert_eq!(kernel.options[&id].schema_override, Some(SchemaId::Ifc2x3));
+        assert_eq!(kernel.edit.prepared[&id].impact.created_entities, vec![2]);
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        kernel.commit_revision_inner(id, "0").unwrap();
+        let too_many = added.replace("ENDSEC;\nEND-ISO", &wall_record(3, "i", "Extra"));
+        assert!(
+            kernel
+                .prepare_revision_inner(id, too_many.into_bytes(), "1")
+                .is_err()
+        );
+        kernel
+            .prepare_revision_inner(id, TINY.to_vec(), "1")
+            .unwrap();
+        assert_eq!(kernel.edit.prepared[&id].impact.deleted_entities, vec![2]);
+        kernel.commit_revision_inner(id, "1").unwrap();
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn failed_candidate_geometry_cannot_replace_a_renderable_product() {
+        let mut kernel = Kernel::new();
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        let broken = String::from_utf8_lossy(BOX).replace("#1,$,#2,3.", "$,$,#2,3.");
+        kernel
+            .prepare_revision_inner(id, broken.into_bytes(), "0")
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(!kernel.edit.prepared[&id].accepted);
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+        assert_eq!(kernel.export_model(id).unwrap(), BOX);
+        let token = kernel.edit.prepared[&id].token.to_string();
+        assert!(kernel.discard_revision_inner(id, &token).unwrap());
+        let unusable = String::from_utf8_lossy(BOX).replace("'Body'", "'Axis'");
+        kernel
+            .prepare_revision_inner(id, unusable.into_bytes(), "0")
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(!kernel.edit.prepared[&id].accepted);
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
+        kernel.close_model(id);
+        assert!(kernel.get_model_revision(id).is_none());
+        assert!(kernel.get_prepared_revision_info(id).is_none());
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn broad_revisions_preserve_unchanged_failed_products_and_allow_representation_removal() {
+        let mut kernel = Kernel::new();
+        let context = "#100=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,0.00001,#7,$);\n";
+        let broken = String::from_utf8_lossy(BOX)
+            .replace("#1,$,#2,3.", "$,$,#2,3.")
+            .replace("ENDSEC;\nEND-ISO", &format!("{context}ENDSEC;\nEND-ISO"));
+        let id = kernel.open_model(broken.as_bytes().to_vec(), None).unwrap();
+        let revised = broken.replace("0.00001", "0.00002");
+        kernel
+            .prepare_revision_inner(id, revised.into_bytes(), "0")
+            .unwrap();
+        assert!(kernel.edit.prepared[&id].impact.full_rebuild);
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(
+            kernel.edit.prepared[&id].accepted,
+            "{:?}",
+            kernel.edit.prepared[&id].diagnostics
+        );
+        kernel.commit_revision_inner(id, "0").unwrap();
+
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":9,"attribute":"Representation","value":"$","raw":true}]"#,
+                "0",
+            )
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+            .unwrap();
+        assert!(kernel.edit.prepared[&id].accepted);
+        assert_eq!(
+            kernel.edit.prepared[&id].outcomes[0].state,
+            ProductState::NoRepresentation
+        );
+        assert_eq!(kernel.commit_revision_inner(id, "0").unwrap(), "1");
+    }
+
+    #[cfg(feature = "edit")]
+    #[test]
+    fn candidate_handles_settings_frames_and_postcommit_outcomes_remain_consistent() {
+        let mut kernel = Kernel::new();
+        let with_empty = String::from_utf8_lossy(BOX).replace(
+            "ENDSEC;\nEND-ISO",
+            "#20=IFCWALL('empty',$,'Empty',$,$,$,$,$,$);\nENDSEC;\nEND-ISO",
+        );
+        let id = kernel.open_model(with_empty.into_bytes(), None).unwrap();
+        kernel
+            .evaluate_geometry(id, Some(r#"{"circleSegments":40}"#.into()))
+            .unwrap();
+        kernel.take_pack(id);
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":9,"attribute":"Name","value":"New name"}]"#,
+                "0",
+            )
+            .unwrap();
+        let token = kernel.edit.prepared[&id].token.to_string();
+        assert!(
+            kernel
+                .evaluate_prepared_revision_inner(id, GeometrySettings::default())
+                .is_err()
+        );
+        assert!(
+            kernel
+                .evaluate_prepared_revision_inner(
+                    id,
+                    GeometrySettings::from_json(
+                        r#"{"circleSegments":40,"modelOffset":[1e300,0,0]}"#
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+        assert!(kernel.discard_revision_inner(id, &token).unwrap());
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":9,"attribute":"Name","value":"New name"}]"#,
+                "0",
+            )
+            .unwrap();
+        assert!(kernel.check_candidate_token(id, &token).is_err());
+        assert!(kernel.discard_revision_inner(id, &token).is_err());
+        assert!(kernel.get_prepared_revision_info(id).is_some());
+        kernel
+            .evaluate_prepared_revision_inner(
+                id,
+                GeometrySettings::from_json(r#"{"circleSegments":40}"#).unwrap(),
+            )
+            .unwrap();
+        kernel.commit_revision_inner(id, "0").unwrap();
+        assert!(!kernel.discard_revision_inner(id, &token).unwrap());
+        let hierarchy: serde_json::Value =
+            serde_json::from_str(&kernel.get_spatial_hierarchy(id).unwrap()).unwrap();
+        assert!(
+            hierarchy["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["expressId"] == 9 && n["rendered"] == true && n["globalId"] == "a")
+        );
+        assert!(
+            !hierarchy["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["expressId"] == 20 && n["rendered"] == true)
+        );
+        let outcomes = kernel.current_product_outcomes(id).unwrap();
+        assert_eq!(
+            outcomes.iter().find(|o| o.express_id == 9).unwrap().state,
+            ProductState::Emitted
+        );
+        assert_eq!(
+            outcomes.iter().find(|o| o.express_id == 20).unwrap().state,
+            ProductState::NoRepresentation
+        );
+
+        // Without an existing frame, packing must still reject f32 overflow.
+        let id = kernel.open_model(BOX.to_vec(), None).unwrap();
+        kernel
+            .prepare_attribute_edits_inner(
+                id,
+                r#"[{"expressId":3,"attribute":"Depth","value":"4.","raw":true}]"#,
+                "0",
+            )
+            .unwrap();
+        kernel
+            .evaluate_prepared_revision_inner(
+                id,
+                GeometrySettings::from_json(r#"{"modelOffset":[1e300,0,0]}"#).unwrap(),
+            )
+            .unwrap();
+        assert!(!kernel.edit.prepared[&id].accepted);
+        assert!(
+            kernel.edit.prepared[&id]
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "E_REVISION_PACK_FAILED")
+        );
+        assert!(kernel.commit_revision_inner(id, "0").is_err());
     }
 }

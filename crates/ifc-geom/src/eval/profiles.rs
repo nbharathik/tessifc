@@ -5,10 +5,13 @@
 
 use crate::context::EvalCtx;
 use crate::error::GeomError;
-use crate::placement::axis2_placement_2d;
+use crate::placement::{axis2_placement_2d, cartesian_point};
 use crate::registry::{Profile2D, ProfileEvaluator, Registry};
 use glam::{DMat4, DVec2, DVec3};
 use tessifc_model::Entity;
+
+/// Upper bound on the widths one open cross profile may list.
+const MAX_CROSS_WIDTHS: usize = 65_536;
 
 /// Apply a profile's optional `Position` to an outline.
 fn place(profile: Entity<'_>, ctx: &EvalCtx<'_>, points: &mut [DVec2]) {
@@ -1150,6 +1153,75 @@ fn offset_polyline(points: &[DVec2], distance: f64) -> Vec<DVec2> {
     out
 }
 
+/// `IfcOpenCrossProfileDef` (IFC4X3): a run of widths and slopes from an offset point.
+///
+/// Profile x runs to the left of the directrix the profile is swept along and
+/// y up; the widths are horizontal or measured along each slope.
+pub struct OpenCrossProfile;
+
+impl ProfileEvaluator for OpenCrossProfile {
+    fn classes(&self) -> &'static [&'static str] {
+        &["IfcOpenCrossProfileDef"]
+    }
+
+    fn evaluate(&self, ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Profile2D, GeomError> {
+        let horizontal = item.attr("HorizontalWidths").as_bool().unwrap_or(true);
+        let list = |name: &str| -> Result<Vec<f64>, GeomError> {
+            let values = item
+                .attr(name)
+                .as_list()
+                .ok_or_else(|| GeomError::missing(name))?;
+            if values.count() > MAX_CROSS_WIDTHS {
+                return Err(GeomError::LimitReached("cross profile widths".into()));
+            }
+            Ok(item
+                .attr(name)
+                .as_list()
+                .ok_or_else(|| GeomError::missing(name))?
+                .floats()
+                .collect())
+        };
+        let widths = list("Widths")?;
+        let slopes = list("Slopes")?;
+        if widths.is_empty() || widths.len() != slopes.len() {
+            return Err(GeomError::Degenerate(
+                "an open cross profile needs one slope per width".into(),
+            ));
+        }
+        let start = item
+            .attr("OffsetPoint")
+            .as_entity()
+            .and_then(|point| cartesian_point(point, &ctx.units))
+            .map(|point| point.truncate())
+            .unwrap_or(DVec2::ZERO);
+        let mut points = Vec::with_capacity(widths.len() + 1);
+        points.push(start);
+        for (&width, &slope) in widths.iter().zip(&slopes) {
+            let width = ctx.units.length(width);
+            let slope = ctx.units.angle(slope);
+            if !(width.is_finite() && slope.is_finite()) {
+                return Err(GeomError::Degenerate(
+                    "a non-finite width or slope in an open cross profile".into(),
+                ));
+            }
+            let (sin, cos) = slope.sin_cos();
+            let step = if horizontal {
+                if cos.abs() < 1e-9 {
+                    return Err(GeomError::Degenerate(
+                        "a vertical slope with a horizontal width".into(),
+                    ));
+                }
+                DVec2::new(width, width * sin / cos)
+            } else {
+                DVec2::new(width * cos, width * sin)
+            };
+            let last = points[points.len() - 1];
+            points.push(last + step);
+        }
+        Ok(Profile2D::open(points))
+    }
+}
+
 /// Register every profile evaluator.
 pub fn register(registry: &mut Registry) {
     registry.register_profile(Box::new(RectangleProfile));
@@ -1167,12 +1239,100 @@ pub fn register(registry: &mut Registry) {
     registry.register_profile(Box::new(TrapeziumProfile));
     registry.register_profile(Box::new(EllipseProfile));
     registry.register_profile(Box::new(CenterLineProfile));
+    registry.register_profile(Box::new(OpenCrossProfile));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "schema-ifc4x3")]
+    use crate::eval::tests::model_of_schema;
     use crate::eval::tests::{eval_profile, model_of};
+
+    #[cfg(feature = "schema-ifc4x3")]
+    #[test]
+    fn an_open_cross_profile_with_horizontal_widths_rises_by_the_slope() {
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            "#1=IFCOPENCROSSPROFILEDEF(.CURVE.,$,.T.,(2.,2.),(-0.02,0.02),$,$);\n",
+        );
+        let profile = eval_profile(&model, 1).unwrap();
+        assert!(profile.open);
+        assert_eq!(profile.outer.len(), 3);
+        let drop = 2.0 * (0.02f64).tan();
+        assert!((profile.outer[0] - DVec2::ZERO).length() < 1e-12);
+        assert!((profile.outer[1] - DVec2::new(2.0, -drop)).length() < 1e-12);
+        assert!((profile.outer[2] - DVec2::new(4.0, 0.0)).length() < 1e-12);
+    }
+
+    #[cfg(feature = "schema-ifc4x3")]
+    #[test]
+    fn an_open_cross_profile_measured_along_its_slopes_starts_at_its_offset_point() {
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            concat!(
+                "#1=IFCCARTESIANPOINT((-1.,0.5));\n",
+                "#2=IFCOPENCROSSPROFILEDEF(.CURVE.,$,.F.,(1.),(0.5235987755982988),$,#1);\n",
+            ),
+        );
+        let profile = eval_profile(&model, 2).unwrap();
+        assert_eq!(profile.outer.len(), 2);
+        assert!((profile.outer[0] - DVec2::new(-1.0, 0.5)).length() < 1e-12);
+        let end = DVec2::new(-1.0 + (30.0f64).to_radians().cos(), 1.0);
+        assert!(
+            (profile.outer[1] - end).length() < 1e-12,
+            "{}",
+            profile.outer[1]
+        );
+    }
+
+    #[cfg(feature = "schema-ifc4x3")]
+    #[test]
+    fn an_open_cross_profile_takes_its_slopes_in_the_file_unit() {
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            concat!(
+                "#90=IFCDIMENSIONALEXPONENTS(0,0,0,0,0,0,0);\n",
+                "#91=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n",
+                "#92=IFCSIUNIT(*,.PLANEANGLEUNIT.,$,.RADIAN.);\n",
+                "#93=IFCMEASUREWITHUNIT(IFCPLANEANGLEMEASURE(0.017453292519943295),#92);\n",
+                "#94=IFCCONVERSIONBASEDUNIT(#90,.PLANEANGLEUNIT.,'DEGREE',#93);\n",
+                "#95=IFCUNITASSIGNMENT((#91,#94));\n",
+                "#96=IFCPROJECT('0000000000000000000000',$,$,$,$,$,$,$,#95);\n",
+                "#1=IFCOPENCROSSPROFILEDEF(.CURVE.,$,.T.,(1.),(45.),$,$);\n",
+            ),
+        );
+        let profile = eval_profile(&model, 1).unwrap();
+        assert!(
+            (profile.outer[1] - DVec2::new(1.0, 1.0)).length() < 1e-9,
+            "{}",
+            profile.outer[1]
+        );
+    }
+
+    #[cfg(feature = "schema-ifc4x3")]
+    #[test]
+    fn an_open_cross_profile_with_mismatched_lists_or_a_vertical_horizontal_width_is_refused() {
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            concat!(
+                "#1=IFCOPENCROSSPROFILEDEF(.CURVE.,$,.T.,(1.,1.),(0.),$,$);\n",
+                "#2=IFCOPENCROSSPROFILEDEF(.CURVE.,$,.T.,(1.),(1.5707963267948966),$,$);\n",
+                "#3=IFCOPENCROSSPROFILEDEF(.CURVE.,$,.F.,(1.),(1.5707963267948966),$,$);\n",
+            ),
+        );
+        assert!(matches!(
+            eval_profile(&model, 1),
+            Err(GeomError::Degenerate(_))
+        ));
+        assert!(matches!(
+            eval_profile(&model, 2),
+            Err(GeomError::Degenerate(_))
+        ));
+        // Along the slope a vertical width is fine.
+        let vertical = eval_profile(&model, 3).unwrap();
+        assert!((vertical.outer[1] - DVec2::new(0.0, 1.0)).length() < 1e-9);
+    }
 
     #[test]
     fn a_rectangle_is_centred_on_its_origin() {

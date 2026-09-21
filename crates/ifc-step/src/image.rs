@@ -236,7 +236,8 @@ impl ModelImage {
         self.class_members = members;
     }
 
-    #[cfg(test)]
+    /// An image with nothing in it, for a file that could not be read at all.
+    #[cfg(any(feature = "ifczip", test))]
     pub(crate) fn empty(schema: SchemaId) -> Self {
         ModelImage {
             tape: Vec::new(),

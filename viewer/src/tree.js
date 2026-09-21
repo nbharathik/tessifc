@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two model trees in the left panel: the IFC spatial structure and the
-//! element types. Both descend to individual elements. Nodes are built as data
-//! first and become DOM the first time their branch opens, so a large model
-//! only pays for what the user looks at.
+//! The two model trees in the left panel: the spatial structure and the element
+//! types. Nodes are data first and become DOM when their branch opens.
 
 import { classLabelColor, humanizeIfcClass } from "./igp.js";
 import { count as formatCount } from "./format.js";
@@ -206,6 +204,7 @@ export function createTree({ onVisibility, onSelect, onFocus }) {
   /** Build both trees for one model from the per-product record lists in `index`. */
   function build(pack, hierarchy, index) {
     cancelExpansion();
+    const remembered = rememberOpenState();
     mounted = new Set();
     branches = [];
     query = "";
@@ -223,8 +222,33 @@ export function createTree({ onVisibility, onSelect, onFocus }) {
     // two trees own separate nodes.
     if (!roots.spatial.length) roots.spatial = buildTypeRoots(index, products);
 
-    mountRoots(spatialHost, roots.spatial);
-    mountRoots(typesHost, roots.types);
+    mountRoots(spatialHost, roots.spatial, remembered);
+    mountRoots(typesHost, roots.types, remembered);
+  }
+
+  /** A branch's identity across rebuilds: container ids and class names down from the root. */
+  function branchKey(node) {
+    const own = node.isClass ? `k:${node.exact}` : `c:${node.expressId ?? node.label}`;
+    return node.parent ? `${branchKey(node.parent)}/${own}` : own;
+  }
+
+  /** Open branches and scroll offsets, so a rebuild after an edit leaves the panel where it was. */
+  function rememberOpenState() {
+    if (!branches.length) return null;
+    const open = new Map();
+    for (const node of branches) open.set(branchKey(node), node.open);
+    return { open, scroll: new Map([[spatialHost, spatialHost.scrollTop], [typesHost, typesHost.scrollTop]]) };
+  }
+
+  function restoreOpenState(node, remembered) {
+    if (node.kind !== "branch") return;
+    const known = remembered.open.get(branchKey(node));
+    if (known === undefined) {
+      openContainers(node);
+      return;
+    }
+    setOpen(node, known);
+    for (const child of node.children) restoreOpenState(child, remembered);
   }
 
   /** One entry per rendered product: its name, class, records and container. */
@@ -484,16 +508,18 @@ export function createTree({ onVisibility, onSelect, onFocus }) {
 
   // ------------------------------------------------------------ mounting
 
-  function mountRoots(host, list) {
+  function mountRoots(host, list, remembered = null) {
     if (!list.length) {
       host.replaceChildren(emptyState("Nothing to show", "This model produced no renderable products."));
       return;
     }
     // Built detached and attached once, so the rows never shift each other on the page.
     const roots = list.map(mount);
-    // Containers open down to the storeys; the class groups inside stay closed.
-    for (const node of list) openContainers(node);
+    // Containers open down to the storeys; the class groups inside stay closed,
+    // unless an earlier build of the same panel says otherwise.
+    for (const node of list) remembered ? restoreOpenState(node, remembered) : openContainers(node);
     host.replaceChildren(...roots);
+    if (remembered) host.scrollTop = remembered.scroll.get(host) ?? 0;
     const first = list[0]?.element;
     if (first) setTabStop(host, first);
   }

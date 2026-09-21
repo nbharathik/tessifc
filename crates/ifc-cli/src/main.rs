@@ -38,7 +38,7 @@ struct Cli {
 enum Command {
     /// Read a file and report what is in it.
     Info {
-        /// The .ifc file to read.
+        /// The .ifc or .ifczip file to read.
         file: PathBuf,
         /// Machine-readable JSON output.
         #[arg(long)]
@@ -56,7 +56,7 @@ enum Command {
 
     /// Evaluate geometry and write an IGP pack.
     Convert {
-        /// The .ifc file to read.
+        /// The .ifc or .ifczip file to read.
         file: PathBuf,
         /// Where to write the pack. Omit to measure without writing.
         #[arg(short, long)]
@@ -98,7 +98,7 @@ enum Command {
 
     /// Change one entity attribute without rewriting the rest of the IFC.
     Edit {
-        /// The .ifc file to read.
+        /// The .ifc or .ifczip file to read.
         file: PathBuf,
         /// Express id, written without the leading #.
         #[arg(long)]

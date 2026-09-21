@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Convex cells of any closed solid, from a BSP of its own face planes.
-//!
-//! An outward-wound closed mesh partitions space when its faces are used as
-//! splitters: the region behind a face is locally inside. A leaf reached with
-//! nothing left behind it is an inside cell, convex by construction, and the
-//! inside cells tile the solid. The classical construction from the computer
-//! graphics literature, written from its published description.
+//! Convex cells of a closed solid from a BSP of its own face planes: the region
+//! behind a face is locally inside, so the inside leaves tile the solid. The
+//! classical construction, written from its published description.
 
 use crate::clip::{Plane, clip_polygon};
 use crate::mesh::Mesh64;
@@ -326,9 +322,8 @@ pub(crate) fn bsp_cells_closing(
     if mesh.is_empty() {
         return Err("empty mesh".into());
     }
-    // The construction reads faces as outward and needs a closed surface: a
-    // shell with T-junctions is healed first, faces that disagree about the
-    // outside are turned to agree, and an inside-out shell is turned whole.
+    // The construction needs a closed, outward-wound surface: heal T-junctions,
+    // then turn disagreeing faces and an inside-out shell.
     let mut oriented;
     let mesh =
         if mesh.is_edge_manifold() && mesh.is_consistently_wound() && mesh.signed_volume() >= 0.0 {
@@ -338,6 +333,11 @@ pub(crate) fn bsp_cells_closing(
             if !oriented.is_edge_manifold() {
                 crate::weld::weld_and_close(&mut oriented, close);
                 if crate::weld::heal_t_junctions(&mut oriented, close) > 0 {
+                    crate::weld::weld_and_close(&mut oriented, close);
+                }
+                if !oriented.is_edge_manifold()
+                    && crate::weld::drop_hanging_slivers(&mut oriented, close) > 0
+                {
                     crate::weld::weld_and_close(&mut oriented, close);
                 }
                 if !oriented.is_edge_manifold() {
@@ -353,6 +353,30 @@ pub(crate) fn bsp_cells_closing(
             oriented.fix_orientation();
             &oriented
         };
+    // The proof decides, so an input that happens to straddle one tolerance
+    // is tried at its neighbours before it is refused.
+    let mut refusal = String::new();
+    let floor = tol.min(1e-9);
+    for factor in [1.0, 10.0, 100.0, 0.1] {
+        let attempt = (tol * factor).clamp(floor, close);
+        if factor != 1.0 && attempt == tol {
+            continue;
+        }
+        match bsp_cells_at(mesh, attempt) {
+            Ok(cells) => return Ok(cells),
+            Err(why) if why.contains("cells hold") => {
+                if refusal.is_empty() {
+                    refusal = why;
+                }
+            }
+            Err(why) => return Err(why),
+        }
+    }
+    Err(refusal)
+}
+
+/// One decomposition of a closed, outward-wound mesh at one tolerance.
+fn bsp_cells_at(mesh: &Mesh64, tol: f64) -> Result<Vec<Mesh64>, String> {
     let target = mesh.signed_volume();
     let Some((low, high)) = mesh.bounds() else {
         return Err("no bounds".into());
@@ -440,9 +464,8 @@ pub(crate) fn bsp_cells_closing(
         }
     }
 
-    // Cells as meshes: a box round the solid, cut down by every half-space on
-    // the cell's path. Each cut rebuilds the new face as the convex hull of the
-    // cut points, so no boundary has to be chained and a sliver cannot fail.
+    // Each cell is a box round the solid cut by every half-space on its path; the
+    // new face is the hull of the cut points, so no boundary is chained.
     let margin = (high - low).length().max(1.0) + tol;
     let hull = hull_faces(low - DVec3::splat(margin), high + DVec3::splat(margin));
     let mut out = Vec::with_capacity(cells.len());

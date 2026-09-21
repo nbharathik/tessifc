@@ -10,7 +10,7 @@ use tessifc_engine::Engine;
 use tessifc_engine::pack::Packer;
 use tessifc_geom::Settings;
 use tessifc_model::Model;
-use tessifc_step::{ParseOptions, parse};
+use tessifc_step::ParseOptions;
 
 #[derive(Serialize)]
 struct Report {
@@ -42,6 +42,7 @@ struct Report {
     length_scale_to_m: f64,
     effective_settings: Settings,
     product_outcomes: Vec<tessifc_engine::ProductOutcome>,
+    limit_reached: Option<tessifc_engine::LimitReached>,
     output_written: bool,
     product_classes: std::collections::BTreeMap<String, ProductClassSummary>,
     diagnostics: DiagnosticSummary,
@@ -117,7 +118,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
     };
 
     let parse_started = Instant::now();
-    let image = parse(&bytes, &ParseOptions::default());
+    let image = tessifc_step::open(&bytes, &ParseOptions::default());
     let schema = image.schema.as_str().to_string();
     let entities = image.len();
     let model = Model::new(image);
@@ -162,9 +163,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    // The pool is process-wide and built once. A second convert in the same
-    // process would find it already built, which is fine.
-    // Bounded: a thread per core times a few is all the work can use.
+    // The pool is process-wide and built once; a thread per core times a few is all the work can use.
     let threads = options
         .jobs
         .unwrap_or_else(rayon::current_num_threads)
@@ -191,9 +190,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
         .map(|shape| shape.class.clone())
         .collect();
     let products_with_geometry = result.shapes.len();
-    // One record per colour. IGP carries one colour per record, so a window's
-    // frame and its glass are two records that share an express id; a family
-    // placed many times is one mesh and many records.
+    // One record per colour: a window's frame and glass are two records sharing an express id.
     for shape in &result.shapes {
         packer.add_shape_ref(shape);
     }
@@ -244,6 +241,10 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
     packer.set_stat("triangles", triangles as f64);
     packer.set_stat("parse_ms", parse_ms);
     packer.set_stat("geometry_ms", geometry_ms);
+    if let Some(limit) = &result.limit_reached {
+        packer.set_stat("limit_reached", 1.0);
+        packer.set_stat("products_skipped", limit.products_skipped as f64);
+    }
 
     let geometries = packer.geometry_count();
     let instances = packer.instance_count();
@@ -306,8 +307,14 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
                         | "W_BOUNDING_BOX_SUBSTITUTED"
                         | "W_NON_MANIFOLD_INPUT"
                         | "W_OPENING_CUT_ON_SURFACE"
+                        | "W_BOOLEAN_REFUSED"
                         | "W_PLACEMENT_UNSUPPORTED"
+                        | "W_ALIGNMENT_SEGMENT_GAP"
+                        | "W_CANT_APPROXIMATED"
+                        | "W_LINEAR_PLACEMENT_MISMATCH"
                         | "W_NO_DRAWN_REPRESENTATION"
+                        | "W_TEXTURE_DROPPED_BY_BOOLEAN"
+                        | "W_TEXTURE_OMITTED"
                 )
         });
     if !refused
@@ -352,6 +359,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
         length_scale_to_m: result.units.length_to_m,
         effective_settings: settings,
         product_outcomes: engine.outcomes(&model, &result),
+        limit_reached: result.limit_reached.clone(),
         output_written: options.output.is_some() && !refused,
         product_classes,
         diagnostics: DiagnosticSummary {
@@ -387,6 +395,15 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
             report.geometries, report.instances, report.shared_instances
         );
         println!("  triangles           {}", report.triangles);
+        if let Some(limit) = &report.limit_reached {
+            println!(
+                "  stopped             {} reached {} of {}; {} products skipped",
+                limit.which.as_str(),
+                limit.reached,
+                limit.limit,
+                limit.products_skipped
+            );
+        }
         println!(
             "  parse               {:.1} ms      geometry {:.1} ms on {} threads      pack {:.1} ms",
             report.parse_ms, report.geometry_ms, report.threads, report.pack_ms

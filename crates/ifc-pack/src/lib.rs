@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! IGP: the IFC Geometry Pack.
-//!
-//! A GLB-shaped container: a 24-byte header, a UTF-8 JSON index and an
-//! 8-byte-aligned binary chunk. No codegen, no dependency to read it: a
-//! `DataView` in JavaScript, `numpy.frombuffer` in Python, a slice in Rust.
-//!
-//! The layout is **normative** and frozen for v0. It is specified in
-//! `docs/igp-format.md` and changing it needs an RFC.
+//! IGP, the IFC Geometry Pack: a 24-byte header, a UTF-8 JSON index and an
+//! 8-byte-aligned binary chunk, readable with a `DataView` or `numpy`. The v0
+//! layout is normative, specified in `docs/igp-format.md`; changing it needs an RFC.
 //!
 //! ```
 //! use tessifc_pack::{IgpWriter, Geometry, Instance};
@@ -21,6 +16,7 @@
 //!     color: [200, 200, 200, 255],
 //!     flags: 0,
 //!     provenance: Default::default(),
+//!     material: None,
 //! });
 //! let bytes = writer.finish();
 //! assert_eq!(&bytes[0..4], b"IGP\0");
@@ -70,6 +66,67 @@ pub struct Instance {
     pub flags: u16,
     /// Where the mesh came from.
     pub provenance: Provenance,
+    /// The index of the material this record is drawn with, from
+    /// [`IgpWriter::add_material`], or `None` for the colour alone.
+    pub material: Option<u32>,
+}
+
+/// One entry of the optional `materials` table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaterialRecord {
+    /// The surface colour with its opacity, as the instance colour.
+    pub color: [u8; 4],
+    /// The diffuse colour in 0..1, when the style gives one.
+    pub diffuse: Option<[f32; 3]>,
+    /// The specular colour in 0..1, when the style gives one.
+    pub specular: Option<[f32; 3]>,
+    /// The specular exponent, when given.
+    pub shininess: Option<f32>,
+    /// The specular roughness in 0..1, when given.
+    pub roughness: Option<f32>,
+    /// The reflectance method's name, when given.
+    pub reflectance: Option<String>,
+    /// The id of the texture painted on it, an entry of the `textures` table.
+    pub texture: Option<u32>,
+    /// The express id of the surface style.
+    pub source: u32,
+}
+
+/// Where a texture's pixels are, as the pack carries them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextureData {
+    /// A URL or relative path the file refers to; nothing is fetched.
+    Uri(String),
+    /// An encoded image the reader decodes.
+    Blob(Vec<u8>),
+    /// Raw pixels, `components` bytes each, rows from the bottom.
+    Pixels {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Bytes per pixel, 1 to 4.
+        components: u8,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// Left out of the pack, with a diagnostic saying why.
+    Omitted,
+}
+
+/// One entry of the optional `textures` table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextureRecord {
+    /// The texture's id: its express id, unique across a stream.
+    pub id: u32,
+    /// The media type of an encoded image, when known.
+    pub mime: Option<String>,
+    /// Whether it repeats along s and t.
+    pub repeat: [bool; 2],
+    /// A 2D affine transform of the coordinates, `[a, b, c, d, tx, ty]`.
+    pub transform: Option<[f64; 6]>,
+    /// The pixels.
+    pub data: TextureData,
 }
 
 /// Where one drawn mesh came from, as the index writes it.
@@ -111,6 +168,19 @@ pub struct Geometry {
     /// nobody checked. A reader needs it to know what may be capped at a
     /// section plane and what a volume figure would mean.
     pub closed: Option<bool>,
+    /// Whether the mesh carries a texture coordinate per vertex.
+    pub has_uv: bool,
+    /// Set on a coarse level: which base mesh it simplifies, and how far.
+    pub lod: Option<LodLink>,
+}
+
+/// A coarse level's link to its base mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LodLink {
+    /// The id of the base geometry whose positions the level shares.
+    pub of: u32,
+    /// 1 for the first coarse level, 2 for the coarser one.
+    pub level: u8,
 }
 
 /// Where a chunk sits in a stream of packs.
@@ -137,6 +207,8 @@ pub struct StreamState {
     pub known: HashMap<u64, u32>,
     /// The id the next new mesh receives.
     pub next_geometry_id: u32,
+    /// Textures written so far, by id; a later chunk refers to them without writing them again.
+    pub known_textures: std::collections::HashSet<u32>,
 }
 
 /// Builds an IGP file, or one chunk of a streamed one.
@@ -148,7 +220,11 @@ pub struct IgpWriter {
     geometries: Vec<Geometry>,
     positions: Vec<Vec<f32>>,
     indices: Vec<Vec<u32>>,
+    uvs: Vec<Vec<f32>>,
     instances: Vec<Instance>,
+    materials: Vec<MaterialRecord>,
+    textures: Vec<TextureRecord>,
+    known_textures: std::collections::HashSet<u32>,
     non_finite_positions: usize,
     by_hash: HashMap<u64, u32>,
     first_geometry_id: u32,
@@ -186,7 +262,11 @@ impl IgpWriter {
             geometries: Vec::new(),
             positions: Vec::new(),
             indices: Vec::new(),
+            uvs: Vec::new(),
             instances: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            known_textures: std::collections::HashSet::new(),
             non_finite_positions: 0,
             by_hash: HashMap::new(),
             first_geometry_id: 0,
@@ -206,6 +286,7 @@ impl IgpWriter {
         let mut writer = IgpWriter::new(schema, length_scale_to_m);
         writer.by_hash = state.known;
         writer.first_geometry_id = state.next_geometry_id;
+        writer.known_textures = state.known_textures;
         writer
     }
 
@@ -255,7 +336,7 @@ impl IgpWriter {
         if let Some(&existing) = self.by_hash.get(&hash) {
             return existing;
         }
-        self.store_geometry(hash, positions.to_vec(), indices.to_vec(), None)
+        self.store_geometry(hash, positions.to_vec(), indices.to_vec(), None, Vec::new())
     }
 
     /// Add an already-owned mesh without copying its two largest arrays.
@@ -273,9 +354,22 @@ impl IgpWriter {
     /// the hash is over the same bytes the answer was derived from.
     pub fn add_geometry_owned_closed(
         &mut self,
+        positions: Vec<f32>,
+        indices: Vec<u32>,
+        closed: Option<bool>,
+    ) -> u32 {
+        self.add_geometry_owned_closed_uv(positions, indices, closed, Vec::new())
+    }
+
+    /// [`IgpWriter::add_geometry_owned_closed`] with texture coordinates, two
+    /// per vertex; an empty `uvs` is a mesh without any. The hash covers them,
+    /// so the same triangles with a different mapping are two meshes.
+    pub fn add_geometry_owned_closed_uv(
+        &mut self,
         mut positions: Vec<f32>,
         indices: Vec<u32>,
         closed: Option<bool>,
+        mut uvs: Vec<f32>,
     ) -> u32 {
         // A non-finite coordinate has no JSON spelling and cannot sit inside
         // the bounding box the format says every position is inside.
@@ -283,12 +377,44 @@ impl IgpWriter {
             *value = 0.0;
             self.non_finite_positions += 1;
         }
-        let hash = hash_mesh(&positions, &indices);
+        if uvs.len() != positions.len() / 3 * 2 {
+            uvs.clear();
+        }
+        for value in uvs.iter_mut().filter(|value| !value.is_finite()) {
+            *value = 0.0;
+        }
+        let hash = hash_mesh_uv(&positions, &indices, &uvs);
         if let Some(&existing) = self.by_hash.get(&hash) {
             return existing;
         }
 
-        self.store_geometry(hash, positions, indices, closed)
+        self.store_geometry(hash, positions, indices, closed, uvs)
+    }
+
+    /// Add a material, returning its index in this pack's `materials` table.
+    ///
+    /// Identical records collapse to one entry, in first-seen order.
+    pub fn add_material(&mut self, record: MaterialRecord) -> u32 {
+        if let Some(index) = self.materials.iter().position(|known| *known == record) {
+            return index as u32;
+        }
+        self.materials.push(record);
+        (self.materials.len() - 1) as u32
+    }
+
+    /// Add a texture unless the stream has already written it. Returns
+    /// whether this pack carries it.
+    pub fn add_texture(&mut self, record: TextureRecord) -> bool {
+        if !self.known_textures.insert(record.id) {
+            return false;
+        }
+        self.textures.push(record);
+        true
+    }
+
+    /// Whether the stream has written this texture already.
+    pub fn has_texture(&self, id: u32) -> bool {
+        self.known_textures.contains(&id)
     }
 
     /// Position components replaced with zero because they were not finite.
@@ -302,6 +428,7 @@ impl IgpWriter {
         positions: Vec<f32>,
         mut indices: Vec<u32>,
         closed: Option<bool>,
+        uvs: Vec<f32>,
     ) -> u32 {
         // A stale index would be narrowed onto another vertex or read past the
         // array, so such triangles are dropped, as is a trailing partial one.
@@ -338,11 +465,69 @@ impl IgpWriter {
             index_count: indices.len(),
             bbox,
             closed,
+            has_uv: !uvs.is_empty(),
+            lod: None,
         });
         self.positions.push(positions);
         self.indices.push(indices);
+        self.uvs.push(uvs);
         self.by_hash.insert(hash, id);
         id
+    }
+
+    /// The positions and indices of a geometry this pack holds, for a
+    /// caller deriving something from them; `None` for an id from an earlier
+    /// chunk or a level.
+    pub fn geometry_data(&self, id: u32) -> Option<(&[f32], &[u32])> {
+        let local = self
+            .geometries
+            .iter()
+            .position(|geometry| geometry.id == id)?;
+        if self.geometries[local].lod.is_some() {
+            return None;
+        }
+        Some((&self.positions[local], &self.indices[local]))
+    }
+
+    /// Add a coarse level of `base`: `indices` over the base's own vertices,
+    /// three per triangle. Returns the level's id, or `None` when the base is
+    /// not in this pack, is itself a level, the level is not 1 or 2, or an
+    /// index is outside the base. Identical levels of one base collapse.
+    pub fn add_geometry_lod(&mut self, base: u32, indices: Vec<u32>, level: u8) -> Option<u32> {
+        let local = self
+            .geometries
+            .iter()
+            .position(|geometry| geometry.id == base)?;
+        let parent = self.geometries[local].clone();
+        if parent.lod.is_some()
+            || !(1..=2).contains(&level)
+            || !indices.len().is_multiple_of(3)
+            || indices.is_empty()
+            || indices
+                .iter()
+                .any(|&index| index as usize >= parent.vertex_count)
+        {
+            return None;
+        }
+        let hash = hash_lod(base, level, &indices);
+        if let Some(&existing) = self.by_hash.get(&hash) {
+            return Some(existing);
+        }
+        let id = self.next_geometry_id();
+        self.geometries.push(Geometry {
+            id,
+            vertex_count: parent.vertex_count,
+            index_count: indices.len(),
+            bbox: parent.bbox,
+            closed: parent.closed,
+            has_uv: parent.has_uv,
+            lod: Some(LodLink { of: base, level }),
+        });
+        self.positions.push(Vec::new());
+        self.indices.push(indices);
+        self.uvs.push(Vec::new());
+        self.by_hash.insert(hash, id);
+        Some(id)
     }
 
     /// Add a placed instance.
@@ -375,6 +560,7 @@ impl IgpWriter {
         let state = StreamState {
             next_geometry_id: self.next_geometry_id(),
             known: std::mem::take(&mut self.by_hash),
+            known_textures: self.known_textures.clone(),
         };
         (self.serialise(), state)
     }
@@ -394,9 +580,8 @@ impl IgpWriter {
             }
         }
 
-        // The provenance table, in first-seen order over the sorted instances,
-        // so the same model always produces the same bytes. Identical rows
-        // collapse: a family placed a thousand times costs one.
+        // Provenance rows in first-seen order over the sorted instances, identical
+        // rows collapsed, so the same model always produces the same bytes.
         let mut provenance_rows: Vec<&Provenance> = Vec::new();
         let mut provenance_of: Vec<u32> = Vec::with_capacity(self.instances.len());
         {
@@ -446,19 +631,26 @@ impl IgpWriter {
             .map(|(index, name)| (name.as_str(), index as u16))
             .collect();
 
-        // Compute binary offsets first, then serialise directly into the final
-        // output buffer. Keeping a complete BIN Vec and copying it into a
-        // second final Vec made peak pack memory grow by the full IGP payload.
+        // Offsets first, then serialise straight into the output buffer; a separate
+        // BIN buffer would double the peak memory.
         let mut binary_len = 0usize;
         let mut geometry_json = Vec::new();
+        // A level's positions and uv are its base's sections; bases come first.
+        let mut base_sections: HashMap<u32, (usize, Option<usize>)> = HashMap::new();
 
         for (local, geometry) in self.geometries.iter().enumerate() {
             let positions = &self.positions[local];
             let indices = &self.indices[local];
 
-            binary_len = aligned(binary_len);
-            let positions_at = binary_len;
-            binary_len += positions.len() * size_of::<f32>();
+            let (positions_at, uv_at) = match geometry.lod {
+                Some(link) => base_sections.get(&link.of).copied().unwrap_or((0, None)),
+                None => {
+                    binary_len = aligned(binary_len);
+                    let positions_at = binary_len;
+                    binary_len += positions.len() * size_of::<f32>();
+                    (positions_at, None)
+                }
+            };
 
             binary_len = aligned(binary_len);
             let indices_at = binary_len;
@@ -471,11 +663,33 @@ impl IgpWriter {
                 } else {
                     size_of::<u32>()
                 };
+            let uv_at = if geometry.has_uv && geometry.lod.is_none() {
+                binary_len = aligned(binary_len);
+                let at = binary_len;
+                binary_len += self.uvs[local].len() * size_of::<f32>();
+                Some(at)
+            } else {
+                uv_at
+            };
+            if geometry.lod.is_none() {
+                base_sections.insert(geometry.id, (positions_at, uv_at));
+            }
+            let uv_json = match uv_at {
+                Some(uv_at) if geometry.has_uv => format!(
+                    ",\"uv\":{{\"off\":{uv_at},\"count\":{}}}",
+                    geometry.vertex_count
+                ),
+                _ => String::new(),
+            };
+            let lod_json = match geometry.lod {
+                Some(link) => format!(",\"lod\":{{\"of\":{},\"level\":{}}}", link.of, link.level),
+                None => String::new(),
+            };
 
             geometry_json.push(format!(
                 "{{\"id\":{},\"positions\":{{\"off\":{},\"count\":{}}},\
                  \"indices\":{{\"off\":{},\"count\":{},\"type\":\"{}\"}},\
-                 \"bbox\":[{}],\"primitive\":\"triangles\"{}}}",
+                 \"bbox\":[{}],\"primitive\":\"triangles\"{}{uv_json}{lod_json}}}",
                 geometry.id,
                 positions_at,
                 geometry.vertex_count,
@@ -518,6 +732,34 @@ impl IgpWriter {
         binary_len = aligned(binary_len);
         let provenance_at = binary_len;
         binary_len += count * size_of::<u32>();
+        // The material column and the texture bytes come last, so a reader
+        // that knows nothing of them finds every older section where it was.
+        let any_material = self
+            .instances
+            .iter()
+            .any(|instance| instance.material.is_some());
+        let material_at = if any_material {
+            binary_len = aligned(binary_len);
+            let at = binary_len;
+            binary_len += count * size_of::<u32>();
+            Some(at)
+        } else {
+            None
+        };
+        let mut texture_at: Vec<Option<usize>> = Vec::with_capacity(self.textures.len());
+        for texture in &self.textures {
+            let bytes = match &texture.data {
+                TextureData::Blob(bytes) => bytes.len(),
+                TextureData::Pixels { bytes, .. } => bytes.len(),
+                TextureData::Uri(_) | TextureData::Omitted => {
+                    texture_at.push(None);
+                    continue;
+                }
+            };
+            binary_len = aligned(binary_len);
+            texture_at.push(Some(binary_len));
+            binary_len += bytes;
+        }
 
         let mut json = String::with_capacity(4096 + geometry_json.len() * 96);
         json.push_str(&format!(
@@ -552,9 +794,26 @@ impl IgpWriter {
              \"class_id\":{{\"off\":{class_id_at},\"type\":\"u16\"}},\
              \"transform\":{{\"off\":{transform_at},\"type\":\"f32x16\"}},\
              \"color\":{{\"off\":{color_at},\"type\":\"u8x4\"}},\
-             \"flags\":{{\"off\":{flags_at},\"type\":\"u16\"}},             \"provenance\":{{\"off\":{provenance_at},\"type\":\"u32\"}}}},"
+             \"flags\":{{\"off\":{flags_at},\"type\":\"u16\"}},             \"provenance\":{{\"off\":{provenance_at},\"type\":\"u32\"}}{}}},",
+            match material_at {
+                Some(at) => format!(",\"material\":{{\"off\":{at},\"type\":\"u32\"}}"),
+                None => String::new(),
+            }
         ));
         json.push_str(&format!("\"provenance\":[{provenance_json}],"));
+        if !self.materials.is_empty() {
+            let rows: Vec<String> = self.materials.iter().map(material_json).collect();
+            json.push_str(&format!("\"materials\":[{}],", rows.join(",")));
+        }
+        if !self.textures.is_empty() {
+            let rows: Vec<String> = self
+                .textures
+                .iter()
+                .zip(&texture_at)
+                .map(|(texture, at)| texture_json(texture, *at))
+                .collect();
+            json.push_str(&format!("\"textures\":[{}],", rows.join(",")));
+        }
         json.push_str(&format!(
             "\"classes\":[{}],",
             classes
@@ -621,9 +880,11 @@ impl IgpWriter {
         for (local, geometry) in self.geometries.iter().enumerate() {
             let positions = &self.positions[local];
             let indices = &self.indices[local];
-            align_binary(&mut out, binary_start);
-            for value in positions {
-                out.extend_from_slice(&value.to_le_bytes());
+            if geometry.lod.is_none() {
+                align_binary(&mut out, binary_start);
+                for value in positions {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
             }
             align_binary(&mut out, binary_start);
             if geometry.vertex_count <= u16::MAX as usize {
@@ -633,6 +894,12 @@ impl IgpWriter {
             } else {
                 for &index in indices {
                     out.extend_from_slice(&index.to_le_bytes());
+                }
+            }
+            if geometry.has_uv && geometry.lod.is_none() {
+                align_binary(&mut out, binary_start);
+                for value in &self.uvs[local] {
+                    out.extend_from_slice(&value.to_le_bytes());
                 }
             }
         }
@@ -671,9 +938,103 @@ impl IgpWriter {
         for index in &provenance_of {
             out.extend_from_slice(&index.to_le_bytes());
         }
+        if material_at.is_some() {
+            align_binary(&mut out, binary_start);
+            for instance in &self.instances {
+                out.extend_from_slice(&instance.material.unwrap_or(u32::MAX).to_le_bytes());
+            }
+        }
+        for texture in &self.textures {
+            let bytes = match &texture.data {
+                TextureData::Blob(bytes) => bytes,
+                TextureData::Pixels { bytes, .. } => bytes,
+                TextureData::Uri(_) | TextureData::Omitted => continue,
+            };
+            align_binary(&mut out, binary_start);
+            out.extend_from_slice(bytes);
+        }
         debug_assert_eq!(out.len(), binary_start + binary_len);
         out
     }
+}
+
+fn material_json(material: &MaterialRecord) -> String {
+    let rgb = |value: &Option<[f32; 3]>| match value {
+        Some(rgb) => format!(
+            "[{},{},{}]",
+            format_float(&rgb[0]),
+            format_float(&rgb[1]),
+            format_float(&rgb[2])
+        ),
+        None => "null".to_string(),
+    };
+    let number = |value: &Option<f32>| match value {
+        Some(value) => format_float(value),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"color\":[{},{},{},{}],\"diffuse\":{},\"specular\":{},\"shininess\":{},\"roughness\":{},\"reflectance\":{},\"texture\":{},\"source\":{}}}",
+        material.color[0],
+        material.color[1],
+        material.color[2],
+        material.color[3],
+        rgb(&material.diffuse),
+        rgb(&material.specular),
+        number(&material.shininess),
+        number(&material.roughness),
+        match &material.reflectance {
+            Some(name) => format!("\"{}\"", escape(name)),
+            None => "null".to_string(),
+        },
+        match material.texture {
+            Some(id) => id.to_string(),
+            None => "null".to_string(),
+        },
+        material.source
+    )
+}
+
+fn texture_json(texture: &TextureRecord, at: Option<usize>) -> String {
+    let data = match (&texture.data, at) {
+        (TextureData::Uri(uri), _) => format!("\"uri\":\"{}\"", escape(uri)),
+        (TextureData::Blob(bytes), Some(at)) => {
+            format!("\"blob\":{{\"off\":{at},\"len\":{}}}", bytes.len())
+        }
+        (
+            TextureData::Pixels {
+                width,
+                height,
+                components,
+                bytes,
+            },
+            Some(at),
+        ) => format!(
+            "\"pixels\":{{\"off\":{at},\"len\":{},\"width\":{width},\"height\":{height},\"components\":{components}}}",
+            bytes.len()
+        ),
+        _ => "\"omitted\":true".to_string(),
+    };
+    format!(
+        "{{\"id\":{},\"mime\":{},\"repeat\":[{},{}],\"transform\":{},{data}}}",
+        texture.id,
+        match &texture.mime {
+            Some(mime) => format!("\"{}\"", escape(mime)),
+            None => "null".to_string(),
+        },
+        texture.repeat[0],
+        texture.repeat[1],
+        match &texture.transform {
+            Some(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(format_double)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            None => "null".to_string(),
+        }
+    )
 }
 
 fn aligned(length: usize) -> usize {
@@ -723,6 +1084,19 @@ fn escape(text: &str) -> String {
 
 /// A content hash over a mesh, for deduplication.
 fn hash_mesh(positions: &[f32], indices: &[u32]) -> u64 {
+    hash_mesh_uv(positions, indices, &[])
+}
+
+/// A level's identity: its base and its indices, in a domain apart from meshes.
+fn hash_lod(base: u32, level: u8, indices: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (u64::MAX, base, level).hash(&mut hasher);
+    indices.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_mesh_uv(positions: &[f32], indices: &[u32], uvs: &[f32]) -> u64 {
     // FNV-1a over the raw bytes. Collisions cost a wrongly shared mesh, so the
     // vertex and index counts go in first to make one vanishingly unlikely.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -739,6 +1113,13 @@ fn hash_mesh(positions: &[f32], indices: &[u32]) -> u64 {
     }
     for value in indices {
         eat(&value.to_le_bytes());
+    }
+    // A mesh without coordinates hashes as before, so old packs stay identical.
+    if !uvs.is_empty() {
+        eat(&(uvs.len() as u64).to_le_bytes());
+        for value in uvs {
+            eat(&value.to_le_bytes());
+        }
     }
     hash
 }
@@ -769,6 +1150,7 @@ mod tests {
             color: [255, 255, 255, 255],
             flags: 0,
             provenance: Provenance::default(),
+            material: None,
         }
     }
 
@@ -908,6 +1290,7 @@ mod tests {
             color: [11, 22, 33, 44],
             flags: 0x1234,
             provenance: Provenance::default(),
+            material: None,
         });
         let bytes = writer.finish();
 
@@ -1126,5 +1509,96 @@ mod tests {
         let (_, _, _, _, json) = parse_header(&bytes);
         assert_eq!(json["geometries"][0]["indices"]["count"], 3);
         assert_eq!(json["geometries"][0]["indices"]["type"], "u16");
+    }
+
+    /// A fan of `n` triangles around a centre, over `n + 1` vertices.
+    fn fan(n: u32) -> (Vec<f32>, Vec<u32>) {
+        let mut positions = vec![0.0f32, 0.0, 0.0];
+        let mut indices = Vec::new();
+        for i in 0..n {
+            let angle = i as f32 / n as f32 * std::f32::consts::TAU;
+            positions.extend_from_slice(&[angle.cos(), angle.sin(), 0.0]);
+            indices.extend_from_slice(&[0, 1 + i, 1 + (i + 1) % n]);
+        }
+        (positions, indices)
+    }
+
+    #[test]
+    fn a_level_shares_its_base_positions_and_says_so() {
+        let mut writer = IgpWriter::new("IFC4", 1.0);
+        let (positions, indices) = fan(8);
+        let base = writer.add_geometry(&positions, &indices);
+        let coarse: Vec<u32> = indices[..12].to_vec();
+        let level = writer
+            .add_geometry_lod(base, coarse.clone(), 1)
+            .expect("a level over the base");
+        assert_ne!(level, base);
+        assert_eq!(
+            writer.add_geometry_lod(base, coarse.clone(), 1),
+            Some(level),
+            "an identical level collapses"
+        );
+        assert_eq!(
+            writer.add_geometry_lod(level, coarse.clone(), 2),
+            None,
+            "a level is no base"
+        );
+        assert_eq!(
+            writer.add_geometry_lod(base, vec![0, 1, 99], 1),
+            None,
+            "an index outside the base"
+        );
+        assert_eq!(
+            writer.add_geometry_lod(base, coarse.clone(), 3),
+            None,
+            "only levels 1 and 2"
+        );
+        assert_eq!(
+            writer.add_geometry_lod(77, coarse, 1),
+            None,
+            "an unknown base"
+        );
+        writer.add_instance(instance(base, 1, "IfcWall"));
+        let bytes = writer.finish();
+        let (_, _, _, _, json) = parse_header(&bytes);
+        let entries = json["geometries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[1]["lod"],
+            serde_json::json!({ "of": base, "level": 1 })
+        );
+        assert!(entries[0].get("lod").is_none());
+        assert_eq!(
+            entries[1]["positions"], entries[0]["positions"],
+            "the level's positions are the base's section"
+        );
+        assert_eq!(entries[1]["bbox"], entries[0]["bbox"]);
+        assert_eq!(entries[1]["indices"]["count"], 12);
+        assert_ne!(
+            entries[1]["indices"]["off"], entries[0]["indices"]["off"],
+            "the level has its own indices"
+        );
+        assert_eq!(entries[1]["indices"]["type"], "u16");
+        // The level's indices read back over the shared positions.
+        let json_len = json_len_of(&bytes);
+        let binary_start = 24 + json_len.div_ceil(8) * 8;
+        let off = entries[1]["indices"]["off"].as_u64().unwrap() as usize;
+        let read: Vec<u16> = (0..12)
+            .map(|i| {
+                u16::from_le_bytes(
+                    bytes[binary_start + off + i * 2..binary_start + off + i * 2 + 2]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+            indices[..12].to_vec()
+        );
+    }
+
+    fn json_len_of(bytes: &[u8]) -> usize {
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize
     }
 }

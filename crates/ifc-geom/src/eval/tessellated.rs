@@ -7,8 +7,81 @@ use crate::context::EvalCtx;
 use crate::error::GeomError;
 use crate::registry::{Registry, SolidEvaluator};
 use glam::DVec3;
+use std::collections::HashMap;
 use tessifc_mesh::{Mesh64, triangulate_face, weld_and_close};
 use tessifc_model::Entity;
+
+/// The texture coordinates an indexed texture map gives a face set.
+struct TextureMap {
+    /// The `IfcTextureVertexList`, as read.
+    coords: Vec<[f32; 2]>,
+    /// Per triangle of an `IfcTriangulatedFaceSet`: zero-based coordinate
+    /// indices, or `None` when the map follows `CoordIndex`.
+    triangles: Option<Vec<Vec<usize>>>,
+    /// Per `IfcIndexedPolygonalFace` id: zero-based coordinate indices.
+    faces: HashMap<u32, Vec<usize>>,
+}
+
+/// The indexed texture map of a face set, when textures are wanted and it has one.
+fn texture_map(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Option<TextureMap> {
+    if !ctx.settings.textures {
+        return None;
+    }
+    let map = ctx.model.entity(ctx.texture_map_of(item.id())?)?;
+    let coords: Vec<[f32; 2]> = map
+        .attr("TexCoords")
+        .as_entity()?
+        .attr("TexCoordsList")
+        .as_list()?
+        .filter_map(|row| {
+            let mut values = row.as_list()?.floats();
+            Some([values.next()? as f32, values.next()? as f32])
+        })
+        .collect();
+    let zero_based = |value: tessifc_model::Value<'_>| -> Option<usize> {
+        usize::try_from(value.as_i64()?.checked_sub(1)?)
+            .ok()
+            .filter(|index| *index < coords.len())
+    };
+    let mut triangles = None;
+    let mut faces = HashMap::new();
+    if map.is_a("IfcIndexedTriangleTextureMap") {
+        triangles = map.attr("TexCoordIndex").as_list().map(|rows| {
+            rows.map(|row| {
+                row.as_list()
+                    .map(|values| values.filter_map(zero_based).collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+        });
+    } else {
+        for value in map.attr("TexCoordIndices").as_list()? {
+            let Some(entry) = value.as_entity() else {
+                continue;
+            };
+            let Some(face) = entry.attr("TexCoordsOf").as_entity() else {
+                continue;
+            };
+            let indices: Vec<usize> = entry
+                .attr("TexCoordIndex")
+                .as_list()
+                .map(|values| values.filter_map(zero_based).collect())
+                .unwrap_or_default();
+            faces.insert(face.id(), indices);
+        }
+    }
+    Some(TextureMap {
+        coords,
+        triangles,
+        faces,
+    })
+}
+
+/// Coordinates for a face's `corners` corner indices, when the map has them all.
+fn face_uvs(map: &TextureMap, indices: &[usize], corners: usize) -> Option<Vec<[f32; 2]>> {
+    (indices.len() == corners && corners >= 3)
+        .then(|| indices.iter().map(|&index| map.coords[index]).collect())
+}
 
 /// Read the coordinates of an `IfcCartesianPointList2D` or `3D`.
 fn coordinates(ctx: &EvalCtx<'_>, entity: Entity<'_>) -> Result<Vec<DVec3>, GeomError> {
@@ -58,6 +131,13 @@ impl SolidEvaluator for TriangulatedFaceSet {
     }
 
     fn evaluate(&self, ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Mesh64, GeomError> {
+        // A texture map gives corners their own coordinates, so the shared
+        // vertices are split face by face and welded back where they agree.
+        if ctx.settings.textures && ctx.texture_map_of(item.id()).is_some() {
+            let faces = triangulated_faces(ctx, item)?;
+            let members: Vec<&Face> = faces.iter().collect();
+            return finish(ctx, item, mesh_of_faces(ctx, &members));
+        }
         let list = item
             .attr("Coordinates")
             .as_entity()
@@ -104,6 +184,8 @@ struct Face {
     holes: Vec<Vec<DVec3>>,
     /// The entity to blame when the face will not triangulate.
     id: u32,
+    /// Texture coordinates of the outer loop's corners, when the file maps them.
+    uvs: Option<Vec<[f32; 2]>>,
 }
 
 /// The faces of an `IfcPolygonalFaceSet` in file order.
@@ -118,6 +200,8 @@ fn polygonal_faces(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Vec<Face>, Geo
         .attr("Faces")
         .as_list()
         .ok_or_else(|| GeomError::missing("Faces"))?;
+    let map = texture_map(ctx, item);
+    let mut unmapped = 0usize;
     let mut out = Vec::new();
     for value in faces {
         let Some(face) = value.as_entity() else {
@@ -133,6 +217,16 @@ fn polygonal_faces(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Vec<Face>, Geo
                     .collect()
             })
             .unwrap_or_default();
+        let uvs = map.as_ref().and_then(|map| {
+            let found = map
+                .faces
+                .get(&face.id())
+                .and_then(|indices| face_uvs(map, indices, outer.len()));
+            if found.is_none() && outer.len() >= 3 {
+                unmapped += 1;
+            }
+            found
+        });
         // A face too small to triangulate still keeps its slot for the colour index.
         let mut holes: Vec<Vec<DVec3>> = Vec::new();
         // IfcIndexedPolygonalFaceWithVoids carries its holes in InnerCoordIndices.
@@ -155,7 +249,15 @@ fn polygonal_faces(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Vec<Face>, Geo
             outer,
             holes,
             id: face.id(),
+            uvs,
         });
+    }
+    if unmapped > 0 {
+        ctx.diag.info(
+            crate::error::codes::TEXTURE_MAP_IGNORED,
+            item.id(),
+            format!("{unmapped} face(s) have no matching texture coordinates"),
+        );
     }
     Ok(out)
 }
@@ -172,21 +274,52 @@ fn triangulated_faces(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Vec<Face>, 
         .attr("CoordIndex")
         .as_list()
         .ok_or_else(|| GeomError::missing("CoordIndex"))?;
+    let map = texture_map(ctx, item);
+    let mut unmapped = 0usize;
     let mut out = Vec::new();
-    for row in faces {
+    for (position, row) in faces.enumerate() {
         let Some(values) = row.as_list() else {
             continue;
         };
-        let outer: Vec<DVec3> = values
-            .filter_map(|value| value.as_i64())
-            .filter_map(|index| resolve(index, &pn, points.len()))
+        // A map without its own indices follows the coordinate indices.
+        let raw: Vec<i64> = values.filter_map(|value| value.as_i64()).collect();
+        let outer: Vec<DVec3> = raw
+            .iter()
+            .filter_map(|&index| resolve(index, &pn, points.len()))
             .map(|index| points[index])
             .collect();
+        let uvs = map.as_ref().and_then(|map| {
+            let own: Vec<usize>;
+            let indices: &[usize] = match &map.triangles {
+                Some(rows) => rows.get(position).map(Vec::as_slice).unwrap_or(&[]),
+                None => {
+                    own = raw
+                        .iter()
+                        .filter_map(|&index| usize::try_from(index.checked_sub(1)?).ok())
+                        .filter(|index| *index < map.coords.len())
+                        .collect();
+                    &own
+                }
+            };
+            let found = face_uvs(map, indices, outer.len());
+            if found.is_none() && outer.len() == 3 {
+                unmapped += 1;
+            }
+            found
+        });
         out.push(Face {
             outer: if outer.len() == 3 { outer } else { Vec::new() },
             holes: Vec::new(),
             id: item.id(),
+            uvs,
         });
+    }
+    if unmapped > 0 {
+        ctx.diag.info(
+            crate::error::codes::TEXTURE_MAP_IGNORED,
+            item.id(),
+            format!("{unmapped} triangle(s) have no matching texture coordinates"),
+        );
     }
     Ok(out)
 }
@@ -205,6 +338,13 @@ fn mesh_of_faces(ctx: &EvalCtx<'_>, faces: &[&Face]) -> Mesh64 {
                 for hole in &face.holes {
                     mesh.positions.extend_from_slice(hole);
                 }
+                crate::eval::uv::push_face_uvs(
+                    &mut mesh,
+                    base as usize,
+                    &face.outer,
+                    &face.holes,
+                    face.uvs.as_deref(),
+                );
                 for triangle in indices.chunks_exact(3) {
                     mesh.push_triangle(base + triangle[0], base + triangle[1], base + triangle[2]);
                 }
@@ -345,7 +485,7 @@ pub fn register(registry: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::tests::{eval_solid, model_of};
+    use crate::eval::tests::{eval_solid, eval_textured_solid, model_of};
 
     /// The eight corners of a unit cube as a coordinate list.
     const CUBE_POINTS: &str = "((0.,0.,0.),(1.,0.,0.),(1.,1.,0.),(0.,1.,0.),\
@@ -368,6 +508,93 @@ mod tests {
             mesh.signed_volume()
         );
         assert!((mesh.surface_area() - 6.0).abs() < 1e-9);
+    }
+
+    /// A unit cube face set with a texture map in which the front face, corners
+    /// 1 2 6 5, has its own coordinates: a seam at each of those corners.
+    fn textured_cube(map: &str) -> String {
+        format!(
+            "#1=IFCCARTESIANPOINTLIST3D({CUBE_POINTS},$);\n\
+             #2=IFCTRIANGULATEDFACESET(#1,$,.T.,((1,3,2),(1,4,3),(5,6,7),(5,7,8),\
+             (1,2,6),(1,6,5),(2,3,7),(2,7,6),(3,4,8),(3,8,7),(4,1,5),(4,5,8)),$);\n\
+             #3=IFCTEXTUREVERTEXLIST(((0.,0.),(1.,0.),(1.,1.),(0.,1.),(0.,0.),(1.,0.),(1.,1.),(0.,1.),(0.5,0.5)));\n\
+             {map}"
+        )
+    }
+
+    #[test]
+    fn a_texture_map_gives_the_quad_its_coordinates() {
+        let model = model_of(crate::style::tests::TEXTURED_QUAD);
+        let (mesh, diagnostics) = eval_textured_solid(&model, 2);
+        let mesh = mesh.unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(mesh.has_uvs());
+        assert_eq!(mesh.positions.len(), 4);
+        let at = |x: f64, y: f64| {
+            mesh.positions
+                .iter()
+                .position(|p| (p.x - x).abs() < 1e-9 && (p.y - y).abs() < 1e-9)
+                .unwrap()
+        };
+        assert_eq!(mesh.uvs[at(1.0, 1.0)], [1.0, 1.0]);
+        assert_eq!(mesh.uvs[at(0.0, 1.0)], [0.0, 1.0]);
+        // The plain evaluation carries nothing.
+        assert!(!eval_solid(&model, 2).unwrap().has_uvs());
+    }
+
+    #[test]
+    fn a_map_without_its_own_indices_follows_the_coordinate_indices() {
+        let model = model_of(&textured_cube(
+            "#4=IFCINDEXEDTRIANGLETEXTUREMAP((#10),#2,#3,$);\n\
+             #10=IFCIMAGETEXTURE(.T.,.T.,$,$,$,'a.png');\n",
+        ));
+        let (mesh, diagnostics) = eval_textured_solid(&model, 2);
+        let mesh = mesh.unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(mesh.has_uvs());
+        assert_eq!(
+            mesh.positions.len(),
+            8,
+            "one coordinate per corner, no seam"
+        );
+        assert_eq!(mesh.closed, Some(true));
+    }
+
+    #[test]
+    fn a_seam_keeps_vertices_apart_but_the_cube_stays_closed() {
+        // The front face maps its corners to the ninth coordinate; the other
+        // faces follow the corner numbers.
+        let model = model_of(&textured_cube(
+            "#4=IFCINDEXEDTRIANGLETEXTUREMAP((#10),#2,#3,((1,3,2),(1,4,3),(5,6,7),(5,7,8),\
+             (9,9,9),(9,9,9),(2,3,7),(2,7,6),(3,4,8),(3,8,7),(4,1,5),(4,5,8)));\n\
+             #10=IFCIMAGETEXTURE(.T.,.T.,$,$,$,'a.png');\n",
+        ));
+        let (mesh, diagnostics) = eval_textured_solid(&model, 2);
+        let mesh = mesh.unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(mesh.has_uvs());
+        assert_eq!(mesh.positions.len(), 12, "the four front corners are split");
+        assert_eq!(mesh.closed, Some(true), "closedness is judged on positions");
+        assert!((mesh.signed_volume() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_map_that_does_not_match_is_noted_and_left_out() {
+        let model = model_of(&textured_cube(
+            "#4=IFCINDEXEDTRIANGLETEXTUREMAP((#10),#2,#3,((1,2),(1,4,3)));\n\
+             #10=IFCIMAGETEXTURE(.T.,.T.,$,$,$,'a.png');\n",
+        ));
+        let (mesh, diagnostics) = eval_textured_solid(&model, 2);
+        let mesh = mesh.unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == crate::error::codes::TEXTURE_MAP_IGNORED),
+            "{diagnostics:?}"
+        );
+        // Eleven triangles are unmapped and get zeros; the mesh still carries coordinates.
+        assert!(mesh.has_uvs());
+        assert_eq!(mesh.closed, Some(true));
     }
 
     #[test]

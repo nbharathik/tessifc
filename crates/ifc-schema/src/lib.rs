@@ -3,8 +3,6 @@
 //! ids and names, STEP attribute order, subtype tests and defined-type
 //! primitives. The tables under `gen/` are generated; do not edit them by hand.
 //!
-//! # Example
-//!
 //! ```
 //! use tessifc_schema::{Schema, SchemaId};
 //!
@@ -26,7 +24,8 @@ use core::fmt;
     feature = "schema-ifc4x3"
 )))]
 compile_error!(
-    "tessifc-schema needs at least one of schema-ifc2x3, schema-ifc4 or schema-ifc4x3.      Building with none of them would produce a kernel that cannot read any file."
+    "tessifc-schema needs at least one of schema-ifc2x3, schema-ifc4 or schema-ifc4x3; \
+     with none of them the kernel cannot read any file."
 );
 
 // `gen` is a reserved keyword in edition 2024, so the module is named `generated`.

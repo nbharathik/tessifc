@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `tessifc info`: read a file and report what is in it.
-//!
-//! The JSON form is a contract, not a convenience. Add fields freely, but do
-//! not rename or repurpose one without updating its consumers in the same
-//! commit.
+//! `tessifc info`: read a file and report what is in it. The JSON form is a
+//! contract: add fields freely, never rename or repurpose one.
 
 use crate::alloc;
 use serde::Serialize;
@@ -11,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use tessifc_step::{ParseOptions, SchemaId, parse};
+use tessifc_step::{ParseOptions, SchemaId};
 
 #[derive(Serialize)]
 struct Report {
@@ -94,7 +91,7 @@ pub fn run(
     }
 
     let started = Instant::now();
-    let image = parse(&bytes, &options);
+    let image = tessifc_step::open(&bytes, &options);
     let elapsed = started.elapsed();
 
     let parse_ms = elapsed.as_secs_f64() * 1000.0;

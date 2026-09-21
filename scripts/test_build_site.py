@@ -74,6 +74,8 @@ class GeneratedSite(unittest.TestCase):
     def setUpClass(cls):
         if not (site.REPO / "bindings" / "wasm" / "pkg" / "tessifc_wasm_bg.wasm").is_file():
             raise unittest.SkipTest("build the browser WASM package to run the generated-site checks")
+        if importlib.util.find_spec("mkdocs") is None:
+            raise unittest.SkipTest("install requirements-site.txt to run the generated-site checks")
         temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(temporary.cleanup)
         cls.out = Path(temporary.name) / "site"
@@ -102,7 +104,7 @@ class GeneratedSite(unittest.TestCase):
     def test_published_heading_anchors_are_preserved(self):
         historical = {
             "getting-started": "three-js",
-            "preview": "v0-1-developer-preview",
+            "preview": "developer-preview",
         }
         for stem, anchor in historical.items():
             with self.subTest(page=stem, anchor=anchor):
@@ -160,7 +162,8 @@ class GeneratedSite(unittest.TestCase):
     def test_viewer_package_and_public_assets_are_included(self):
         for relative in (
             "viewer/index.html", "viewer/src/main.js", "bindings/wasm/pkg/tessifc_wasm.js",
-            "bindings/wasm/pkg/tessifc_wasm_bg.wasm", "assets/viewer.png", ".nojekyll",
+            "bindings/wasm/pkg/tessifc_wasm_bg.wasm", "bindings/edit/src/igp.js", "bindings/viewer/src/renderer.js",
+            "assets/viewer.png", ".nojekyll",
         ):
             with self.subTest(path=relative):
                 self.assertTrue((self.out / relative).is_file())

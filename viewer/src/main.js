@@ -20,6 +20,10 @@ import { createTools } from "./tools.js";
 import { createGizmo } from "./gizmo.js";
 import { createFrameScheduler, createTaskQueue } from "./scheduler.js";
 import { bytes, coordinate, count, duration, errorText, plural } from "./format.js";
+import { startFileSession } from "./file-session.js";
+import { createSessionPanel } from "./session-panel.js";
+import { PROVIDERS, createBrowserAssistant } from "./assistant.js";
+import { describeModelInfo } from "../../bindings/edit/src/describe.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -30,7 +34,8 @@ const HELPER_FILTERS = [
 ];
 
 const SETTINGS_KEY = "tessifc.settings";
-const DEFAULT_SETTINGS = { scale: 1.5, hideSemantic: true, adaptive: false, lod: true, coincident: true };
+const DEFAULT_SETTINGS = { scale: 1, hideSemantic: true, adaptive: false, lod: true, coincident: true, occlusion: true, motionLod: true, textures: false, scriptTimeoutMs: 30_000 };
+const SCRIPT_TIMEOUTS_MS = [10_000, 30_000, 120_000, 0];
 
 /** Rendering settings from the last visit; a blocked or stale store falls back. */
 function loadSettings() {
@@ -41,6 +46,9 @@ function loadSettings() {
     for (const key of Object.keys(DEFAULT_SETTINGS)) {
       if (typeof stored[key] === typeof DEFAULT_SETTINGS[key]) settings[key] = stored[key];
     }
+    // The scale is a fraction of native resolution now; an older stored limit above it means native.
+    settings.scale = Math.min(1, Math.max(0.25, settings.scale));
+    if (!SCRIPT_TIMEOUTS_MS.includes(settings.scriptTimeoutMs)) settings.scriptTimeoutMs = DEFAULT_SETTINGS.scriptTimeoutMs;
     return settings;
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -64,6 +72,9 @@ const state = {
   stream: null,
   selection: null,
   dirty: false,
+  revisionPending: null,
+  fileSession: null,
+  scriptHistory: { undo: 0, redo: 0 },
   hiddenClasses: new Set(),
   hiddenRecords: new Set(),
   shownRecords: new Set(),
@@ -84,6 +95,25 @@ try {
 const shell = createShell();
 const tools = createTools({ renderer, shell, scheduleRender });
 const inspector = createInspector({ onApplyEdits: applyEdits });
+const assistant = createBrowserAssistant({
+  inspect: (code, selection) => runBrowserScript(code, selection, { commit: false }),
+  execute: (script, selection) => runBrowserScript(script, selection),
+  undo: () => browserHistoryAction("undo"),
+  context: assistantContext,
+});
+const sessionPanel = createSessionPanel({
+  shell,
+  getSession: () => state.fileSession,
+  getSelection: selectionSummary,
+  hasModel: () => Boolean(state.model && !state.model.stale),
+  browser: {
+    run: (script, selection) => runBrowserScript(script, selection),
+    undo: () => browserHistoryAction("undo"),
+    redo: () => browserHistoryAction("redo"),
+    history: () => state.scriptHistory,
+  },
+  assistant,
+});
 const tree = createTree({
   onVisibility: setNodeVisible,
   onSelect: (expressId) => selectExpressId(expressId),
@@ -118,6 +148,8 @@ function renderScene() {
   syncMemoryNextFrame = false;
   renderer.render();
   tools.drawOverlay();
+  // A highlight fade keeps asking for frames until it is done.
+  if (renderer.animating) renderScheduler.request(false);
   if (syncGizmoNextFrame) {
     syncGizmoNextFrame = false;
     syncGizmo();
@@ -195,6 +227,7 @@ shell.on("resize", () => requestAnimationFrame(() => {
 shell.register([
   { id: "open", label: "Open IFC file", section: "File", hint: "Ctrl O", run: () => $("file-input").click() },
   { id: "export", label: "Export IFC", section: "File", hint: "Ctrl S", disabled: true, run: requestExport },
+  { id: "update-ifc", label: "Update from edited IFC", section: "File", disabled: true, run: () => $("revision-input").click() },
   { id: "close", label: "Close model", section: "File", disabled: true, run: closeModel },
   { id: "settings", label: "Settings", section: "Workspace", hint: "Ctrl ,", run: shell.openSettings },
   { id: "help", label: "Keyboard shortcuts", section: "Workspace", hint: "?", run: shell.openHelp },
@@ -225,6 +258,9 @@ shell.register([
   { id: "toggle-outliner", label: "Toggle the structure panel", section: "Panels", hint: "Ctrl B", run: () => shell.togglePanel("outliner") },
   { id: "toggle-inspector", label: "Toggle the inspector", section: "Panels", hint: "\\", run: () => shell.togglePanel("inspector") },
   { id: "toggle-editor", label: "Toggle the edit panel", section: "Panels", hint: "E", run: () => setEditor(!shell.panelVisible("editor")) },
+  { id: "toggle-session", label: "Toggle the session panel", section: "Panels", run: () => shell.togglePanel("session") },
+  { id: "session-script", label: "Python script panel", section: "Session", run: () => sessionPanel.open("script") },
+  { id: "session-assistant", label: "Assistant panel", section: "Session", run: () => sessionPanel.open("assistant") },
   { id: "properties", label: "Show properties", section: "Panels", run: () => shell.setInspectorPanel("properties") },
   { id: "element", label: "Show element details", section: "Panels", run: () => shell.setInspectorPanel("element") },
   { id: "model-stats", label: "Show model statistics", section: "Panels", disabled: true, run: () => shell.setInspectorPanel("model") },
@@ -255,6 +291,11 @@ shell.on("canvasTheme", (theme) => {
 
 // -------------------------------------------------------------- settings
 
+/** Geometry settings the worker merges over its defaults: only what the panel turns on. */
+function geometrySettingOverrides() {
+  return state.settings.textures ? { textures: true } : {};
+}
+
 function saveSettings() {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
@@ -267,7 +308,7 @@ $("set-theme").addEventListener("change", (event) => shell.applyTheme(event.targ
 $("set-canvas").addEventListener("change", (event) => shell.applyCanvasTheme(event.target.value));
 $("set-scale").addEventListener("change", (event) => {
   state.settings.scale = Number(event.target.value) || 1;
-  renderer.setPixelRatioLimit?.(state.settings.scale);
+  renderer.setRenderScale?.(state.settings.scale);
   renderer.resize();
   saveSettings();
   scheduleRender(true);
@@ -290,6 +331,56 @@ $("set-coincident").addEventListener("change", (event) => {
   saveSettings();
   scheduleRender(true);
 });
+$("set-motion-lod").addEventListener("change", (event) => {
+  state.settings.motionLod = event.target.checked;
+  renderer.setMotionLod?.(event.target.checked);
+  saveSettings();
+  if (event.target.checked) requestMeshLevels();
+  scheduleRender(true);
+});
+$("set-occlusion").addEventListener("change", (event) => {
+  state.settings.occlusion = event.target.checked;
+  renderer.setOcclusionCulling?.(event.target.checked);
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-textures").addEventListener("change", (event) => {
+  state.settings.textures = event.target.checked;
+  renderer.setTextures?.(event.target.checked);
+  saveSettings();
+  scheduleRender(true);
+});
+$("set-script-timeout").addEventListener("change", (event) => {
+  state.settings.scriptTimeoutMs = Number(event.target.value) || 0;
+  saveSettings();
+});
+// The assistant fields write straight through; the panel re-reads them on its next refresh.
+function syncAssistantFields() {
+  const settings = assistant.settings();
+  const provider = PROVIDERS[settings.provider] ?? PROVIDERS.off;
+  $("set-assistant-provider").value = settings.provider;
+  $("set-assistant-model").value = settings.model;
+  $("set-assistant-model").placeholder = provider.model ?? "";
+  $("set-assistant-url").value = settings.baseUrl;
+  $("set-assistant-key").value = settings.key;
+  $("set-assistant-model-row").classList.toggle("hidden", settings.provider === "off");
+  $("set-assistant-url-row").classList.toggle("hidden", settings.provider !== "compatible");
+  $("set-assistant-key-row").classList.toggle("hidden", settings.provider === "off");
+}
+$("set-assistant-provider").addEventListener("change", (event) => {
+  const provider = PROVIDERS[event.target.value] ?? PROVIDERS.off;
+  assistant.update({ provider: event.target.value, model: provider.model ?? "", baseUrl: provider.baseUrl ?? "" });
+  syncAssistantFields();
+  sessionPanel.refresh();
+});
+for (const [id, key] of [["set-assistant-model", "model"], ["set-assistant-url", "baseUrl"], ["set-assistant-key", "key"]]) {
+  $(id).addEventListener("input", (event) => {
+    assistant.update({ [key]: event.target.value.trim() });
+    sessionPanel.refresh();
+  });
+}
+$("assistant-settings").addEventListener("click", () => shell.openSettings());
+
 $("set-hidden").addEventListener("change", (event) => {
   state.settings.hideSemantic = event.target.checked;
   state.hiddenInstanceFlags = event.target.checked ? DEFAULT_HIDDEN_INSTANCE_FLAGS : 0;
@@ -309,8 +400,14 @@ $("set-hidden").addEventListener("change", (event) => {
 
 $("file-input").addEventListener("change", (event) => {
   const [file] = event.target.files;
-  if (file) openFile(file);
+  if (file) openFile(file, { detachSession: true });
   event.target.value = "";
+});
+
+$("revision-input").addEventListener("change", (event) => {
+  const [file] = event.target.files;
+  event.target.value = "";
+  if (file) updateFromFile(file).catch((error) => shell.toast(errorText(error), "error"));
 });
 
 window.addEventListener("dragenter", (event) => {
@@ -336,7 +433,7 @@ window.addEventListener("drop", (event) => {
   state.dragDepth = 0;
   endDrag();
   const [file] = event.dataTransfer.files;
-  if (file) openFile(file);
+  if (file) openFile(file, { detachSession: true });
 });
 window.addEventListener("beforeunload", (event) => {
   if (!state.dirty) return;
@@ -401,9 +498,20 @@ function pickAtRelease(event) {
     if (surface) tools.addMeasurePoint(surface, at);
     return;
   }
-  const hit = renderer.pick(at.x, at.y, false);
+  const hit = renderer.pick(at.x, at.y, true);
   if (!hit) clearSelection();
-  else selectRecord(hit.record);
+  else {
+    // The clicked surface becomes the orbit and zoom centre.
+    if (hit.point) renderer.setPivot(hit.point);
+    selectRecord(hit.record);
+  }
+}
+
+/** Bring the inspector forward for a selection, unless an edit or session panel is in its place. */
+function revealSelectionPanel(panel) {
+  if (shell.panelVisible("editor") || shell.panelVisible("session")) return;
+  if (panel === "element") shell.setPanel("inspector", true);
+  else shell.setInspectorPanel("properties");
 }
 
 function selectExpressId(expressId, refresh = false) {
@@ -417,8 +525,7 @@ function selectRecord(record, refresh = false) {
       (selected.infoState === "pending" || selected.infoState === "ready")) {
     const panel = shell.inspectorPanel();
     if (!shell.panelVisible("inspector") || panel !== "element" && panel !== "properties") {
-      if (panel === "element") shell.setPanel("inspector", true);
-      else shell.setInspectorPanel("properties");
+      revealSelectionPanel(panel === "element" ? "element" : "properties");
     }
     return;
   }
@@ -432,8 +539,11 @@ function selectRecord(record, refresh = false) {
   let triangles = 0;
   for (const item of records) triangles += index.triangles[item];
 
+  // A refresh of the element already shown keeps its attributes on screen until the new ones arrive.
+  const quiet = refresh && selected?.expressId === expressId && selected.modelId === state.model.modelId;
   state.selection = { record, records, expressId, className, modelId: state.model.modelId,
-    requestId: ++state.requestId, editRequestId: 0, infoState: state.worker ? "pending" : "idle" };
+    requestId: ++state.requestId, editRequestId: 0, infoState: state.worker ? "pending" : "idle",
+    info: quiet ? selected.info : undefined };
   renderer.select(records);
   scheduleRender();
 
@@ -442,8 +552,7 @@ function selectRecord(record, refresh = false) {
   const offset = pack.index.model_offset ?? [0, 0, 0];
   const toIfc = (point) => point.map((value, axis) => value + offset[axis]);
   // A user reading the element tab keeps it; anyone else lands on the properties.
-  if (shell.inspectorPanel() === "element") shell.setPanel("inspector", true);
-  else shell.setInspectorPanel("properties");
+  revealSelectionPanel(shell.inspectorPanel() === "element" ? "element" : "properties");
   inspector.showSelection({
     className,
     expressId,
@@ -458,8 +567,10 @@ function selectRecord(record, refresh = false) {
     extent: bounds ? { min: toIfc(bounds.min), max: toIfc(bounds.max) } : null,
     path: tree.pathOf(expressId),
     state: describeVisibility(records),
+    quiet,
   });
   syncIsolation(isIsolated(records));
+  sessionPanel.setSelection(true);
   panelWork.selection = true;
   schedulePanelWork();
   for (const id of ["isolate", "hide", "clear-selection", "focus", "edit"]) shell.setEnabled(id, true);
@@ -473,10 +584,27 @@ function selectRecord(record, refresh = false) {
   });
 }
 
+/** The selection as a script target: express id, class, and the GlobalId once its attributes arrived. */
+function selectionSummary() {
+  const selection = state.selection;
+  if (!selection || selection.modelId !== state.model?.modelId) return null;
+  const fields = Array.isArray(selection.info?.fields) ? selection.info.fields : [];
+  const field = (name) => fields.find((item) => item.name === name)?.value ?? null;
+  const node = state.model.hierarchy?.nodes?.find((item) => item.expressId === selection.expressId);
+  return {
+    expressId: selection.expressId,
+    className: selection.className,
+    globalId: field("GlobalId") ?? node?.globalId ?? null,
+    name: field("Name") ?? node?.name ?? null,
+  };
+}
+
 function clearSelection() {
   renderer.select(null);
   scheduleRender();
   state.selection = null;
+  sessionPanel.setSelection(false);
+  state.fileSession?.reportSelection?.(null);
   inspector.clearSelection();
   panelWork.selection = true;
   schedulePanelWork();
@@ -511,6 +639,7 @@ function isRecordVisible(record) {
 }
 
 function isRecordVisibleInPack(pack, record) {
+  if (pack.instances.active && !pack.instances.active[record]) return false;
   if (state.isolated && !state.isolated.has(record)) return false;
   if (state.hiddenRecords.has(record)) return false;
   if (state.shownRecords.has(record)) return true;
@@ -579,11 +708,11 @@ function isIsolated(records) {
   return Boolean(state.isolated) && records.every((record) => state.isolated.has(record));
 }
 
+/** Undo every hide and isolation; the helper categories keep their own toggles. */
 function restoreVisibility() {
   state.hiddenClasses.clear();
   state.hiddenRecords.clear();
   state.shownRecords.clear();
-  state.hiddenInstanceFlags = 0;
   state.isolated = null;
   tree.markAllVisible();
   syncIsolation(false);
@@ -644,11 +773,15 @@ function scheduleVisibilityStats() {
   if (statsFrame) return;
   statsFrame = requestAnimationFrame(() => {
     statsFrame = 0;
-    const total = state.model?.pack.instances.count ?? 0;
+    const instances = state.model?.pack.instances;
+    const total = instances?.activeCount ?? instances?.count ?? 0;
     let visible = 0;
-    for (let record = 0; record < total; record += 1) if (isRecordVisible(record)) visible += 1;
+    for (let record = 0; record < (instances?.count ?? 0); record += 1) if (isRecordVisible(record)) visible += 1;
     $("stat-visible").textContent = count(visible);
     $("stat-hidden").textContent = count(total - visible);
+    // The dock's show-all button lights up while a hide or an isolation is in force.
+    const restorable = state.hiddenRecords.size > 0 || state.hiddenClasses.size > 0 || Boolean(state.isolated);
+    $("dock-show-all").classList.toggle("attention", restorable);
   });
 }
 
@@ -674,16 +807,30 @@ function startWorker() {
         return receiveEntityInfo(data);
       case "entity-error":
         return receiveEntityError(data);
-      case "edit-result":
-        return receiveEditResult(data);
-      case "edit-error":
-        return receiveEditError(data);
       case "export-result":
         return receiveExport(data);
       case "export-error":
         return shell.toast(data.message, "error");
-      case "product-geometry":
-        return receiveProductGeometry(data);
+      case "script-finished":
+        return receiveScriptFinished(data);
+      case "script-result":
+        receiveScriptResult(data);
+        break;
+      case "script-error":
+        receiveScriptError(data);
+        break;
+      case "revision-result":
+        return receiveRevision(data);
+      case "revision-error":
+        return receiveRevisionError(data);
+      case "reopened":
+        return receiveReopened(data);
+      case "reopen-error":
+        return receiveReopenError(data);
+      case "contested-triangles":
+        return receiveContestedTriangles(data);
+      case "mesh-levels":
+        return receiveMeshLevels(data);
       default:
         break;
     }
@@ -714,6 +861,7 @@ function startWorker() {
     worker.terminate();
     state.worker = null;
     state.workerReady = false;
+    if (state.revisionPending) finishRevision(new Error("The geometry worker stopped."));
     state.converting = false;
     state.loadOutcome = "failed";
     abandonStream();
@@ -730,6 +878,10 @@ function workerReady(data) {
   setStatus("Kernel ready", "on");
   $("status-engine").textContent = `TessIFC ${data.version}`;
   if (!state.model) $("model-name").textContent = "No model open";
+  if (state.revisionPending?.reopen) {
+    sendReopen();
+    return;
+  }
   if (state.queuedFile) {
     const queued = state.queuedFile;
     state.queuedFile = null;
@@ -755,9 +907,13 @@ function workerFailed(data) {
 
 // ------------------------------------------------------------ model load
 
-async function openFile(file) {
-  if (!file.name.toLowerCase().endsWith(".ifc")) {
-    shell.toast("Choose an IFC-SPF file with the .ifc extension.", "error");
+async function openFile(file, { detachSession = false } = {}) {
+  if (state.revisionPending) {
+    shell.toast("Wait for the current IFC update to finish.", "info");
+    return;
+  }
+  if (!/\.(ifc|ifczip)$/i.test(file.name)) {
+    shell.toast("Choose an IFC file with the .ifc or .ifczip extension.", "error");
     return;
   }
   if (!file.size) {
@@ -768,6 +924,7 @@ async function openFile(file) {
     if (!window.confirm("This model has unsaved IFC edits. Discard them and open another file?")) return;
     state.replaceApproved = file;
   }
+  if (detachSession) detachFileSession();
   if (state.converting) {
     state.queuedFile = file;
     state.jobId += 1;
@@ -794,10 +951,11 @@ async function openFile(file) {
   try {
     const buffer = await file.arrayBuffer();
     if (jobId !== state.jobId) return;
-    state.pendingFile = { name: file.name, size: file.size };
+    // The handle stays so the model can be reopened after its worker was ended.
+    state.pendingFile = { name: file.name, size: file.size, handle: file };
     state.converting = true;
     state.loadOutcome = "loading";
-    state.worker.postMessage({ type: "convert", jobId, buffer }, [buffer]);
+    state.worker.postMessage({ type: "convert", jobId, buffer, settings: geometrySettingOverrides() }, [buffer]);
   } catch (error) {
     state.loadOutcome = "failed";
     finishLoading();
@@ -835,6 +993,118 @@ function setProgress(progress) {
     track.classList.remove("determinate");
     bar.style.width = "";
   }
+}
+
+/**
+ * Ask the worker which triangles share a plane with another product. The renderer keeps
+ * the bounds-based overlay until the answer arrives, then redraws only those triangles.
+ */
+function requestContestedTriangles() {
+  const model = state.model;
+  if (!model || !state.worker || typeof renderer.applyContestedTriangles !== "function") return;
+  const { pack } = model;
+  const requestId = ++state.requestId;
+  model.overlayAnalysis = { requestId, state: "pending", requestedAt: performance.now() };
+  // Copies, not views: a view would clone the whole chunk buffer behind it.
+  const geometries = pack.geometry.map((geometry) => ({
+    id: geometry.id,
+    positions: Float32Array.from(geometry.positions),
+    indices: geometry.indices.slice(),
+  }));
+  const instances = {
+    count: pack.instances.count,
+    transforms: pack.instances.transforms.slice(),
+    colors: pack.instances.colors.slice(),
+    geometryIds: pack.instances.geometryIds.slice(),
+    active: pack.instances.active ? pack.instances.active.slice() : null,
+  };
+  const transfer = [instances.transforms.buffer, instances.colors.buffer, instances.geometryIds.buffer];
+  if (instances.active) transfer.push(instances.active.buffer);
+  for (const geometry of geometries) transfer.push(geometry.positions.buffer, geometry.indices.buffer);
+  state.worker.postMessage({ type: "contested-triangles", requestId, modelId: model.modelId, instances, geometries }, transfer);
+}
+
+function receiveContestedTriangles(data) {
+  const model = state.model;
+  if (!model || model.overlayAnalysis?.requestId !== data.requestId) return;
+  if (model.lastUpdate?.stages && model.overlayAnalysis.requestedAt) {
+    model.lastUpdate.stages.overlayMs = performance.now() - model.overlayAnalysis.requestedAt;
+    model.lastUpdate.stages.overlayWorkerMs = data.elapsedMs ?? null;
+  }
+  if (data.error) {
+    model.overlayAnalysis = { requestId: data.requestId, state: "failed", error: data.error };
+    return;
+  }
+  // Past its budget the analysis has no answer; the bounds overlay stays.
+  if (data.exhausted) {
+    model.overlayAnalysis = { requestId: data.requestId, state: "exhausted", elapsedMs: data.elapsedMs };
+    return;
+  }
+  renderer.applyContestedTriangles(data);
+  model.overlayAnalysis = { requestId: data.requestId, state: "ready", triangles: data.triangles.length, pairs: data.pairs, elapsedMs: data.elapsedMs };
+  inspector.setDisplayFacts(renderer);
+  scheduleRender(true);
+  requestMeshLevels();
+}
+
+// Meshes with at least this many triangles get a coarse level for moving frames.
+const LOD_MIN_TRIANGLES = 1024;
+// Meshes per worker message, so the levels land while the worker stays answerable.
+const LOD_BATCH = 8;
+
+/**
+ * Ask the worker for coarse levels of the model's large meshes, a few meshes
+ * per message; they are added to the pack and the GPU as each reply lands.
+ */
+function requestMeshLevels() {
+  const model = state.model;
+  if (!model || !state.worker || !state.settings.motionLod || typeof renderer.applyLodLevels !== "function") return;
+  const { pack } = model;
+  const levelled = new Set(pack.geometry.filter((mesh) => mesh.lod).map((mesh) => mesh.lod.of));
+  const large = pack.geometry.filter((mesh) => !mesh.lod && !levelled.has(mesh.id) && mesh.indices.length >= LOD_MIN_TRIANGLES * 3);
+  if (!large.length) {
+    model.lodLevels = { state: "ready", requested: 0, received: 0, levels: 0, pending: 0 };
+    return;
+  }
+  const generation = (model.lodLevels?.generation ?? 0) + 1;
+  model.lodLevels = { state: "pending", generation, requested: large.length, received: 0, levels: 0, pending: 0, workerMs: 0, mainMs: 0 };
+  const chordToleranceM = model.settings?.chordToleranceM ?? 0.002;
+  for (let at = 0; at < large.length; at += LOD_BATCH) {
+    const geometries = large.slice(at, at + LOD_BATCH).map((mesh) => ({
+      id: mesh.id,
+      positions: Float32Array.from(mesh.positions),
+      indices: Uint32Array.from(mesh.indices),
+    }));
+    const transfer = geometries.flatMap((mesh) => [mesh.positions.buffer, mesh.indices.buffer]);
+    const requestId = ++state.requestId;
+    model.lodLevels.pending += 1;
+    state.worker.postMessage({ type: "mesh-levels", requestId, modelId: model.modelId, generation, geometries, chordToleranceM, levels: 1 }, transfer);
+  }
+}
+
+/** Coarse levels from the worker: into the assembler, then onto the GPU without re-uploading vertices. */
+function receiveMeshLevels(data) {
+  const model = state.model;
+  if (!model || data.modelId !== model.modelId || !model.lodLevels || model.lodLevels.state !== "pending") return;
+  const tracker = model.lodLevels;
+  const started = performance.now();
+  tracker.pending = Math.max(0, tracker.pending - 1);
+  tracker.workerMs += data.elapsedMs ?? 0;
+  if (data.error) {
+    tracker.error = data.error;
+  } else if (data.levels?.length && model.assembler) {
+    const ids = model.assembler.addLodLevels(data.levels);
+    if (ids.length) {
+      const pack = model.assembler.pack();
+      model.pack = pack;
+      renderer.applyLodLevels(pack, ids);
+      tracker.levels += ids.length;
+      scheduleRender(true);
+    }
+  }
+  tracker.received += data.levels?.length ?? 0;
+  tracker.mainMs += performance.now() - started;
+  if (tracker.pending === 0) tracker.state = tracker.error ? "failed" : "ready";
 }
 
 /** Merge one streamed IGP chunk and draw it; the first chunk clears the previous model. */
@@ -889,19 +1159,11 @@ function showResult(data) {
       assembler = state.stream.assembler;
       state.stream = null;
       pack = assembler.pack();
-      if (!pack.instances.count || !pack.geometry.length) {
-        renderer.clear();
-        state.loadOutcome = "empty";
-        throw new Error("The IFC parsed correctly, but no supported product geometry was produced.");
-      }
+      // An empty scene stays open: scripts and sessions add the products.
       model = renderer.finishStream(pack, (record) => isRecordVisibleInPack(pack, record));
     } else {
       state.stream = null;
       pack = readIgp(data.pack);
-      if (!pack.instances.count || !pack.geometry.length) {
-        state.loadOutcome = "empty";
-        throw new Error("The IFC parsed correctly, but no supported product geometry was produced.");
-      }
       disposeModel();
       // Through the assembler too, so an edit can patch it the same way.
       assembler = createPackAssembler();
@@ -914,13 +1176,16 @@ function showResult(data) {
       pack,
       assembler,
       info: data.info,
+      facts: data.facts ?? null,
       summary: data.summary,
       hierarchy: data.hierarchy,
       modelId: data.modelId,
+      revision: data.revision ?? "0",
       index: buildIndex(pack),
       file: state.pendingFile,
     };
-    state.loadOutcome = "ready";
+    // An open model with nothing to draw is a terminal state of its own.
+    state.loadOutcome = pack.instances.count ? "ready" : "empty";
     state.dirty = false;
     setDirty(false);
 
@@ -951,6 +1216,7 @@ function showResult(data) {
     describeModel(data, pack, totalMs);
     scheduleRender(true);
     finishLoading();
+    requestContestedTriangles();
   } catch (error) {
     finishLoading();
     restoreModelLabel();
@@ -971,6 +1237,7 @@ function buildIndex(pack) {
   const triangles = new Uint32Array(total);
   let instanceFlags = 0;
   for (let record = 0; record < total; record += 1) {
+    if (pack.instances.active && !pack.instances.active[record]) continue;
     instanceFlags |= pack.instances.flags[record];
     const expressId = pack.instances.expressIds[record];
     let records = recordsByExpressId.get(expressId);
@@ -1005,7 +1272,16 @@ function describeModel(data, pack, totalMs) {
     `${plural(data.summary.products, "product")}, ${count(data.summary.triangles)} tris, ` +
     `${count(pack.geometry.length)} meshes, ${count(state.model.drawCalls)} draws`;
   $("status-offset").textContent = `offset ${pack.index.model_offset.map(coordinate).join(" / ")}`;
-  if (totalMs !== null) setStatus(`Ready in ${duration(totalMs)}`, "on");
+  if (totalMs !== null) {
+    if (!pack.instances.count) {
+      const spatial = new Set(["IfcProject", "IfcSite", "IfcBuilding", "IfcBuildingStorey", "IfcSpace"]);
+      const onlySpatial = Object.keys(data.info?.products ?? {}).every((name) => spatial.has(name));
+      setStatus(onlySpatial ? "Empty model: no product geometry yet" : "No supported product geometry", onlySpatial ? "on" : "err");
+      if (!onlySpatial) shell.toast("The IFC parsed correctly, but no supported product geometry was produced.", "error");
+    } else {
+      setStatus(`Ready in ${duration(totalMs)}`, "on");
+    }
+  }
   $("gizmo-host").classList.remove("hidden");
   $("hint-bar").classList.remove("hidden");
   setTimeout(() => $("hint-bar").classList.add("hidden"), 6000);
@@ -1014,11 +1290,12 @@ function describeModel(data, pack, totalMs) {
 function enableModelCommands(enabled) {
   for (const id of [
     "fit", "zoom-in", "zoom-out", "plan", "style", "measure", "section", "show-all", "export", "close",
-    "quality", "model-stats", "tree-expand", "tree-collapse",
+    "quality", "model-stats", "properties", "element", "tree-expand", "tree-collapse", "update-ifc",
     "spaces", "openings", "references",
     "view:perspective", "view:top", "view:front", "view:right",
   ]) shell.setEnabled(id, enabled);
   $("tree-search").disabled = !enabled;
+  sessionPanel.refresh();
 }
 
 /** After a failed load, the chip names the model still open, or nothing. */
@@ -1046,6 +1323,8 @@ function abandonStream() {
 
 /** Put the chrome back to its no-model state. The model chip and the dropzone belong to the caller. */
 function clearModelUi() {
+  state.scriptHistory = { undo: 0, redo: 0 };
+  sessionPanel.refresh();
   tools.reset(false);
   tree.clear();
   inspector.clear();
@@ -1058,6 +1337,7 @@ function clearModelUi() {
   $("status-offset").textContent = "";
   $("stat-visible").textContent = "0";
   $("stat-hidden").textContent = "0";
+  $("dock-show-all").classList.remove("attention");
   $("stat-classes").textContent = "0";
   $("gizmo-host").classList.add("hidden");
   $("hint-bar").classList.add("hidden");
@@ -1078,9 +1358,22 @@ function disposeModel() {
   clearModelUi();
 }
 
+/** The chrome of an empty viewer: the dropzone and a blank model chip. */
+function showNoModel() {
+  state.pendingFile = null;
+  $("dropzone").classList.remove("hidden");
+  $("model-chip").classList.add("blank");
+  $("model-name").textContent = "No model open";
+}
+
 function closeModel() {
+  if (state.revisionPending) {
+    shell.toast("Wait for the current IFC update to finish.", "info");
+    return;
+  }
   if (state.dirty && !window.confirm("This model has unsaved IFC edits. Discard them and close it?")) return;
   const activeId = state.model?.modelId;
+  detachFileSession();
   if (state.converting) {
     // Cancel the job the way a replacement open does: a fresh worker holds no model.
     state.jobId += 1;
@@ -1094,10 +1387,7 @@ function closeModel() {
   state.loadOutcome = "idle";
   state.queuedFile = null;
   state.replaceApproved = null;
-  state.pendingFile = null;
-  $("dropzone").classList.remove("hidden");
-  $("model-chip").classList.add("blank");
-  $("model-name").textContent = "No model open";
+  showNoModel();
   if (state.workerReady) setStatus("Kernel ready", "on");
   else setStatus("Restarting the kernel", "busy");
   scheduleRender(true);
@@ -1112,6 +1402,7 @@ function receiveEntityInfo(data) {
   state.selection.infoState = "ready";
   panelWork.properties = { selection: state.selection, info: data.info };
   schedulePanelWork();
+  state.fileSession?.reportSelection?.(selectionSummary());
 }
 
 function receiveEntityError(data) {
@@ -1120,9 +1411,161 @@ function receiveEntityError(data) {
   inspector.setPropertyError(data.message);
 }
 
+/** Run a browser script in the worker; resolves with the script report and, after a commit, the impact. */
+function runBrowserScript(source, selection = null, { commit = true } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!state.model || !state.workerReady) return reject(new Error("Open a model before running a script."));
+    if (state.fileSession) return reject(new Error("This model follows a local session; its scripts run there."));
+    if (state.revisionPending || state.converting) return reject(new Error("Wait for the current update to finish."));
+    if (state.model.stale) return reject(new Error("Reopen the model to restore synchronization."));
+    const requestId = ++state.requestId;
+    const timeoutMs = state.settings.scriptTimeoutMs;
+    // The worker that runs the script also holds the model: the limit ends both.
+    const timer = timeoutMs > 0 ? setTimeout(() => scriptTimedOut(requestId), timeoutMs) : null;
+    state.revisionPending = { requestId, script: true, resolve, reject, timer, timeoutMs };
+    state.worker.postMessage({
+      type: "run-script", requestId, modelId: state.model.modelId, source: String(source ?? ""), selection, commit,
+      patch: revisionOptions(),
+    });
+  });
+}
+
+/** The script returned; what follows is the kernel's bounded work, so the limit no longer applies. */
+function receiveScriptFinished(data) {
+  const pending = state.revisionPending;
+  if (!pending || data.requestId !== pending.requestId) return;
+  clearTimeout(pending.timer);
+  pending.timer = null;
+}
+
+/** Stop a script at the limit: end the worker, fail the run and reopen the model without it. */
+function scriptTimedOut(requestId) {
+  const pending = state.revisionPending;
+  if (!pending?.script || pending.requestId !== requestId || !state.model) return;
+  state.worker?.terminate();
+  state.worker = null;
+  state.workerReady = false;
+  const limit = pending.timeoutMs >= 1000 ? `${pending.timeoutMs / 1000} s` : `${pending.timeoutMs} ms`;
+  const error = new Error(`ScriptTimeout: the script ran longer than ${limit} and was stopped. The model reopens at its last revision; the undo history is cleared.`);
+  error.timedOut = true;
+  finishRevision(error);
+  state.scriptHistory = { undo: 0, redo: 0 };
+  shell.toast(error.message, "error");
+  beginReopen();
+}
+
+/** Reopen the committed source in a fresh worker while the scene stays on screen. */
+function beginReopen() {
+  const requestId = ++state.requestId;
+  state.revisionPending = { requestId, reopen: true, resolve: () => {}, reject: () => {} };
+  setStatus("Script stopped; reopening the model", "busy");
+  sessionPanel.refresh();
+  startWorker();
+}
+
+async function sendReopen() {
+  const pending = state.revisionPending;
+  const model = state.model;
+  if (!pending?.reopen || !model) return;
+  try {
+    // The last revision's source, or the file itself when nothing was committed since it was opened.
+    const buffer = model.snapshot ? model.snapshot.slice(0) : await model.file?.handle?.arrayBuffer();
+    if (!buffer) throw new Error("its source is no longer available");
+    if (state.revisionPending !== pending || !state.worker) return;
+    state.worker.postMessage({ type: "reopen", requestId: pending.requestId, buffer, settings: geometrySettingOverrides() }, [buffer]);
+  } catch (error) {
+    receiveReopenError({ requestId: pending.requestId, message: errorText(error) });
+  }
+}
+
+function receiveReopened(data) {
+  const pending = state.revisionPending;
+  if (!pending?.reopen || data.requestId !== pending.requestId || !state.model) return;
+  state.model.modelId = data.modelId;
+  state.model.revision = data.revision ?? "0";
+  state.model.info = data.info ?? state.model.info;
+  state.model.facts = data.facts ?? state.model.facts;
+  state.model.hierarchy = data.hierarchy ?? state.model.hierarchy;
+  state.model.stale = false;
+  finishRevision(null);
+  if (state.selection) {
+    // The attributes stay on screen while the fresh worker reads them again.
+    state.selection.modelId = data.modelId;
+    selectExpressId(state.selection.expressId, true);
+  }
+  setStatus(`Model reopened at revision ${state.model.revision}; undo history cleared`, "on");
+  sessionPanel.refresh();
+}
+
+function receiveReopenError(data) {
+  const pending = state.revisionPending;
+  if (!pending?.reopen || data.requestId !== pending.requestId) return;
+  finishRevision(new Error(data.message));
+  disposeModel();
+  showNoModel();
+  state.loadOutcome = "failed";
+  setStatus("The model could not be reopened", "err");
+  state.dismissLoadError = shell.toast(`The model could not be reopened after the script was stopped: ${data.message} Open the file again.`, "error", 0);
+}
+
+function browserHistoryAction(action) {
+  return new Promise((resolve, reject) => {
+    if (!state.model || !state.workerReady) return reject(new Error("Open a model first."));
+    if (state.revisionPending || state.converting) return reject(new Error("Wait for the current update to finish."));
+    if (state.model.stale) return reject(new Error("Reopen the model to restore synchronization."));
+    const requestId = ++state.requestId;
+    state.revisionPending = { requestId, script: true, resolve, reject };
+    state.worker.postMessage({ type: "script-history", requestId, modelId: state.model.modelId, action, patch: revisionOptions() });
+  });
+}
+
+function receiveScriptResult(data) {
+  if (data.modelId !== state.model?.modelId || data.requestId !== state.revisionPending?.requestId) return;
+  if (data.history) state.scriptHistory = data.history;
+  finishRevision(null, { ...data.result, impact: null, history: data.history ?? null });
+  sessionPanel.refresh();
+}
+
+function receiveScriptError(data) {
+  if (data.modelId !== state.model?.modelId || data.requestId !== state.revisionPending?.requestId) return;
+  if (data.history) state.scriptHistory = data.history;
+  finishRevision(new Error(data.message));
+  sessionPanel.refresh();
+}
+
+/** What the browser assistant learns about the open model and the selection. */
+async function assistantContext() {
+  const model = state.model;
+  if (!model) return "No model is open.";
+  const info = model.info ?? {};
+  const selection = selectionSummary();
+  // Storeys come by class from the worker; the hierarchy is empty until geometry exists.
+  const storeys = model.facts?.storeys?.length
+    ? model.facts.storeys
+    : (model.hierarchy?.nodes ?? []).filter((node) => node.class === "IfcBuildingStorey").map((node) => ({ expressId: node.expressId, name: node.name ?? null }));
+  return describeModelInfo({
+    name: model.file?.name ?? "model.ifc",
+    schema: info.schema ?? null,
+    revision: model.revision,
+    lengthUnit: model.facts?.lengthUnit ?? null,
+    products: info.products ?? {},
+    storeys,
+    selection: selection ? { expressId: selection.expressId, className: selection.className, fields: state.selection?.info?.fields ?? [] } : null,
+  });
+}
+
 function applyEdits(changes) {
   if (!state.selection || !state.model) return;
+  if (state.fileSession) {
+    inspector.setEditError("This model follows an external IFC file. Edit it in the connected authoring process.");
+    return;
+  }
+  if (state.revisionPending || state.model.stale) {
+    inspector.setEditError("Wait for the current update, or reopen the model if synchronization failed.");
+    return;
+  }
   state.selection.editRequestId = ++state.requestId;
+  state.revisionPending = { requestId: state.selection.editRequestId, attributeEdit: true };
   inspector.setEditPending();
   try {
     const { assembler, pack } = state.model;
@@ -1134,51 +1577,13 @@ function applyEdits(changes) {
       changes,
       // The patch must land in the same pack space, above every geometry id in use.
       patch: assembler
-        ? { modelOffset: pack.index.model_offset ?? [0, 0, 0], firstGeometryId: assembler.nextGeometryId() }
+        ? { baseRevision: state.model.revision, modelOffset: pack.index.model_offset ?? [0, 0, 0], firstGeometryId: assembler.nextGeometryId() }
         : null,
     });
   } catch (error) {
     // Never leave the editor stuck on its pending state.
     inspector.setEditError(errorText(error));
-  }
-}
-
-/** Swap in the edited product's fresh geometry; the scene is rebuilt only if the triangles changed. */
-function receiveProductGeometry(data) {
-  const model = state.model;
-  if (!model?.assembler || data.modelId !== model.modelId) return;
-  try {
-    const chunk = readIgp(data.buffer);
-    // Read before the columns are compacted, or every hidden record above the edit would shift.
-    const hiddenIds = expressIdsOf(state.hiddenRecords);
-    const shownIds = expressIdsOf(state.shownRecords);
-    const isolatedIds = state.isolated ? expressIdsOf(state.isolated) : null;
-    const selected = state.selection?.expressId ?? null;
-    const result = model.assembler.replaceProducts([data.expressId], chunk);
-    if (!result.changed) {
-      setStatus("Edited, geometry unchanged", "busy");
-      return;
-    }
-
-    const pack = model.assembler.pack();
-    const index = buildIndex(pack);
-    state.hiddenRecords = recordsOf(hiddenIds, index);
-    state.shownRecords = recordsOf(shownIds, index);
-    state.isolated = isolatedIds ? recordsOf(isolatedIds, index) : null;
-    state.model = { ...model, pack, index };
-    const rebuilt = renderer.reload(pack, isRecordVisible);
-    state.model = { ...state.model, ...rebuilt };
-    tree.build(pack, model.hierarchy, index);
-    tree.syncVisibility(isRecordVisible);
-    syncHelperControls(pack);
-    scheduleVisibilityStats();
-    if (selected !== null) selectExpressId(selected, true);
-    inspector.setGeometryFacts({ pack, model: state.model });
-    describeModel({ info: model.info, summary: model.summary }, pack, null);
-    setStatus(`Edited, #${data.expressId} redrawn in ${duration(data.elapsedMs ?? 0)}`, "busy");
-    scheduleRender(true);
-  } catch (error) {
-    shell.toast(`The edited element could not be redrawn: ${errorText(error)}`, "error");
+    finishRevision(error);
   }
 }
 
@@ -1196,25 +1601,221 @@ function recordsOf(expressIds, index) {
   return records;
 }
 
-function receiveEditResult(data) {
-  if (!state.selection || data.requestId !== state.selection.editRequestId) return;
-  if (data.expressId !== state.selection.expressId) return;
-  state.selection.info = data.info;
-  state.selection.infoState = "ready";
-  state.dirty = true;
-  setDirty(true);
-  inspector.setEditResult(data.info, data.changed);
-  setStatus("Edited, export pending", "busy");
+function revisionOptions() {
+  const { pack, assembler, revision } = state.model;
+  return { baseRevision: revision, modelOffset: pack.index.model_offset ?? [0, 0, 0],
+    firstGeometryId: assembler.nextGeometryId(), selectedExpressId: state.selection?.expressId ?? null };
 }
 
-function receiveEditError(data) {
-  if (!state.selection || data.requestId !== state.selection.editRequestId) return;
+/** Ingest a saved version while retaining the open scene and its user state. */
+async function updateFromFile(file) {
+  if (!state.model || !state.workerReady) throw new Error("Open a model before updating it.");
+  if (state.revisionPending || state.converting) throw new Error("An IFC update is already running.");
+  if (state.model.stale) throw new Error("Reopen the model to restore synchronization.");
+  if (!file.size || !/\.ifc$/i.test(file.name)) throw new Error("Choose a nonempty IFC file.");
+  if (state.dirty && !window.confirm("Replace the current unsaved edits with this IFC revision?")) {
+    throw new Error("Update cancelled.");
+  }
+  const requestId = ++state.requestId;
+  const modelId = state.model.modelId;
+  const promise = new Promise((resolve, reject) => {
+    state.revisionPending = { requestId, file: { name: file.name, size: file.size }, resolve, reject };
+  });
+  setStatus("Reading the edited IFC", "busy");
+  try {
+    const buffer = await file.arrayBuffer();
+    if (state.model?.modelId !== modelId) throw new Error("The model changed during the update.");
+    state.worker.postMessage({ type: "update-revision", requestId, modelId, buffer, patch: revisionOptions() }, [buffer]);
+    setStatus("Evaluating affected objects", "busy");
+  } catch (error) {
+    finishRevision(error);
+    shell.toast(errorText(error), "error");
+  }
+  return promise;
+}
+
+function detachFileSession() {
+  if (!state.fileSession) return;
+  state.fileSession.stop();
+  state.fileSession = null;
+  sessionPanel.setStatus(null);
+}
+
+function finishRevision(error = null, result = null) {
+  const pending = state.revisionPending;
+  state.revisionPending = null;
+  if (pending?.timer) clearTimeout(pending.timer);
+  if (error) pending?.reject?.(error);
+  else pending?.resolve?.(result);
+}
+
+/** GlobalId of every product in a hierarchy, by express id. */
+function hierarchyGuids(hierarchy) {
+  const guids = new Map();
+  for (const node of hierarchy?.nodes ?? []) if (node.globalId) guids.set(node.expressId, node.globalId);
+  return guids;
+}
+
+/** Express id of every GlobalId in a hierarchy; null marks one that several products share. */
+function hierarchyIds(hierarchy) {
+  const ids = new Map();
+  for (const node of hierarchy?.nodes ?? []) {
+    if (!node.globalId) continue;
+    ids.set(node.globalId, ids.has(node.globalId) ? null : node.expressId);
+  }
+  return ids;
+}
+
+function productIdentities(guids, ids) {
+  return [...ids].map((id) => ({ id, guid: guids.get(id) ?? null }));
+}
+
+function restoreIdentities(identities, ids, fullRebuild) {
+  return identities.map(({ id, guid }) => {
+    if (!guid) return fullRebuild ? null : id;
+    const found = ids.get(guid);
+    if (Number.isInteger(found)) return found;
+    // A GlobalId several products share cannot pick one, but in a selective update the express id still does.
+    return found === null && !fullRebuild ? id : null;
+  }).filter((id) => Number.isInteger(id));
+}
+
+function receiveRevision(data) {
+  const model = state.model;
+  if (!model || data.modelId !== model.modelId) return;
+  if (data.revision === model.revision) {
+    if (data.requestId === state.revisionPending?.requestId) finishRevision(new Error("The IFC update reported no new revision."));
+    return;
+  }
+  if (data.requestId !== state.revisionPending?.requestId || data.baseRevision !== model.revision) {
+    model.stale = true;
+    setStatus("IFC revision mismatch; reopen the model", "err");
+    finishRevision(new Error("The received IFC revision has an unexpected base."));
+    return;
+  }
+  const pending = state.revisionPending;
+  const started = performance.now();
+  // Main-thread cost by stage, kept beside the kernel and worker figures in lastUpdate.
+  const stages = {};
+  let mark = started;
+  const stage = (name) => {
+    const now = performance.now();
+    stages[name] = (stages[name] ?? 0) + now - mark;
+    mark = now;
+  };
+  try {
+    const impact = data.impact;
+    const chunk = data.buffer ? readIgp(data.buffer) : null;
+    if (!chunk) throw new Error("The IFC update is missing its geometry payload.");
+    stage("readIgpMs");
+    const guids = hierarchyGuids(model.hierarchy);
+    const hidden = productIdentities(guids, expressIdsOf(state.hiddenRecords));
+    const shown = productIdentities(guids, expressIdsOf(state.shownRecords));
+    const isolated = state.isolated ? productIdentities(guids, expressIdsOf(state.isolated)) : null;
+    const selected = productIdentities(guids, state.selection ? [state.selection.expressId] : []);
+    stage("identityMs");
+    let assembler = model.assembler;
+    let result;
+    if (impact.fullRebuild) {
+      assembler = createPackAssembler();
+      assembler.append(chunk);
+      result = { changed: true };
+    } else {
+      result = assembler.replaceProducts([...new Set([...impact.affectedProducts, ...impact.removedProducts])], chunk);
+    }
+    const pack = assembler.pack();
+    pack.index.georef = chunk.index.georef;
+    stage("assembleMs");
+    const index = buildIndex(pack);
+    stage("indexMs");
+    const newIds = hierarchyIds(data.hierarchy);
+    const restore = (items) => recordsOf(restoreIdentities(items, newIds, impact.fullRebuild), index);
+    state.hiddenRecords = restore(hidden);
+    state.shownRecords = restore(shown);
+    state.isolated = isolated ? restore(isolated) : null;
+    stage("identityMs");
+    const summary = { ...model.summary, products: index.recordsByExpressId.size,
+      triangles: index.triangles.reduce((sum, value) => sum + value, 0) };
+    state.model = { ...model, assembler, pack, index, revision: data.revision, info: data.info, facts: data.facts ?? model.facts ?? null,
+      hierarchy: data.hierarchy, summary, stale: false, file: pending.file ?? model.file, snapshot: data.snapshot ?? model.snapshot ?? null };
+    let rendered = {};
+    if (result.changed) {
+      rendered = impact.fullRebuild ? renderer.reload(pack, isRecordVisible) : renderer.applyDelta(pack, result, isRecordVisible);
+      tools.clearMeasurement();
+    }
+    stage("rendererMs");
+    state.model = { ...state.model, ...rendered,
+      lastUpdate: { ...impact, ...data.timings, revision: data.revision, renderer: rendered.patchStats ?? null, stages } };
+    if (result.changed) requestContestedTriangles();
+    tree.build(pack, data.hierarchy, index);
+    tree.syncVisibility(isRecordVisible);
+    stage("treeMs");
+    syncHelperControls(pack);
+    scheduleVisibilityStats();
+    const selectedId = restoreIdentities(selected, newIds, impact.fullRebuild)[0];
+    if (selectedId != null && index.recordsByExpressId.has(selectedId)) selectExpressId(selectedId, true);
+    else clearSelection();
+    if (data.entityInfo && state.selection?.expressId === (data.infoId ?? data.expressId)) {
+      state.selection.info = data.entityInfo;
+      state.selection.infoState = "ready";
+      if (data.attributeEdit) inspector.setEditResult(data.entityInfo, data.changed);
+      else inspector.setProperties(data.entityInfo);
+    }
+    if (result.changed && !impact.fullRebuild) {
+      const touched = new Set([...impact.affectedProducts, ...(impact.metadataProducts ?? [])]);
+      renderer.flash?.([...recordsOf(touched, index)]);
+    }
+    state.dirty = data.attributeEdit || Boolean(data.script);
+    setDirty(state.dirty);
+    if (data.history) state.scriptHistory = data.history;
+    state.pendingFile = state.model.file;
+    inspector.setGeometryFacts({ pack, model: state.model });
+    inspector.setQuality(pack.index.diagnostics ?? [], renderer);
+    describeModel({ info: data.info, summary }, pack, null);
+    const updated = impact.affectedProducts.length;
+    const deleted = impact.removedProducts.length;
+    const label = impact.fullRebuild ? "Full geometry refresh" : `${updated} geometry updates, ${deleted} removed`;
+    setStatus(`Revision ${data.revision}: ${label}`, "on");
+    $("status-text").title = (impact.reasons ?? []).slice(0, 30).map((item) => `#${item.expressId}: ${item.reason}`).join("\n");
+    scheduleRender(true);
+    sessionPanel.refresh();
+    stage("panelsMs");
+    stages.totalMs = performance.now() - started;
+    finishRevision(null, pending.script
+      ? { ...data.script, impact: state.model.lastUpdate, history: data.history ?? null }
+      : state.model.lastUpdate);
+  } catch (error) {
+    state.model.revision = data.revision;
+    state.model.stale = true;
+    state.model.snapshot = data.snapshot ?? state.model.snapshot ?? null;
+    state.dirty = data.attributeEdit || Boolean(data.script);
+    setDirty(state.dirty);
+    setStatus("IFC updated; the view needs reopening", "err");
+    shell.toast(`The IFC revision was committed, but the scene could not be updated: ${errorText(error)}`, "error", 0);
+    finishRevision(error);
+  }
+}
+
+function receiveRevisionError(data) {
+  if (data.modelId !== state.model?.modelId || data.requestId !== state.revisionPending?.requestId) return;
+  if (data.committed) {
+    state.model.revision = data.revision;
+    state.model.stale = true;
+  }
+  if (data.history) state.scriptHistory = data.history;
   inspector.setEditError(data.message);
+  setStatus(data.committed ? "IFC updated; reopen to synchronize" : "IFC update rejected; previous revision retained", "err");
+  shell.toast(data.message, "error");
+  const error = new Error(data.message);
+  error.revisionRejected = !data.committed;
+  error.script = data.script ?? null;
+  finishRevision(error);
+  sessionPanel.refresh();
 }
 
 function setDirty(dirty) {
   shell.setDirty("export", dirty);
-  $("pending-bar").classList.toggle("hidden", !dirty);
+  $("save-revision").classList.toggle("hidden", !dirty);
 }
 
 // ---------------------------------------------------------------- export
@@ -1229,7 +1830,8 @@ function requestExport() {
 function receiveExport(data) {
   if (!state.model || data.requestId !== state.model.exportRequestId) return;
   const original = state.pendingFile?.name ?? "model.ifc";
-  const stem = original.replace(/\.ifc$/i, "");
+  // An archive is exported as the plain IFC it held.
+  const stem = original.replace(/\.(ifc|ifczip)$/i, "");
   const name = state.dirty ? `${stem}.edited.ifc` : `${stem}.copy.ifc`;
   const url = URL.createObjectURL(new Blob([data.buffer], { type: "application/octet-stream" }));
   const link = document.createElement("a");
@@ -1280,20 +1882,41 @@ function fatal(message) {
 shell.applyTheme(shell.themeMode());
 // Both themes' canvas tokens are read while the page is still small, so a later switch reads nothing.
 for (const name of ["--canvas-light", "--canvas-dark", "--section-cap-light", "--section-cap-dark"]) cssToken(name);
-renderer.setPixelRatioLimit?.(state.settings.scale);
+renderer.setRenderScale?.(state.settings.scale);
 $("set-scale").value = String(state.settings.scale);
+syncAssistantFields();
 renderer.setAdaptiveResolution?.(state.settings.adaptive);
 $("set-adaptive").checked = state.settings.adaptive;
 renderer.setLodPixels?.(state.settings.lod ? LOD_PIXELS : 0);
 $("set-lod").checked = state.settings.lod;
 renderer.setDepthTieBreak?.(state.settings.coincident);
 $("set-coincident").checked = state.settings.coincident;
+renderer.setOcclusionCulling?.(state.settings.occlusion);
+$("set-occlusion").checked = state.settings.occlusion;
+renderer.setMotionLod?.(state.settings.motionLod);
+$("set-motion-lod").checked = state.settings.motionLod;
+renderer.setTextures?.(state.settings.textures);
+$("set-textures").checked = state.settings.textures;
+$("set-script-timeout").value = String(state.settings.scriptTimeoutMs);
 tools.reset(false);
 tree.clear();
 enableModelCommands(false);
 clearSelection();
 startWorker();
 scheduleRender();
+
+if (new URLSearchParams(location.search).get("session") === "file") {
+  state.fileSession = startFileSession({
+    ready: () => state.workerReady && !state.converting && !state.revisionPending && !state.model?.stale,
+    loaded: () => Boolean(state.model),
+    open: openFile,
+    update: updateFromFile,
+    report: (message) => setStatus(message, "err"),
+    status: (session) => {
+      if (state.fileSession) sessionPanel.setStatus(session);
+    },
+  });
+}
 
 const splash = $("splash");
 splash.classList.add("done");

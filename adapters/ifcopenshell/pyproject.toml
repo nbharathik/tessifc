@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tessifc-session"
+version = "0.2.0"
+description = "Live IFC editing session for the TessIFC viewer: scripts, undo and an optional assistant."
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Bharathi Kannan" }]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+authoring = ["ifcopenshell"]
+assistant = ["anthropic"]
+mcp = ["mcp>=1.12,<2"]
+
+[project.scripts]
+tessifc-session = "tessifc_session.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tessifc_session*"]

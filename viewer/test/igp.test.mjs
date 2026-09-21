@@ -36,10 +36,14 @@ import {
   planDepthRanks,
   planRenderBatches,
   preferDepthHit,
+  recordTextureId,
   renderPixelRatio,
   renderTargetPlan,
   restrictDepthPlan,
 } from "../src/renderer.js";
+import { createPackAssembler } from "../src/stream.js";
+import { pixelsToRgba, resolveTextureUrl, uvMatrix } from "../src/textures.js";
+import { writeIgp } from "./igp-writer.mjs";
 
 import {
   SNAP_PIXELS,
@@ -98,10 +102,19 @@ console.log("ok    every published test suite takes its model from the environme
 const html = readFileSync(resolve(repo, "viewer", "index.html"), "utf8");
 // Source guards read the app modules as one blob, wherever a rule's code lives.
 const SEPARATOR = String.fromCharCode(10);
-const appModules = ["main.js", "shell.js", "tree.js", "inspector.js", "tools.js", "format.js", "boot.js", "stream.js", "measure.js"];
-const app = appModules.map((name) => readFileSync(resolve(repo, "viewer", "src", name), "utf8")).join(SEPARATOR);
-const renderer = readFileSync(resolve(repo, "viewer", "src", "renderer.js"), "utf8");
-const worker = readFileSync(resolve(repo, "viewer", "src", "worker.js"), "utf8");
+// The renderer and its helpers live in the viewer package; the application modules stay in viewer/src.
+const appModules = ["main.js", "shell.js", "tree.js", "inspector.js", "tools.js", "boot.js"];
+const packageModules = ["format.js", "stream.js", "measure.js"];
+const app = [
+  ...appModules.map((name) => readFileSync(resolve(repo, "viewer", "src", name), "utf8")),
+  ...packageModules.map((name) => readFileSync(resolve(repo, "bindings", "viewer", "src", name), "utf8")),
+].join(SEPARATOR);
+const renderer = readFileSync(resolve(repo, "bindings", "viewer", "src", "renderer.js"), "utf8");
+// The app's worker is an entry over the package's core; the guards read the one implementation.
+const workerEntry = readFileSync(resolve(repo, "viewer", "src", "worker.js"), "utf8");
+const workerCore = readFileSync(resolve(repo, "bindings", "viewer", "src", "kernel-worker-core.js"), "utf8");
+const worker = [workerEntry, workerCore].join(SEPARATOR);
+const embed = readFileSync(resolve(repo, "bindings", "viewer", "src", "contested-worker.js"), "utf8");
 const packageJson = JSON.parse(readFileSync(resolve(repo, "viewer", "package.json"), "utf8"));
 
 const htmlIds = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
@@ -111,9 +124,12 @@ for (const [, id] of app.matchAll(/\$\("([^"]+)"\)/g)) {
 }
 console.log("ok    viewer controls resolve to unique HTML elements");
 
-for (const tab of ["file", "home", "view", "analyze", "review"]) {
+for (const tab of ["file", "home", "view", "analyze"]) {
   assert.match(html, new RegExp(`data-tab="${tab}"`), `ribbon must expose the ${tab} task`);
 }
+assert.doesNotMatch(html, /data-tab="review"/, "the ribbon has four tasks; review folded into analyze");
+const commandIds = [...html.matchAll(/id="(cmd-[a-z-]+)"/g)].map((match) => match[1]);
+assert.equal(new Set(commandIds).size, commandIds.length, "no command appears twice in the ribbon");
 for (const view of ["spatial", "types"]) {
   assert.match(html, new RegExp(`data-outliner="${view}"`), `outliner must expose the ${view} view`);
 }
@@ -131,10 +147,13 @@ assert.match(app, /renderer\.setViewportTheme\?\./, "canvas theme control must u
 assert.match(app, /function filterProperties\(/, "property filtering must be implemented locally");
 console.log("ok    task ribbon, model navigator, and inspector views are wired");
 
-// A URL to a real host is a network dependency; the XML namespace in an inline
-// SVG is an identifier, not a fetch.
+// A URL to a real host is a network dependency; the SVG namespace and the
+// policy's connect-src provider list are not.
 const remoteUrl = /https?:\/\/(?!www\.w3\.org\/)/;
-for (const [name, source] of Object.entries({ html, app, renderer, worker })) {
+const htmlWithoutPolicy = html.replace(/<meta\s+http-equiv="Content-Security-Policy"[\s\S]*?\/>/, "");
+assert.match(html, /connect-src 'self' https:\/\/openrouter\.ai https:\/\/api\.anthropic\.com http:\/\/127\.0\.0\.1:\* http:\/\/localhost:\*;/,
+  "connect-src allows only the assistant providers and loopback ports");
+for (const [name, source] of Object.entries({ html: htmlWithoutPolicy, app, renderer, worker })) {
   assert.doesNotMatch(source, remoteUrl, `${name} must not fetch runtime code`);
   assert.doesNotMatch(source, /(?:from\s+["']three|THREE\.)/, `${name} must use the first-party renderer`);
 }
@@ -697,10 +716,22 @@ console.log("ok    measurements snap to corners and edges and copy as text");
 
 assert.match(
   app,
-  /addEventListener\("pointerup", pickAtRelease\)[\s\S]*function pickAtRelease\(event\) \{[\s\S]*?const hit = renderer\.pick\(at\.x, at\.y, false\);/,
+  /addEventListener\("pointerup", pickAtRelease\)[\s\S]*function pickAtRelease\(event\) \{[\s\S]*?const hit = renderer\.pick\(at\.x, at\.y, true\);/,
   "a click selects in the release handler itself, so the release frame and the selection share one render",
 );
+assert.match(app, /if \(hit\.point\) renderer\.setPivot\(hit\.point\);/, "a click moves the orbit and zoom centre to the surface it hit");
+assert.match(renderer, /setPivot\(point\) \{[\s\S]*?this\.camera\.target = add\(this\.camera\.position, scale\(forward, depth\)\);/, "the pivot slides along the view axis so the click never turns the camera");
 assert.doesNotMatch(app, /uiTasks\.post\(\(\) => performPick/, "selection must not be queued behind the release frame");
+assert.match(worker, /findContestedTriangles\(\{ instances \}, byId\)/, "the worker runs the coincident-plane analysis off the main thread");
+assert.match(app, /function requestContestedTriangles\(\)[\s\S]*?Float32Array\.from\(geometry\.positions\)/, "the analysis request copies geometry instead of cloning whole chunk buffers");
+assert.match(renderer, /drawBatch\(batch, false, this\.uniforms, Boolean\(batch\.overlay\)\)/, "the overlay draws a batch's contested triangles when it has them");
+assert.match(renderer, /applyContestedTriangles\(result\) \{[\s\S]*?\|\| result\.exhausted\) return false;/, "an analysis that ran out of budget must not empty the overlay");
+assert.match(app, /if \(data\.exhausted\) \{[\s\S]*?state: "exhausted"[\s\S]*?return;[\s\S]*?renderer\.applyContestedTriangles\(data\);/, "the application keeps the bounds overlay when the analysis gives up");
+assert.match(worker, /exhausted: result\.exhausted/, "the worker reports an exhausted analysis instead of an empty one");
+assert.match(embed, /exhausted: result\.exhausted/, "the package worker reports an exhausted analysis too");
+assert.match(renderer, /batch\.gpuBytes \+= indices\.byteLength;[\s\S]{0,80}this\.gpuBufferBytes \+= indices\.byteLength;\n  \}/, "overlay index bytes are counted on the batch so a delta's recount keeps them");
+assert.match(renderer, /const next = prepass && batch\.depthContested && !batch\.overlayResolved && !\(this\.coarseActive && this\.coarseOf\(batch\)\);/, "the depth-only base pass applies only to whole-record overlays, and never to a batch drawn coarse");
+assert.match(renderer, /if \(batch\.culled \|\| \(this\.coarseActive && this\.coarseOf\(batch\)\)\) continue;/, "a batch drawn coarse gets no fine overlay");
 assert.doesNotMatch(renderer, /pick\(clientX, clientY, includePoint = true\) \{[\s\S]{0,400}?this\.dirty = true;/, "picking changes no pixel, so it must not ask for a frame");
 assert.match(
   app,
@@ -806,6 +837,15 @@ for (const setting of ["includeSpaces", "includeOpenings", "includeAnnotations",
   assert.match(worker, new RegExp(`${setting}: true`), `worker must retain ${setting} for the top-bar controls`);
 }
 assert.match(app, /renderer\.appendStream\(/, "chunks must reach the renderer as they arrive");
+// Occlusion culling: the draw path goes through cluster runs, and picking never reads cluster state.
+assert.match(renderer, /visibleRuns\(batch\.clusterState\)/, "a reduced frame draws the visible cluster runs");
+assert.match(renderer, /this\.clusterCullActive = active;/, "the cull is decided once per frame");
+assert.match(renderer, /!picking && this\.clusterCulling && this\.motionFrame && this\.style === "shaded" && !this\.section\.active/, "the cull applies to shaded moving frames only, never to picking or sections");
+assert.match(renderer, /const occlude = active && inside && this\.occlusionCulling && Boolean\(this\.occluders/, "occlusion needs the cull, a camera inside the model, the switch and the occluders");
+{
+  const pickBody = renderer.slice(renderer.indexOf("  pickRecord(ray) {"), renderer.indexOf("  intersectRecord(record, clientX, clientY"));
+  assert.ok(pickBody.length > 0 && !/clusterState|clusterHidden|occlusion/.test(pickBody), "picking ignores cluster state");
+}
 assert.match(app, /renderer\.finishStream\(/, "the final scene must be rebuilt from the assembled pack");
 console.log("ok    interaction cleanup and worker compatibility are regression-gated");
 
@@ -967,8 +1007,10 @@ console.log("ok    a streaming load has one owner and one failure path");
   );
   assert.equal(moved.changed, true, "a different mesh is a change");
   const patched = assembler.pack();
-  assert.equal(patched.instances.count, 4);
-  assert.deepEqual(Array.from(patched.instances.expressIds), [10, 11, 13, 12], "the patched product moves to the end");
+  assert.equal(patched.instances.count, 5);
+  assert.equal(patched.instances.activeCount, 4);
+  assert.deepEqual(Array.from(patched.instances.expressIds), [10, 11, 12, 13, 12], "replacements append without moving unrelated slots");
+  assert.deepEqual(Array.from(patched.instances.active), [1, 1, 0, 1, 1]);
 
   // Re-editing the same product must not pile up the meshes it superseded.
   const afterOnePatch = assembler.geometryCount;
@@ -983,7 +1025,8 @@ console.log("ok    a streaming load has one owner and one failure path");
   );
   assert.equal(again.changed, true);
   assert.equal(assembler.geometryCount, afterOnePatch, "a superseded patch mesh must be pruned");
-  assert.equal(assembler.pack().instances.count, 4, "pruning must not disturb the instance columns");
+  assert.equal(assembler.pack().instances.count, 6, "retired slots keep their identities");
+  assert.equal(assembler.pack().instances.activeCount, 4, "pruning keeps the active instance count");
   assert.ok(assembler.nextGeometryId() > 11, "a pruned id must never be handed out again");
 
   // The next geometry id must be bounded work, whatever the file holds.
@@ -1237,6 +1280,189 @@ console.log("ok    helper geometry is independently flagged and hidden without c
 assert.throws(() => readIgp(new Uint8Array(4)), /shorter than/);
 assert.throws(() => readIgp(new Uint8Array(24)), /not IGP/);
 console.log("ok    invalid IGP buffers fail with useful errors");
+
+// ---------------------------------------------------- textures in the pack
+{
+  const quad = {
+    id: 1,
+    positions: Float32Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]),
+    indices: Uint16Array.from([0, 1, 2, 0, 2, 3]),
+    uv: Float32Array.from([0, 0, 1, 0, 1, 1, 0, 1]),
+    bbox: [0, 0, 0, 1, 1, 0],
+  };
+  const plain = { id: 2, positions: quad.positions, indices: quad.indices, bbox: quad.bbox };
+  const checker = Uint8Array.from([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
+  const png = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const materials = [
+    { color: [200, 200, 200, 255], diffuse: null, specular: null, shininess: null, roughness: null, reflectance: null, texture: 40, source: 30 },
+    { color: [90, 140, 200, 255], diffuse: [0.2, 0.4, 0.8], specular: null, shininess: 64, roughness: null, reflectance: "METAL", texture: 41, source: 31 },
+    { color: [120, 120, 120, 255], diffuse: null, specular: null, shininess: null, roughness: 0.5, reflectance: null, texture: null, source: 32 },
+  ];
+  const textures = [
+    { id: 40, pixels: { width: 2, height: 2, components: 3, bytes: checker }, repeat: [true, false] },
+    { id: 41, mime: "image/png", blob: png, transform: [2, 0, 0, 2, 0.5, 0] },
+    { id: 42, uri: "textures/brick.png" },
+    { id: 43 },
+  ];
+  const bytes = writeIgp({
+    geometries: [quad, plain],
+    instances: [
+      { geometry: 1, expressId: 10, classId: 0, material: 0 },
+      { geometry: 1, expressId: 11, classId: 0, material: 1 },
+      { geometry: 2, expressId: 12, classId: 0, material: 2 },
+      { geometry: 2, expressId: 13, classId: 0 },
+    ],
+    materials,
+    textures,
+  });
+  const pack = readIgp(bytes);
+  assert.deepEqual([...pack.geometry[0].uv], [...quad.uv], "uv views the pack's floats");
+  assert.equal(pack.geometry[1].uv, null, "a mesh without uv reads null");
+  assert.deepEqual([...pack.instances.material], [0, 1, 2, 0xffffffff]);
+  assert.deepEqual(pack.index.materials, materials);
+  assert.equal(pack.index.textures.length, 4);
+  const [pixels, blob, uri, omitted] = pack.index.textures;
+  assert.deepEqual(pixels.pixels.width, 2);
+  assert.deepEqual([...pixels.pixels.bytes], [...checker], "pixel bytes are viewed from the binary chunk");
+  assert.deepEqual(pixels.repeat, [true, false]);
+  assert.equal(pixels.transform, null);
+  assert.deepEqual([...blob.blob], [...png]);
+  assert.equal(blob.mime, "image/png");
+  assert.deepEqual(blob.transform, [2, 0, 0, 2, 0.5, 0]);
+  assert.equal(uri.uri, "textures/brick.png");
+  assert.equal(omitted.omitted, true);
+  assert.ok(pack.memory.geometryBytes >= quad.uv.byteLength, "uv bytes count toward geometry memory");
+  assert.ok(pack.memory.instanceBytes >= 4 * 4, "the material column counts toward instance memory");
+
+  // The old writer's packs still read without any of the members.
+  const bare = readIgp(writeIgp({ geometries: [plain], instances: [{ geometry: 2, expressId: 12, classId: 0 }] }));
+  assert.equal(bare.instances.material, null);
+  assert.equal(bare.index.materials, undefined);
+  assert.equal(bare.index.textures, undefined);
+
+  // A texture a record can draw with: a material row naming one and a mesh with uv.
+  assert.equal(recordTextureId(pack, 0, pack.geometry[0]), 40);
+  assert.equal(recordTextureId(pack, 1, pack.geometry[0]), 41);
+  assert.equal(recordTextureId(pack, 2, pack.geometry[1]), null, "a material without a texture draws flat");
+  assert.equal(recordTextureId(pack, 3, pack.geometry[1]), null, "no material row draws flat");
+  assert.equal(recordTextureId(pack, 0, pack.geometry[1]), null, "a mesh without uv cannot be textured");
+  assert.equal(recordTextureId(bare, 0, bare.geometry[0]), null);
+
+  // Batches: textured records never share a batch with untextured ones of the same colour.
+  const textureOf = (record, geometry) => recordTextureId(pack, record, geometry);
+  const flat = planRenderBatches(pack, undefined, null, null, { instanceMinVertices: 0 });
+  const textured = planRenderBatches(pack, undefined, null, null, { instanceMinVertices: 0, textureOf });
+  assert.ok(textured.drawCalls > flat.drawCalls, "textures split the colour batches");
+  const texturedGroups = [...textured.instanced, ...textured.baked].filter((group) => group.texture !== null && group.texture !== undefined);
+  assert.deepEqual(texturedGroups.map((group) => group.texture).sort(), [40, 41]);
+  for (const group of [...flat.instanced, ...flat.baked]) assert.equal(group.texture ?? null, null, "no texture function, no textured batch");
+  console.log("ok    a pack's uv, material column, materials and textures read and plan into textured batches");
+
+  // Streaming: materials are chunk-local and remapped; textures are global by id and kept once.
+  const assembler = createPackAssembler();
+  const first = readIgp(writeIgp({
+    geometries: [quad],
+    instances: [{ geometry: 1, expressId: 10, classId: 0, material: 0 }],
+    materials: [materials[0]],
+    textures: [textures[0]],
+  }));
+  const second = readIgp(writeIgp({
+    geometries: [quad, plain],
+    instances: [{ geometry: 2, expressId: 11, classId: 0, material: 0 }, { geometry: 1, expressId: 12, classId: 0, material: 1 }, { geometry: 2, expressId: 13, classId: 0 }],
+    materials: [materials[1], materials[0]],
+    textures: [textures[1], textures[0]],
+  }));
+  assembler.append(first);
+  assembler.append(second);
+  const merged = assembler.pack();
+  assert.deepEqual([...merged.instances.material], [0, 1, 0, 0xffffffff], "each chunk's rows land on the merged table");
+  assert.deepEqual(merged.index.materials, [materials[0], materials[1]]);
+  assert.deepEqual(merged.index.textures.map((texture) => texture.id), [40, 41], "a texture arriving twice is kept once");
+  assert.equal(merged.instances.count, 4);
+  const untextured = createPackAssembler();
+  untextured.append(bare);
+  const bareMerged = untextured.pack();
+  assert.deepEqual([...bareMerged.instances.material], [0xffffffff]);
+  assert.deepEqual(bareMerged.index.materials, []);
+  assert.deepEqual(bareMerged.index.textures, []);
+  console.log("ok    streamed chunks remap materials and merge textures by id");
+}
+
+// ------------------------------------------------------ coarse levels
+{
+  const fine = {
+    id: 3,
+    positions: Float32Array.from([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0.5, 0.5, 0]),
+    indices: Uint16Array.from([0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4]),
+    bbox: [0, 0, 0, 1, 1, 0],
+    closed: false,
+  };
+  const level = { id: 4, positions: fine.positions, indices: Uint16Array.from([0, 1, 2, 0, 2, 3]), bbox: fine.bbox, closed: false, lod: { of: 3, level: 1 } };
+  const pack = readIgp(writeIgp({ geometries: [fine, level], instances: [{ geometry: 3, expressId: 30, classId: 0 }] }));
+  assert.equal(pack.geometry.length, 2);
+  assert.equal(pack.geometry[0].lod, null, "the base has no link");
+  assert.deepEqual(pack.geometry[1].lod, { of: 3, level: 1 }, "the level names its base");
+  assert.equal(pack.geometry[1].positions.byteOffset, pack.geometry[0].positions.byteOffset, "the level views the base's positions");
+  assert.equal(pack.geometry[1].positions.length, 15);
+  assert.deepEqual([...pack.geometry[1].indices], [0, 1, 2, 0, 2, 3]);
+  assert.equal(pack.instances.count, 1, "no instance places the level");
+  const baseBytes = fine.positions.byteLength + fine.indices.byteLength;
+  assert.equal(pack.memory.geometryBytes, baseBytes + level.indices.byteLength, "a level counts its indices only");
+  const base = readIgp(writeIgp({ geometries: [fine], instances: [{ geometry: 3, expressId: 30, classId: 0 }] }));
+  assert.equal(base.geometry[0].lod, null, "a pack without levels reads as before");
+  console.log("ok    a coarse level reads as an unreferenced mesh over its base's positions");
+
+  // The assembler keeps a level exactly as long as its base and can add levels later.
+  const assembler = createPackAssembler();
+  assembler.append(pack);
+  assert.equal(assembler.geometryCount, 2);
+  const ids = assembler.addLodLevels([{ of: 3, level: 2, indices: Uint16Array.from([0, 2, 3]) }, { of: 99, level: 1, indices: Uint16Array.from([0, 1, 2]) },
+    { of: 3, level: 1, indices: Uint16Array.from([0, 1, 2]) }, { of: 3, level: 2, indices: Uint16Array.from([0, 1, 7]) }]);
+  assert.equal(ids.length, 1, "one new level: the unknown base, the repeated level and the bad index are skipped");
+  const added = assembler.pack().geometry.find((mesh) => mesh.id === ids[0]);
+  assert.deepEqual(added.lod, { of: 3, level: 2 });
+  assert.equal(added.positions, pack.geometry[0].positions, "the added level shares the base's positions");
+  assert.equal(assembler.pack().memory.geometryBytes, baseBytes + level.indices.byteLength + 6, "its indices count, its positions do not");
+  const fresh = assembler.nextGeometryId();
+  const replacement = readIgp(writeIgp({ geometries: [{ ...fine, id: fresh, positions: fine.positions.map((v) => v * 2) }], instances: [{ geometry: fresh, expressId: 30, classId: 0 }] }));
+  const patch = assembler.replaceProducts([30], replacement);
+  assert.ok(patch.changed);
+  const remaining = assembler.pack().geometry.map((mesh) => mesh.id).sort();
+  assert.deepEqual(remaining, [fresh], "the base's levels die with it");
+  console.log("ok    the assembler adds levels to a base it holds and drops them with the base");
+}
+
+// ------------------------------------------------------ texture policy
+{
+  const page = "https://viewer.example/models/index.html";
+  assert.equal(resolveTextureUrl("textures/brick.png", { pageUrl: page }), "https://viewer.example/models/textures/brick.png");
+  assert.equal(resolveTextureUrl("/brick.png", { pageUrl: page }), "https://viewer.example/brick.png");
+  assert.equal(resolveTextureUrl("https://cdn.example/brick.png", { pageUrl: page }), null, "another origin needs opting in");
+  assert.equal(resolveTextureUrl("https://cdn.example/brick.png", { pageUrl: page, allowRemote: true }), "https://cdn.example/brick.png");
+  assert.equal(resolveTextureUrl("brick.png", { pageUrl: page, baseUrl: "https://cdn.example/tex/" }), "https://cdn.example/tex/brick.png", "a named base grants its origin");
+  assert.equal(resolveTextureUrl("file:///C:/brick.png", { pageUrl: page, allowRemote: true }), null, "only web images");
+  assert.equal(resolveTextureUrl("data:image/png;base64,AAAA", { pageUrl: null }), "data:image/png;base64,AAAA");
+  assert.equal(resolveTextureUrl("brick.png", { pageUrl: null }), null, "nothing to resolve against");
+  assert.equal(resolveTextureUrl("x".repeat(5000), { pageUrl: page }), null);
+  assert.deepEqual([...pixelsToRgba(Uint8Array.from([7, 9]), 2, 1, 1)], [7, 7, 7, 255, 9, 9, 9, 255]);
+  assert.deepEqual([...pixelsToRgba(Uint8Array.from([7, 128]), 1, 1, 2)], [7, 7, 7, 128]);
+  assert.deepEqual([...pixelsToRgba(Uint8Array.from([1, 2, 3]), 1, 1, 3)], [1, 2, 3, 255]);
+  assert.deepEqual([...pixelsToRgba(Uint8Array.from([1, 2, 3, 4]), 1, 1, 4)], [1, 2, 3, 4]);
+  assert.equal(pixelsToRgba(Uint8Array.from([1, 2, 3]), 2, 2, 3), null, "a size mismatch is refused");
+  assert.deepEqual([...uvMatrix([2, 0, 0, 3, 0.5, 0.25])], [2, 0, 0, 0, 3, 0, 0.5, 0.25, 1]);
+  assert.deepEqual([...uvMatrix(null)], [1, 0, 0, 0, 1, 0, 0, 0, 1]);
+  assert.match(renderer, /createProgram\(gl, VERTEX_SHADER, FRAGMENT_SHADER\)/, "the flat program compiles the untouched sources");
+  assert.match(renderer, /#ifdef TEXTURED/, "texture sampling is compiled in only under its define");
+  assert.match(renderer, /this\.frameTextured = !picking && this\.textures && this\.style === "shaded"/, "textures show in the shaded style only");
+  assert.match(renderer, /this\.coarseActive = !picking && this\.motionLod && this\.motionFrame && this\.style === "shaded" && !this\.section\.active/, "coarse levels stand in on shaded moving frames only");
+  {
+    const wireBody = renderer.slice(renderer.indexOf("  ensureWireBuffer(batch) {"), renderer.indexOf("  scheduleWirePreparation() {"));
+    assert.ok(wireBody.length > 0 && !/coarse/i.test(wireBody), "wire buffers never come from coarse indices");
+    const pickBody = renderer.slice(renderer.indexOf("  pickRecord(ray) {"), renderer.indexOf("  intersectRecord(record, clientX, clientY"));
+    assert.ok(!/coarse/i.test(pickBody), "picking never reads coarse indices");
+  }
+  console.log("ok    texture references follow the origin policy and pixel rows expand to RGBA");
+}
 
 if (!existsSync(wasmGlue)) {
   console.log("skip  build pkg-node for the IFC-to-IGP integration check");

@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The Python wheel: built with maturin for Linux (x86_64 and aarch64,
+# manylinux), macOS (Intel and Apple silicon) and Windows, plus the sdist.
+# Every job installs what it built and runs the tests against it. On a
+# version tag the wheels are attached to the release as artefacts; PyPI is
+# published only when the token exists, and the job says so otherwise.
+
+name: Wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    paths:
+      - "bindings/python/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  wheel:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { name: linux aarch64, os: ubuntu-latest, target: aarch64, manylinux: "2_28" }
+          - { name: macos x86_64, os: macos-15-intel, target: x86_64 }
+          - { name: macos aarch64, os: macos-14, target: aarch64 }
+          - { name: windows x64, os: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --locked --out ../../dist
+          sccache: "true"
+
+      # A cross-built wheel cannot run here; the native ones prove themselves.
+      - name: install the wheel and run the tests
+        if: matrix.target != 'aarch64' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-index --find-links dist tessifc
+          python -m unittest discover -s bindings/python/tests -p 'test_*.py' -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}-${{ matrix.os }}
+          path: dist/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: build the sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out ../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    needs: [wheel, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: publish when the token exists
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_API_TOKEN" ]; then
+            echo "PYPI_API_TOKEN is not set; the wheels stay release artefacts and nothing is published."
+            exit 0
+          fi
+          mkdir -p dist
+          find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+          python -m pip install --upgrade twine
+          python -m twine upload --non-interactive -u __token__ -p "$PYPI_API_TOKEN" dist/*

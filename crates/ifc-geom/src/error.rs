@@ -36,9 +36,9 @@ pub enum GeomError {
     #[error("representation nests deeper than {0} levels")]
     TooDeep(u32),
 
-    /// Deliberately not done in this mode, e.g. a mesh-mesh boolean in clip-only mode.
+    /// A boolean the kernel refused; the body is emitted un-cut.
     #[error("{0}")]
-    NotInThisMode(String),
+    BooleanRefused(String),
 }
 
 impl GeomError {
@@ -52,7 +52,7 @@ impl GeomError {
             GeomError::Degenerate(_) => codes::DEGENERATE_GEOMETRY,
             GeomError::Triangulation(_) => codes::TRIANGULATION_FAILED,
             GeomError::TooDeep(_) => codes::REPRESENTATION_TOO_DEEP,
-            GeomError::NotInThisMode(_) => codes::BOOLEAN_UNSUPPORTED_IN_CLIP_MODE,
+            GeomError::BooleanRefused(_) => codes::BOOLEAN_REFUSED,
         }
     }
 
@@ -99,9 +99,8 @@ pub mod codes {
     pub const TRIANGULATION_FAILED: DiagCode = DiagCode("E_TRIANGULATION_FAILED");
     /// The representation graph nests too deeply, usually a cycle.
     pub const REPRESENTATION_TOO_DEEP: DiagCode = DiagCode("E_REPRESENTATION_TOO_DEEP");
-    /// A boolean that clip-only mode cannot do; the body is emitted un-cut.
-    pub const BOOLEAN_UNSUPPORTED_IN_CLIP_MODE: DiagCode =
-        DiagCode("E_BOOLEAN_UNSUPPORTED_IN_CLIP_MODE");
+    /// A boolean the kernel refused; the body is emitted un-cut.
+    pub const BOOLEAN_REFUSED: DiagCode = DiagCode("W_BOOLEAN_REFUSED");
 
     /// The product has no representation this engine can use.
     pub const NO_USABLE_REPRESENTATION: DiagCode = DiagCode("W_NO_USABLE_REPRESENTATION");
@@ -136,6 +135,24 @@ pub mod codes {
     pub const NO_DRAWN_REPRESENTATION: DiagCode = DiagCode("W_NO_DRAWN_REPRESENTATION");
     /// Openings were cut through the faces of a body whose inside could not be used.
     pub const OPENING_CUT_ON_SURFACE: DiagCode = DiagCode("W_OPENING_CUT_ON_SURFACE");
+    /// An alignment segment does not start where the previous one ends; each keeps its placement.
+    pub const ALIGNMENT_SEGMENT_GAP: DiagCode = DiagCode("W_ALIGNMENT_SEGMENT_GAP");
+    /// Cant was blended linearly along a segment whose parent curve gives no other shape.
+    pub const CANT_APPROXIMATED: DiagCode = DiagCode("W_CANT_APPROXIMATED");
+    /// A linear placement's cached position disagrees with the one computed along its curve.
+    pub const LINEAR_PLACEMENT_MISMATCH: DiagCode = DiagCode("W_LINEAR_PLACEMENT_MISMATCH");
+    /// A vertex loop that is not at an apex or pole of its face's surface bounds no area.
+    pub const VERTEX_LOOP_IGNORED: DiagCode = DiagCode("I_VERTEX_LOOP_IGNORED");
+    /// A style with several texture layers; only the first is carried.
+    pub const TEXTURE_LAYERS_IGNORED: DiagCode = DiagCode("I_TEXTURE_LAYERS_IGNORED");
+    /// A texture map whose coordinates do not match the face or face set it maps.
+    pub const TEXTURE_MAP_IGNORED: DiagCode = DiagCode("I_TEXTURE_MAP_IGNORED");
+    /// A texture coordinate generator in a mode the kernel does not compute.
+    pub const TEXTURE_GENERATOR_UNSUPPORTED: DiagCode = DiagCode("I_TEXTURE_GENERATOR_UNSUPPORTED");
+    /// A textured part was cut by a boolean, which loses its texture coordinates.
+    pub const TEXTURE_DROPPED_BY_BOOLEAN: DiagCode = DiagCode("W_TEXTURE_DROPPED_BY_BOOLEAN");
+    /// A texture's pixels were left out of the pack because they are over the size limit.
+    pub const TEXTURE_OMITTED: DiagCode = DiagCode("W_TEXTURE_OMITTED");
 }
 
 #[cfg(test)]
@@ -150,7 +167,7 @@ mod tests {
             GeomError::Degenerate("zero depth".into()),
             GeomError::Triangulation("nope".into()),
             GeomError::TooDeep(24),
-            GeomError::NotInThisMode("boolean".into()),
+            GeomError::BooleanRefused("boolean".into()),
         ];
         for case in cases {
             let code = case.code().as_str();

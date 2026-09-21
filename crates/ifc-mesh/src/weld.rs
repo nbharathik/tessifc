@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Merging vertices that are the same point.
-//!
-//! An IFC B-rep names its vertices once per face, so a cube arrives as
-//! 24 or 36 vertices rather than 8. That costs memory, breaks edge counting
-//! (nothing is watertight if no two faces share a vertex), and stops any
-//! boolean kernel before it starts.
-//!
-//! Welding is a hash grid on quantised coordinates, not a spatial search. It is
-//! linear, it needs no tree, and the quantum is the model's own precision, so
-//! two points the file considers identical become identical here.
+//! Merging vertices that are the same point. A B-rep names each vertex once per
+//! face, so nothing is watertight until they are merged. The weld is a hash grid
+//! on coordinates quantised to the model's own precision.
 
 use crate::mesh::Mesh64;
 use glam::DVec3;
@@ -19,15 +12,9 @@ const MAX_CELL_INDEX: f64 = 1e15;
 
 /// Merge vertices closer together than `tolerance`, in place.
 ///
-/// Returns the number of vertices removed. Triangles that collapse to a line
-/// once their corners merge are dropped, because a zero-area triangle is not
-/// geometry and every later stage has to special-case it.
-///
-/// The grid is exact rather than approximate: two points land in the same cell
-/// or they do not. A pair straddling a cell boundary at 1.0001 times the
-/// tolerance stays separate, which is the price of doing this in one pass.
-/// Neighbour-cell probing would fix that and triple the cost; the tolerance
-/// comes from the file's own precision, so the case is rare in practice.
+/// Returns the number of vertices removed; triangles that collapse to a line
+/// are dropped. The grid is exact: a pair straddling a cell boundary stays
+/// separate, which is the price of one pass.
 pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
     if mesh.positions.is_empty() || !tolerance.is_finite() || tolerance <= 0.0 {
         return 0;
@@ -36,9 +23,8 @@ pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
         return 0;
     };
     let before = mesh.positions.len();
-    // Quantise from the box corner, and keep the cell index inside what f64
-    // counts exactly: a georeferenced coordinate would otherwise saturate the
-    // cast and weld the whole mesh into one vertex.
+    // Quantise from the box corner and keep the cell index exact in f64, or a
+    // georeferenced coordinate saturates the cast and welds everything together.
     let span = (high - low).max_element();
     let quantum = if span.is_finite() && span > tolerance * MAX_CELL_INDEX {
         span / MAX_CELL_INDEX
@@ -47,32 +33,42 @@ pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
     };
     let inverse = 1.0 / quantum;
 
-    let mut cells: HashMap<(i64, i64, i64), u32> = HashMap::with_capacity(before);
+    // A texture seam is two vertices at one position with different
+    // coordinates; welding keeps them apart, and closedness is judged on
+    // positions alone by the callers that need it.
+    let carry = mesh.has_uvs();
+    let mut cells: HashMap<(i64, i64, i64, u32, u32), u32> = HashMap::with_capacity(before);
     let mut remap = Vec::with_capacity(before);
     let mut kept: Vec<DVec3> = Vec::with_capacity(before);
+    let mut kept_uvs: Vec<[f32; 2]> = Vec::new();
 
-    for position in &mesh.positions {
+    for (at, position) in mesh.positions.iter().enumerate() {
         let offset = *position - low;
+        let uv = if carry { mesh.uvs[at] } else { [0.0, 0.0] };
         let key = (
             (offset.x * inverse).round() as i64,
             (offset.y * inverse).round() as i64,
             (offset.z * inverse).round() as i64,
+            uv[0].to_bits(),
+            uv[1].to_bits(),
         );
         match cells.get(&key) {
             Some(&index) => remap.push(index),
             None => {
                 let index = kept.len() as u32;
                 cells.insert(key, index);
-                // Keep the first position seen rather than an average: an
-                // average would move the geometry, and the whole point is that
-                // these are the same point already.
+                // The first position seen, not an average: an average would move the geometry.
                 kept.push(*position);
+                if carry {
+                    kept_uvs.push(uv);
+                }
                 remap.push(index);
             }
         }
     }
 
     mesh.positions = kept;
+    mesh.uvs = kept_uvs;
     let mut indices = Vec::with_capacity(mesh.indices.len());
     for triangle in mesh.indices.chunks_exact(3) {
         let (Some(&a), Some(&b), Some(&c)) = (
@@ -94,11 +90,8 @@ pub fn weld(mesh: &mut Mesh64, tolerance: f64) -> usize {
 
 /// Remove coincident triangles, regardless of their winding.
 ///
-/// IFC exporters sometimes repeat the same face through two representation
-/// items, or emit both sides of a zero-thickness surface. Once vertices have
-/// been welded those faces have the same three indices. Keeping both makes a
-/// depth buffer alternate between them while the camera moves; one triangle is
-/// sufficient for a two-sided viewer and for all mesh measurements.
+/// Exporters repeat faces and emit both sides of zero-thickness surfaces; after
+/// welding those share three indices, and two of them flicker in a depth buffer.
 pub fn remove_duplicate_triangles(mesh: &mut Mesh64) -> usize {
     let before = mesh.triangle_count();
     let mut seen = HashSet::with_capacity(before);
@@ -195,21 +188,23 @@ pub fn weld_and_close(mesh: &mut Mesh64, tolerance: f64) -> usize {
     mesh.remove_degenerate_triangles(tolerance * tolerance);
     remove_duplicate_triangles(mesh);
     orient_triangles_consistently(mesh);
-    mesh.closed = Some(mesh.is_edge_manifold());
+    mesh.closed = Some(if mesh.has_uvs() {
+        // Texture seams keep vertices apart; the shell is judged on positions.
+        let mut plain = mesh.clone();
+        plain.drop_uvs();
+        weld(&mut plain, tolerance);
+        plain.is_edge_manifold()
+    } else {
+        mesh.is_edge_manifold()
+    });
     removed
 }
 
-/// Separate two faces that drew the same chord inside themselves.
-///
-/// Two triangulated faces meeting along a rim may each cut the same corner off
-/// it, and then that chord exists twice: once inside each face. The surface is
-/// watertight, but the edge is used four times and no edge count can tell that
-/// from a real defect. Splitting one of the two copies at its own midpoint
-/// changes no geometry at all, since the midpoint of a straight segment lies on
-/// it, and leaves every edge used twice.
-///
-/// Returns how many edges were separated.
+/// Separate two faces that drew the same chord inside themselves, so the
+/// edge is no longer used four times: one copy is split at its midpoint, which
+/// changes no geometry. Returns how many edges were separated.
 pub fn split_coincident_edges(mesh: &mut Mesh64, tolerance: f64) -> usize {
+    mesh.drop_uvs();
     let tol = if tolerance.is_finite() && tolerance > 0.0 {
         tolerance
     } else {
@@ -300,19 +295,12 @@ pub fn split_coincident_edges(mesh: &mut Mesh64, tolerance: f64) -> usize {
 
 /// Split triangle edges that have another vertex sitting in the middle of them.
 ///
-/// A T-junction is what you get when two surfaces meet along a line that one
-/// side has subdivided and the other has not. The mesh looks watertight, the
-/// volume is right, and it is still not edge-manifold: the long edge is used
-/// once while the two short ones facing it are used once each. Renderers show
-/// it as a hairline crack, and any algorithm that walks edges sees a hole.
-///
-/// They are unavoidable when two independently triangulated surfaces are
-/// stitched - which is exactly what a difference does - so they are repaired
-/// afterwards rather than prevented.
-///
-/// Weld first: this matches vertices by position, and two copies of the same
-/// corner are two different obstacles. Returns how many splits were made.
+/// A T-junction leaves a mesh watertight but not edge-manifold, which renders
+/// as a hairline crack; stitching two triangulations, as a difference does,
+/// always makes some. Weld first, since vertices are matched by position.
+/// Returns how many splits were made.
 pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
+    mesh.drop_uvs();
     let tol = if tolerance.is_finite() && tolerance > 0.0 {
         tolerance
     } else {
@@ -345,10 +333,8 @@ pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
         .collect();
     let mut done: Vec<[u32; 3]> = Vec::with_capacity(pending.len());
 
-    // Each split replaces one triangle with two, so the total is bounded; the
-    // cap is a guarantee of termination rather than an expectation. The
-    // candidate budget keeps a huge flat mesh, whose cells hold thousands of
-    // vertices each, from turning quadratic: past it the rest is left as is.
+    // The cap only guarantees termination; the candidate budget keeps a huge flat
+    // mesh from turning quadratic, and past it the rest is left as is.
     let limit = pending.len() * 8 + 64;
     let mut budget = mesh
         .positions
@@ -412,9 +398,8 @@ pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
             }
         }
         match split {
-            // Connect the intruding vertex to the corner opposite the edge it
-            // landed on. Both halves go back on the list: an edge can carry
-            // more than one.
+            // Connect the intruding vertex to the opposite corner; both halves go back
+            // on the list because an edge can carry more than one.
             Some((edge, vertex)) => {
                 let a = triangle[edge];
                 let b = triangle[(edge + 1) % 3];
@@ -429,6 +414,349 @@ pub fn heal_t_junctions(mesh: &mut Mesh64, tolerance: f64) -> usize {
 
     mesh.indices = done.into_iter().flatten().collect();
     splits
+}
+
+/// Drop needle triangles thinner than `tolerance` that no properly shared
+/// edge depends on: every edge of one is either unpaired or overused.
+///
+/// Two faces meeting along an edge one exporter placed twice, a whisker
+/// apart, leave such a needle between them after welding. Removing it turns
+/// its overused edges into shared ones and its open edge into nothing.
+/// Returns how many were dropped.
+pub fn drop_hanging_slivers(mesh: &mut Mesh64, tolerance: f64) -> usize {
+    mesh.drop_uvs();
+    let tol = if tolerance.is_finite() && tolerance > 0.0 {
+        tolerance
+    } else {
+        1e-9
+    };
+    let mut uses: HashMap<(u32, u32), usize> = HashMap::with_capacity(mesh.indices.len());
+    for triangle in mesh.indices.chunks_exact(3) {
+        for step in 0..3 {
+            let (from, to) = (triangle[step], triangle[(step + 1) % 3]);
+            *uses.entry((from.min(to), from.max(to))).or_default() += 1;
+        }
+    }
+    let before = mesh.triangle_count();
+    let mut kept = Vec::with_capacity(mesh.indices.len());
+    for triangle in mesh.indices.chunks_exact(3) {
+        let hanging = (0..3).all(|step| {
+            let (from, to) = (triangle[step], triangle[(step + 1) % 3]);
+            uses.get(&(from.min(to), from.max(to))) != Some(&2)
+        });
+        let corners = (
+            mesh.positions.get(triangle[0] as usize),
+            mesh.positions.get(triangle[1] as usize),
+            mesh.positions.get(triangle[2] as usize),
+        );
+        let thin = match corners {
+            (Some(&a), Some(&b), Some(&c)) if hanging => {
+                let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+                longest > 0.0 && (b - a).cross(c - a).length() < tol * longest
+            }
+            _ => false,
+        };
+        if !thin {
+            kept.extend_from_slice(triangle);
+        }
+    }
+    mesh.indices = kept;
+    before - mesh.triangle_count()
+}
+
+/// Most triangles one edge may carry before the split gives up on it.
+const MAX_EDGE_USES: usize = 64;
+
+/// Separate solids that weld into one surface into one closed shell each.
+///
+/// Two solids sharing a face weld into a surface whose shared edges carry
+/// three or four triangles. Around every edge the faces are sorted by angle,
+/// and the two face sides that look into the same wedge bound the same
+/// region of space; a face with material on both sides is written into both
+/// shells. A region is solid when its boundary, wound away from it, encloses
+/// a positive volume, so the outside is never a shell and winding is not
+/// trusted. A face with the same region on both sides separates nothing and
+/// is dropped. `None` when no edge is shared, so there is nothing to split,
+/// when a face lies on part of another, and unless every shell comes out
+/// closed. Each shell has `closed` set.
+pub fn split_manifold_shells(mesh: &Mesh64, tolerance: f64) -> Option<Vec<Mesh64>> {
+    let tol = if tolerance.is_finite() && tolerance > 0.0 {
+        tolerance
+    } else {
+        1e-9
+    };
+    let mut welded = mesh.clone();
+    weld(&mut welded, tol);
+    welded.remove_degenerate_triangles(tol * tol);
+    // Two solids rarely split a shared edge the same way; stitch first. A
+    // face both of them wrote survives once and is handed to each below.
+    if heal_t_junctions(&mut welded, tol) > 0 {
+        weld(&mut welded, tol);
+        welded.remove_degenerate_triangles(tol * tol);
+    }
+    remove_duplicate_triangles(&mut welded);
+    let triangles = welded.triangle_count();
+    let uses = edge_uses(&welded);
+    if triangles < 4 || uses.values().all(|holders| holders.len() <= 2) {
+        return None;
+    }
+    // A face lying on part of another shares no edge with it there, so the
+    // wedges round the edges cannot tell the regions apart.
+    if coplanar_faces_overlap(&welded, tol)? {
+        return None;
+    }
+
+    // One node per face side: the front of triangle `t` is `2 t`, its back `2 t + 1`.
+    let mut parent: Vec<usize> = (0..triangles * 2).collect();
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    let unite = |parent: &mut [usize], a: usize, b: usize| {
+        let (ra, rb) = (root(parent, a), root(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    };
+    let normal_of = |index: usize| -> DVec3 {
+        let t = &welded.indices[index * 3..index * 3 + 3];
+        let (a, b, c) = (
+            welded.positions[t[0] as usize],
+            welded.positions[t[1] as usize],
+            welded.positions[t[2] as usize],
+        );
+        (b - a).cross(c - a)
+    };
+
+    let mut keyed: Vec<(&(u32, u32), &Vec<usize>)> = uses.iter().collect();
+    keyed.sort_unstable_by_key(|(edge, _)| **edge);
+    for (&(a, b), holders) in keyed {
+        if holders.len() < 2 {
+            continue;
+        }
+        if holders.len() > MAX_EDGE_USES {
+            return None;
+        }
+        let pa = welded.positions[a as usize];
+        let pb = welded.positions[b as usize];
+        let axis = (pb - pa).try_normalize()?;
+        // Each face by its angle round the edge. Of two coincident faces, the
+        // one whose normal points on round the edge sits next to the wedge
+        // after them, which is the same geometric choice at all its edges.
+        let mut fans: Vec<(f64, usize, bool)> = Vec::with_capacity(holders.len());
+        let mut frame: Option<(DVec3, DVec3)> = None;
+        for &index in holders {
+            let triangle = &welded.indices[index * 3..index * 3 + 3];
+            let &other = triangle.iter().find(|&&v| v != a && v != b)?;
+            let offset = welded.positions[other as usize] - pa;
+            let d = (offset - axis * offset.dot(axis)).try_normalize()?;
+            let (u, v) = *frame.get_or_insert_with(|| (d, axis.cross(d)));
+            let mut angle = d.dot(v).atan2(d.dot(u));
+            if angle < 0.0 {
+                angle += std::f64::consts::TAU;
+            }
+            let forward = normal_of(index).dot(axis.cross(d)) > 0.0;
+            fans.push((angle, index, forward));
+        }
+        fans.sort_by(|x, y| {
+            if (x.0 - y.0).abs() <= 1e-6 {
+                x.2.cmp(&y.2)
+            } else {
+                x.0.total_cmp(&y.0)
+            }
+        });
+        let (u, v) = frame?;
+        let count = fans.len();
+        let wedges: Vec<(f64, DVec3)> = (0..count)
+            .map(|wedge| {
+                let (from, _, _) = fans[wedge];
+                let (to, _, _) = fans[(wedge + 1) % count];
+                let mut width = to - from;
+                if wedge + 1 == count {
+                    width += std::f64::consts::TAU;
+                }
+                let bisector = from + width * 0.5;
+                (width, u * bisector.cos() + v * bisector.sin())
+            })
+            .collect();
+        // Which side of each face looks into the wedge after it and the one
+        // before it. A coincident pair has no wedge between them to look into,
+        // so those sides are the other flank's opposite.
+        let facing = |index: usize, towards: DVec3| {
+            index * 2 + usize::from(normal_of(index).dot(towards) < 0.0)
+        };
+        let mut after: Vec<Option<usize>> = vec![None; count];
+        let mut before: Vec<Option<usize>> = vec![None; count];
+        for (wedge, &(width, towards)) in wedges.iter().enumerate() {
+            if width > 1e-6 {
+                after[wedge] = Some(facing(fans[wedge].1, towards));
+                before[(wedge + 1) % count] = Some(facing(fans[(wedge + 1) % count].1, towards));
+            }
+        }
+        for face in 0..count {
+            match (after[face], before[face]) {
+                (Some(_), Some(_)) => {}
+                (Some(side), None) => before[face] = Some(side ^ 1),
+                (None, Some(side)) => after[face] = Some(side ^ 1),
+                (None, None) => return None,
+            }
+        }
+        for wedge in 0..count {
+            unite(&mut parent, after[wedge]?, before[(wedge + 1) % count]?);
+        }
+    }
+
+    // Emit each region's boundary wound away from it, in first-seen order;
+    // a face with one region on both sides is nobody's boundary.
+    let mut slot_of: HashMap<usize, usize> = HashMap::new();
+    let mut shells: Vec<Mesh64> = Vec::new();
+    let mut remap: Vec<Vec<u32>> = Vec::new();
+    for node in 0..triangles * 2 {
+        let index = node / 2;
+        let group = root(&mut parent, node);
+        if group == root(&mut parent, node ^ 1) {
+            continue;
+        }
+        let which = *slot_of.entry(group).or_insert_with(|| {
+            shells.push(Mesh64::new());
+            remap.push(vec![u32::MAX; welded.positions.len()]);
+            shells.len() - 1
+        });
+        let triangle = &welded.indices[index * 3..index * 3 + 3];
+        let mut local = [0u32; 3];
+        for (corner, &vertex) in triangle.iter().enumerate() {
+            let slot = &mut remap[which][vertex as usize];
+            if *slot == u32::MAX {
+                *slot = shells[which].push_vertex(welded.positions[vertex as usize]);
+            }
+            local[corner] = *slot;
+        }
+        // The region on the front means the normal points into it: turn it round.
+        if node % 2 == 0 {
+            shells[which].push_triangle(local[0], local[2], local[1]);
+        } else {
+            shells[which].push_triangle(local[0], local[1], local[2]);
+        }
+    }
+    let mut out = Vec::with_capacity(shells.len());
+    for mut shell in shells {
+        let volume = shell.signed_volume();
+        if volume <= tol * shell.surface_area() {
+            // The outside, or a sheet between coincident faces.
+            continue;
+        }
+        if !shell.is_edge_manifold() || !shell.is_consistently_wound() {
+            return None;
+        }
+        shell.closed = Some(true);
+        out.push(shell);
+    }
+    Some(out)
+}
+
+/// Most coplanar triangles compared pairwise before the check gives up.
+const MAX_COPLANAR_GROUP: usize = 2048;
+
+/// Do two coplanar triangles share any area, beyond touching along an edge?
+/// `None` when a plane holds more triangles than the check will compare.
+fn coplanar_faces_overlap(mesh: &Mesh64, tol: f64) -> Option<bool> {
+    let mut groups: HashMap<(i64, i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut corners: Vec<[DVec3; 3]> = Vec::with_capacity(mesh.triangle_count());
+    for (index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
+        let (a, b, c) = (
+            mesh.positions[triangle[0] as usize],
+            mesh.positions[triangle[1] as usize],
+            mesh.positions[triangle[2] as usize],
+        );
+        corners.push([a, b, c]);
+        let Some(normal) = (b - a).cross(c - a).try_normalize() else {
+            continue;
+        };
+        // One key per plane, whichever way its faces wind.
+        let normal = if normal.x < 0.0
+            || (normal.x == 0.0 && (normal.y < 0.0 || (normal.y == 0.0 && normal.z < 0.0)))
+        {
+            -normal
+        } else {
+            normal
+        };
+        let key = (
+            (normal.x * 1e6).round() as i64,
+            (normal.y * 1e6).round() as i64,
+            (normal.z * 1e6).round() as i64,
+            (a.dot(normal) / tol).round() as i64,
+        );
+        groups.entry(key).or_default().push(index);
+    }
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        if members.len() > MAX_COPLANAR_GROUP {
+            return None;
+        }
+        let normal = {
+            let [a, b, c] = corners[members[0]];
+            (b - a).cross(c - a).normalize_or_zero()
+        };
+        // Two in-plane axes to compare along.
+        let u = normal
+            .cross(DVec3::X)
+            .try_normalize()
+            .or_else(|| normal.cross(DVec3::Y).try_normalize())?;
+        let v = normal.cross(u);
+        let flat = |t: usize| corners[t].map(|p| glam::DVec2::new(p.dot(u), p.dot(v)));
+        for (slot, &one) in members.iter().enumerate() {
+            let first = flat(one);
+            for &other in &members[slot + 1..] {
+                if triangles_share_area(&first, &flat(other), tol) {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Separating-axis test in the plane; touching along an edge is not sharing.
+fn triangles_share_area(a: &[glam::DVec2; 3], b: &[glam::DVec2; 3], tol: f64) -> bool {
+    for triangle in [a, b] {
+        for step in 0..3 {
+            let edge = triangle[(step + 1) % 3] - triangle[step];
+            let axis = glam::DVec2::new(-edge.y, edge.x);
+            if axis.length_squared() == 0.0 {
+                return false;
+            }
+            let axis = axis.normalize();
+            let range = |t: &[glam::DVec2; 3]| {
+                let d = t.map(|p| p.dot(axis));
+                (d[0].min(d[1]).min(d[2]), d[0].max(d[1]).max(d[2]))
+            };
+            let (low_a, high_a) = range(a);
+            let (low_b, high_b) = range(b);
+            if high_a <= low_b + tol || high_b <= low_a + tol {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Every edge with the triangles that use it, in triangle order.
+fn edge_uses(mesh: &Mesh64) -> HashMap<(u32, u32), Vec<usize>> {
+    let mut uses: HashMap<(u32, u32), Vec<usize>> = HashMap::with_capacity(mesh.indices.len());
+    for (index, triangle) in mesh.indices.chunks_exact(3).enumerate() {
+        for step in 0..3 {
+            let (from, to) = (triangle[step], triangle[(step + 1) % 3]);
+            uses.entry((from.min(to), from.max(to)))
+                .or_default()
+                .push(index);
+        }
+    }
+    uses
 }
 
 #[cfg(test)]
@@ -657,5 +985,247 @@ mod tests {
         weld(&mut mesh, 1e-13);
         assert_eq!(mesh.positions.len(), 8);
         assert_eq!(mesh.triangle_count(), 12);
+    }
+
+    /// An axis-aligned box, outward wound, with its own vertices.
+    fn box_at(lo: DVec3, hi: DVec3) -> Mesh64 {
+        let mut mesh = Mesh64::new();
+        let corner = |i: usize| {
+            DVec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            )
+        };
+        for index in 0..8 {
+            mesh.push_vertex(corner(index));
+        }
+        let faces = [
+            [0, 2, 3, 1],
+            [4, 5, 7, 6],
+            [0, 1, 5, 4],
+            [2, 6, 7, 3],
+            [0, 4, 6, 2],
+            [1, 3, 7, 5],
+        ];
+        for face in faces {
+            mesh.push_triangle(face[0], face[1], face[2]);
+            mesh.push_triangle(face[0], face[2], face[3]);
+        }
+        mesh
+    }
+
+    fn boxes(cells: &[(DVec3, DVec3)]) -> Mesh64 {
+        let mut mesh = Mesh64::new();
+        for &(lo, hi) in cells {
+            mesh.append(&box_at(lo, hi));
+        }
+        mesh
+    }
+
+    fn volumes(shells: &[Mesh64]) -> Vec<f64> {
+        let mut out: Vec<f64> = shells.iter().map(Mesh64::signed_volume).collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        out
+    }
+
+    #[test]
+    fn two_boxes_sharing_a_face_come_apart_closed() {
+        let mesh = boxes(&[
+            (DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(3.0, 1.0, 1.0)),
+        ]);
+        let mut welded = mesh.clone();
+        weld_and_close(&mut welded, 1e-9);
+        assert!(
+            welded.edge_defects().1 > 0,
+            "the shared face makes overused edges"
+        );
+        let shells = split_manifold_shells(&mesh, 1e-9).expect("two closed shells");
+        assert_eq!(shells.len(), 2);
+        for shell in &shells {
+            assert_eq!(shell.closed, Some(true));
+            assert_eq!(
+                shell.triangle_count(),
+                12,
+                "each keeps its copy of the shared face"
+            );
+        }
+        let volumes = volumes(&shells);
+        assert!((volumes[0] - 1.0).abs() < 1e-12 && (volumes[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_t_of_three_boxes_gives_three() {
+        let mesh = boxes(&[
+            (DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 1.0)),
+            (DVec3::new(2.0, 0.0, 0.0), DVec3::new(3.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 1.0, 0.0), DVec3::new(2.0, 2.0, 1.0)),
+        ]);
+        let shells = split_manifold_shells(&mesh, 1e-9).expect("four closed shells");
+        assert_eq!(shells.len(), 4);
+        for volume in volumes(&shells) {
+            assert!((volume - 1.0).abs() < 1e-12, "{volume}");
+        }
+    }
+
+    #[test]
+    fn a_box_on_part_of_a_face_is_refused() {
+        // The second box's back lies inside the first box's face, so the two
+        // faces overlap without sharing the edges that would separate them.
+        let mesh = boxes(&[
+            (DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 0.5)),
+        ]);
+        assert!(split_manifold_shells(&mesh, 1e-9).is_none());
+    }
+
+    #[test]
+    fn a_dangling_fin_is_dropped() {
+        let mut mesh = box_at(DVec3::ZERO, DVec3::ONE);
+        let a = mesh.push_vertex(DVec3::new(1.0, 0.0, 0.0));
+        let b = mesh.push_vertex(DVec3::new(1.0, 1.0, 0.0));
+        let c = mesh.push_vertex(DVec3::new(2.0, 0.5, 0.0));
+        mesh.push_triangle(a, b, c);
+        let shells = split_manifold_shells(&mesh, 1e-9).expect("the box alone");
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].triangle_count(), 12);
+        assert!((shells[0].signed_volume() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_grid_of_eight_boxes_gives_eight() {
+        let mut cells = Vec::new();
+        for i in 0..2 {
+            for j in 0..2 {
+                for k in 0..2 {
+                    let lo = DVec3::new(i as f64, j as f64, k as f64);
+                    cells.push((lo, lo + DVec3::ONE));
+                }
+            }
+        }
+        let shells = split_manifold_shells(&boxes(&cells), 1e-9).expect("eight closed shells");
+        assert_eq!(shells.len(), 8);
+        assert!(volumes(&shells).iter().all(|v| (v - 1.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn a_box_missing_a_triangle_is_refused() {
+        let mut mesh = boxes(&[
+            (DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 1.0)),
+        ]);
+        mesh.indices.truncate(mesh.indices.len() - 3);
+        assert!(split_manifold_shells(&mesh, 1e-9).is_none());
+    }
+
+    #[test]
+    fn a_surface_with_no_shared_edge_has_nothing_to_split() {
+        let mut torus = Mesh64::new();
+        let (major, minor, around, tube) = (2.0, 0.5, 24, 12);
+        for i in 0..around {
+            let u = std::f64::consts::TAU * i as f64 / around as f64;
+            for j in 0..tube {
+                let v = std::f64::consts::TAU * j as f64 / tube as f64;
+                let r = major + minor * v.cos();
+                torus.push_vertex(DVec3::new(r * u.cos(), r * u.sin(), minor * v.sin()));
+            }
+        }
+        let at = |i: usize, j: usize| ((i % around) * tube + (j % tube)) as u32;
+        for i in 0..around {
+            for j in 0..tube {
+                torus.push_triangle(at(i, j), at(i + 1, j), at(i + 1, j + 1));
+                torus.push_triangle(at(i, j), at(i + 1, j + 1), at(i, j + 1));
+            }
+        }
+        assert!(split_manifold_shells(&torus, 1e-9).is_none());
+        assert!(split_manifold_shells(&box_at(DVec3::ZERO, DVec3::ONE), 1e-9).is_none());
+    }
+
+    #[test]
+    fn a_fin_inside_a_box_splits_it_in_two() {
+        // A wall through the middle of a box, welded to its sides: material
+        // on both sides, so it is the face two half boxes share.
+        let mut mesh = box_at(DVec3::ZERO, DVec3::new(2.0, 1.0, 1.0));
+        let fin = [
+            mesh.push_vertex(DVec3::new(1.0, 0.0, 0.0)),
+            mesh.push_vertex(DVec3::new(1.0, 1.0, 0.0)),
+            mesh.push_vertex(DVec3::new(1.0, 1.0, 1.0)),
+            mesh.push_vertex(DVec3::new(1.0, 0.0, 1.0)),
+        ];
+        mesh.push_triangle(fin[0], fin[1], fin[2]);
+        mesh.push_triangle(fin[0], fin[2], fin[3]);
+        // Split the box faces along the fin so its edges are shared.
+        let mut split = Mesh64::new();
+        for triangle in mesh.indices.chunks_exact(3) {
+            let points: Vec<DVec3> = triangle
+                .iter()
+                .map(|&i| mesh.positions[i as usize])
+                .collect();
+            let straddles =
+                points.iter().any(|p| p.x < 1.0 - 1e-9) && points.iter().any(|p| p.x > 1.0 + 1e-9);
+            if !straddles {
+                let base = split.positions.len() as u32;
+                split.positions.extend(points);
+                split.push_triangle(base, base + 1, base + 2);
+                continue;
+            }
+            let plane =
+                crate::clip::Plane::from_point_normal(DVec3::new(1.0, 0.0, 0.0), DVec3::X).unwrap();
+            for half in [
+                crate::clip::clip_polygon(&points, &plane, 1e-9),
+                crate::clip::clip_polygon(&points, &plane.flipped(), 1e-9),
+            ] {
+                let base = split.positions.len() as u32;
+                split.positions.extend(half.iter().copied());
+                for k in 1..half.len().saturating_sub(1) {
+                    split.push_triangle(base, base + k as u32, base + k as u32 + 1);
+                }
+            }
+        }
+        let shells = split_manifold_shells(&split, 1e-9).expect("two half boxes");
+        assert_eq!(shells.len(), 2);
+        for shell in &shells {
+            assert!(
+                (shell.signed_volume() - 1.0).abs() < 1e-12,
+                "{}",
+                shell.signed_volume()
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_face_is_dropped_but_an_opposite_one_is_kept() {
+        let mut mesh = boxes(&[
+            (DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 1.0)),
+        ]);
+        // The first box's +x face again, same winding: a repeat, not a third solid.
+        let repeat: Vec<u32> = mesh.indices[30..36].to_vec();
+        mesh.indices.extend_from_slice(&repeat);
+        let shells = split_manifold_shells(&mesh, 1e-9).expect("two closed shells");
+        assert_eq!(shells.len(), 2);
+        assert_eq!(shells.iter().map(Mesh64::triangle_count).sum::<usize>(), 24);
+    }
+
+    #[test]
+    fn a_flipped_second_box_still_comes_apart_outward() {
+        let mut mesh = boxes(&[
+            (DVec3::ZERO, DVec3::new(1.0, 1.0, 1.0)),
+            (DVec3::new(1.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 1.0)),
+        ]);
+        let second = mesh.indices.len() / 2;
+        for triangle in mesh.indices[second..].chunks_exact_mut(3) {
+            triangle.swap(1, 2);
+        }
+        let shells = split_manifold_shells(&mesh, 1e-9).expect("two closed shells");
+        assert_eq!(shells.len(), 2);
+        for shell in &shells {
+            assert!(
+                (shell.signed_volume() - 1.0).abs() < 1e-12,
+                "wound outward again"
+            );
+        }
     }
 }

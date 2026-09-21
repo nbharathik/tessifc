@@ -49,7 +49,12 @@ impl CurveEvaluator for Polyline {
         }
         let closed =
             points.len() > 2 && (points[points.len() - 1] - points[0]).length() <= ctx.tol.len;
-        Ok(Polyline3 { points, closed })
+        let parameters = (0..points.len()).map(|index| index as f64).collect();
+        Ok(Polyline3 {
+            points,
+            closed,
+            parameters,
+        })
     }
 }
 
@@ -126,7 +131,11 @@ impl CurveEvaluator for IndexedPolyCurve {
         }
         let closed =
             points.len() > 2 && (points[points.len() - 1] - points[0]).length() <= ctx.tol.len;
-        Ok(Polyline3 { points, closed })
+        Ok(Polyline3 {
+            points,
+            closed,
+            parameters: Vec::new(),
+        })
     }
 }
 
@@ -213,6 +222,10 @@ fn arc_through(start: DVec3, middle: DVec3, end: DVec3, ctx: &EvalCtx<'_>) -> Ve
 }
 
 /// `IfcCompositeCurve`: segments, each a curve in its own right.
+///
+/// A segment that cannot be evaluated fails the whole curve: a sweep along a
+/// directrix with a piece missing would be a different solid, not a coarser one.
+/// A composite of `IfcCurveSegment` is an alignment and is stationed instead.
 pub struct CompositeCurve;
 
 impl CurveEvaluator for CompositeCurve {
@@ -221,6 +234,9 @@ impl CurveEvaluator for CompositeCurve {
     }
 
     fn evaluate(&self, ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Polyline3, GeomError> {
+        if crate::eval::alignment::is_alignment_curve(item) {
+            return crate::eval::alignment::sample(ctx, item);
+        }
         let segments = item
             .attr("Segments")
             .as_list()
@@ -231,13 +247,16 @@ impl CurveEvaluator for CompositeCurve {
             let Some(segment) = value.as_entity() else {
                 continue;
             };
+            if segment.is_a("IfcCurveSegment") {
+                return Err(GeomError::Unsupported(
+                    "IfcCurveSegment among IfcCompositeCurveSegment segments".into(),
+                ));
+            }
             let Some(curve) = segment.attr("ParentCurve").as_entity() else {
                 continue;
             };
             let same_sense = segment.attr("SameSense").as_bool().unwrap_or(true);
-            let Ok(part) = registry.curve(ctx, curve) else {
-                continue;
-            };
+            let part = registry.curve(ctx, curve)?;
             let mut part_points = part.points;
             if !same_sense {
                 part_points.reverse();
@@ -262,7 +281,11 @@ impl CurveEvaluator for CompositeCurve {
             ));
         }
         let closed = (points[points.len() - 1] - points[0]).length() <= ctx.tol.len;
-        Ok(Polyline3 { points, closed })
+        Ok(Polyline3 {
+            points,
+            closed,
+            parameters: Vec::new(),
+        })
     }
 }
 
@@ -281,6 +304,7 @@ impl CurveEvaluator for Conic {
         let frame = axis2_placement_3d(item.attr("Position"), &ctx.units);
         let segments = ctx.segments_for_radius(major.max(minor)).max(3);
         let mut points = Vec::with_capacity(segments as usize + 1);
+        let mut parameters = Vec::with_capacity(segments as usize + 1);
         for step in 0..=segments {
             let angle = std::f64::consts::TAU * f64::from(step) / f64::from(segments);
             points.push(frame.transform_point3(DVec3::new(
@@ -288,10 +312,12 @@ impl CurveEvaluator for Conic {
                 minor * angle.sin(),
                 0.0,
             )));
+            parameters.push(angle);
         }
         Ok(Polyline3 {
             points,
             closed: true,
+            parameters,
         })
     }
 }
@@ -399,31 +425,36 @@ impl CurveEvaluator for BSplineWithKnots {
     }
 
     fn evaluate(&self, ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Polyline3, GeomError> {
-        let points = bspline_points(ctx, item)?;
+        let (points, parameters) = bspline_points_over(ctx, item, None, false)?;
         let closed = item.attr("ClosedCurve").as_bool().unwrap_or(false)
             || (points[0] - points[points.len() - 1]).length() <= ctx.tol.len;
-        Ok(Polyline3 { points, closed })
+        Ok(Polyline3 {
+            points,
+            closed,
+            parameters,
+        })
     }
 }
 
 fn bspline_points(ctx: &EvalCtx<'_>, item: Entity<'_>) -> Result<Vec<DVec3>, GeomError> {
-    bspline_points_over(ctx, item, None, false)
+    Ok(bspline_points_over(ctx, item, None, false)?.0)
 }
 
 pub(crate) fn reweighted_reference_points(
     ctx: &EvalCtx<'_>,
     item: Entity<'_>,
 ) -> Result<Vec<DVec3>, GeomError> {
-    bspline_points_over(ctx, item, None, true)
+    Ok(bspline_points_over(ctx, item, None, true)?.0)
 }
 
-/// Flatten a B-spline, optionally over a sub-range of its parameter domain.
+/// Flatten a B-spline, optionally over a sub-range of its parameter domain,
+/// with the parameter at every point.
 fn bspline_points_over(
     ctx: &EvalCtx<'_>,
     item: Entity<'_>,
     range: Option<(f64, f64)>,
     reweight_reference: bool,
-) -> Result<Vec<DVec3>, GeomError> {
+) -> Result<(Vec<DVec3>, Vec<f64>), GeomError> {
     let degree = item
         .attr("Degree")
         .as_i64()
@@ -607,6 +638,7 @@ fn bspline_points_over(
     let tolerance = ctx.settings.chord_tolerance_m.max(ctx.tol.len);
     let first = project(de_boor(&control, degree, &knots, domain_start));
     let mut points = vec![first];
+    let mut parameters = vec![domain_start];
     for span in degree..=last_control {
         let from = knots[span].max(domain_start);
         let to = knots[span + 1].min(domain_end);
@@ -626,6 +658,7 @@ fn bspline_points_over(
             tolerance,
             0,
             &mut points,
+            &mut parameters,
         )?;
     }
     if points.len() < 2 || points.iter().any(|point| !point.is_finite()) {
@@ -633,7 +666,7 @@ fn bspline_points_over(
             "a B-spline that produced fewer than two finite points".into(),
         ));
     }
-    Ok(points)
+    Ok((points, parameters))
 }
 
 /// Divide out the weight; the reader refuses zero weights.
@@ -685,6 +718,7 @@ fn subdivide_bspline(
     tolerance: f64,
     depth: u32,
     points: &mut Vec<DVec3>,
+    parameters: &mut Vec<f64>,
 ) -> Result<(), GeomError> {
     if points.len() >= MAX_CURVE_POINTS {
         return Err(GeomError::LimitReached(
@@ -727,6 +761,7 @@ fn subdivide_bspline(
             tolerance,
             depth + 1,
             points,
+            parameters,
         )?;
         subdivide_bspline(
             control,
@@ -739,9 +774,11 @@ fn subdivide_bspline(
             tolerance,
             depth + 1,
             points,
+            parameters,
         )?;
     } else {
         points.push(end);
+        parameters.push(to);
     }
     Ok(())
 }
@@ -850,6 +887,7 @@ impl CurveEvaluator for Line {
         Ok(Polyline3 {
             points: vec![origin, origin + orientation * magnitude],
             closed: false,
+            parameters: vec![0.0, 1.0],
         })
     }
 }
@@ -896,6 +934,7 @@ fn trimmed_line(
     Ok(Polyline3 {
         points: vec![start, end],
         closed: false,
+        parameters: vec![from, to],
     })
 }
 
@@ -1000,14 +1039,17 @@ impl CurveEvaluator for TrimmedCurve {
             && let (Some(from), Some(to)) = parameters
             && (prefer_parameter || cartesian.0.is_none() || cartesian.1.is_none())
         {
-            let mut points = bspline_points_over(ctx, basis, Some((from, to)), false)?;
+            let (mut points, mut parameters) =
+                bspline_points_over(ctx, basis, Some((from, to)), false)?;
             // Sampled in parameter order; the curve itself runs from Trim1 to Trim2.
             if from > to {
                 points.reverse();
+                parameters.reverse();
             }
             return Ok(Polyline3 {
                 points,
                 closed: false,
+                parameters,
             });
         }
 
@@ -1020,6 +1062,7 @@ impl CurveEvaluator for TrimmedCurve {
             return Ok(Polyline3 {
                 points,
                 closed: false,
+                parameters: Vec::new(),
             });
         }
 
@@ -1035,6 +1078,7 @@ impl CurveEvaluator for TrimmedCurve {
             return Ok(Polyline3 {
                 points,
                 closed: false,
+                parameters: Vec::new(),
             });
         }
 
@@ -1097,6 +1141,7 @@ fn trimmed_conic(
     let whole = ctx.segments_for_radius(major.max(minor)).max(3);
     let steps = ((f64::from(whole) * (sweep.abs() / full)).ceil() as u32).max(1);
     let mut points = Vec::with_capacity(steps as usize + 1);
+    let mut parameters = Vec::with_capacity(steps as usize + 1);
     for step in 0..=steps {
         let angle = from + sweep * f64::from(step) / f64::from(steps);
         points.push(frame.transform_point3(DVec3::new(
@@ -1104,10 +1149,12 @@ fn trimmed_conic(
             minor * angle.sin(),
             0.0,
         )));
+        parameters.push(angle);
     }
     Ok(Some(Polyline3 {
         points,
         closed: false,
+        parameters,
     }))
 }
 
@@ -1184,6 +1231,7 @@ impl CurveEvaluator for OffsetCurve {
         Ok(Polyline3 {
             points: offset,
             closed: curve.closed,
+            parameters: Vec::new(),
         })
     }
 }
@@ -1507,6 +1555,8 @@ mod tests {
         );
     }
     use super::*;
+    #[cfg(feature = "schema-ifc4x3")]
+    use crate::eval::tests::model_of_schema;
     use crate::eval::tests::{eval_curve, model_of};
 
     #[test]
@@ -1827,6 +1877,7 @@ mod tests {
             1e-6,
             12,
             &mut points,
+            &mut Vec::new(),
         );
         assert!(matches!(result, Err(GeomError::LimitReached(_))));
         assert_eq!(points.len(), 1);
@@ -1856,6 +1907,7 @@ mod tests {
             1e-9,
             0,
             &mut points,
+            &mut Vec::new(),
         );
         assert!(matches!(result, Err(GeomError::LimitReached(_))));
         assert_eq!(points.len(), MAX_CURVE_POINTS);
@@ -1896,6 +1948,85 @@ mod tests {
         assert!(matches!(
             eval_curve(&model, 2),
             Err(GeomError::LimitReached(_))
+        ));
+    }
+
+    /// One straight IFC4X3 alignment segment, ten units along x.
+    #[cfg(feature = "schema-ifc4x3")]
+    const CURVE_SEGMENT_4X3: &str = concat!(
+        "#1=IFCCARTESIANPOINT((0.,0.));\n",
+        "#2=IFCDIRECTION((1.,0.));\n",
+        "#3=IFCAXIS2PLACEMENT2D(#1,#2);\n",
+        "#4=IFCVECTOR(#2,1.);\n",
+        "#5=IFCLINE(#1,#4);\n",
+        "#6=IFCCURVESEGMENT(.CONTINUOUS.,#3,IFCLENGTHMEASURE(0.),IFCLENGTHMEASURE(10.),#5);\n",
+    );
+
+    #[cfg(feature = "schema-ifc4x3")]
+    #[test]
+    fn a_4x3_curve_segment_composite_is_stationed_along_its_segments() {
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            &format!("{CURVE_SEGMENT_4X3}#7=IFCCOMPOSITECURVE((#6),.F.);\n"),
+        );
+        let curve = eval_curve(&model, 7).unwrap();
+        let last = *curve.points.last().unwrap();
+        assert!(
+            (curve.points[0] - DVec3::ZERO).length() < 1e-9
+                && (last - DVec3::new(10.0, 0.0, 0.0)).length() < 1e-9,
+            "ten units of the parent line from the placement, got {:?}",
+            curve.points
+        );
+    }
+
+    #[cfg(feature = "schema-ifc4x3")]
+    #[test]
+    fn a_gradient_curve_over_a_straight_base_is_drawn_in_space() {
+        // The same straight segment as the vertical profile: ten along, ten up.
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            &format!(
+                "{CURVE_SEGMENT_4X3}#7=IFCCOMPOSITECURVE((#6),.F.);\n\
+                 #8=IFCGRADIENTCURVE((#6),.F.,#7,$);\n"
+            ),
+        );
+        let curve = eval_curve(&model, 8).unwrap();
+        let last = *curve.points.last().unwrap();
+        assert!(
+            (last - DVec3::new(10.0, 0.0, 0.0)).length() < 1e-9,
+            "a level profile keeps the base curve's points, got {last}"
+        );
+        // A spiral has no extent of its own.
+        let model = model_of_schema(
+            "IFC4X3_ADD2",
+            "#1=IFCCARTESIANPOINT((0.,0.));\n#2=IFCAXIS2PLACEMENT2D(#1,$);\n#3=IFCCLOTHOID(#2,100.);\n",
+        );
+        assert!(matches!(
+            eval_curve(&model, 3),
+            Err(GeomError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn a_composite_with_an_unreadable_segment_is_refused() {
+        // The second segment's parent is a circle with no radius: a sweep along
+        // the first segment alone would be a different solid.
+        let model = model_of(concat!(
+            "#1=IFCCARTESIANPOINT((0.,0.,0.));\n",
+            "#2=IFCDIRECTION((1.,0.,0.));\n",
+            "#3=IFCVECTOR(#2,1.);\n",
+            "#4=IFCLINE(#1,#3);\n",
+            "#5=IFCTRIMMEDCURVE(#4,(IFCPARAMETERVALUE(0.)),",
+            "(IFCPARAMETERVALUE(5.)),.T.,.PARAMETER.);\n",
+            "#6=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#5);\n",
+            "#7=IFCAXIS2PLACEMENT3D(#1,$,$);\n",
+            "#8=IFCCIRCLE(#7,-1.);\n",
+            "#9=IFCCOMPOSITECURVESEGMENT(.CONTINUOUS.,.T.,#8);\n",
+            "#10=IFCCOMPOSITECURVE((#6,#9),.F.);\n"
+        ));
+        assert!(matches!(
+            eval_curve(&model, 10),
+            Err(GeomError::Degenerate(_))
         ));
     }
 }

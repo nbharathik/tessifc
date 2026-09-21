@@ -41,9 +41,15 @@ the command line and Rust.
 
 -   **Editing**
 
-    Change IFC attributes while preserving the rest of the source file.
+    Attribute edits, scripted revisions and the assistant, refreshing only what changed.
 
-    [Work with attributes](editing.md)
+    [Edit a model](editing.md)
+
+-   **Agents and pipelines**
+
+    Let Claude Code, an MCP client or your own loop build and edit models while the viewer follows.
+
+    [Build on the editing loop](agents.md)
 
 </div>
 

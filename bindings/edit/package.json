@@ -1,0 +1,109 @@
+{
+  "name": "@tessifc/edit",
+  "version": "0.2.0",
+  "description": "Editing sessions, browser scripts, IGP reading and agent tools over the TessIFC kernel",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./session": {
+      "types": "./types/session.d.ts",
+      "default": "./src/session.js"
+    },
+    "./script-engine": {
+      "types": "./types/script-engine.d.ts",
+      "default": "./src/script-engine.js"
+    },
+    "./script-runner": {
+      "types": "./types/script-runner.d.ts",
+      "default": "./src/script-runner.js"
+    },
+    "./igp": {
+      "types": "./types/igp.d.ts",
+      "default": "./src/igp.js"
+    },
+    "./agent-tools": {
+      "types": "./types/agent-tools.d.ts",
+      "default": "./src/agent-tools.js"
+    },
+    "./create-model": {
+      "types": "./types/create-model.d.ts",
+      "default": "./src/create-model.js"
+    },
+    "./providers": {
+      "types": "./types/providers.d.ts",
+      "default": "./src/providers.js"
+    },
+    "./describe": {
+      "types": "./types/describe.d.ts",
+      "default": "./src/describe.js"
+    },
+    "./script-helpers": {
+      "types": "./types/script-helpers.d.ts",
+      "default": "./src/script-helpers.js"
+    },
+    "./verify": {
+      "types": "./types/verify.d.ts",
+      "default": "./src/verify.js"
+    },
+    "./examples": {
+      "types": "./types/examples.d.ts",
+      "default": "./src/examples.js"
+    },
+    "./types": {
+      "types": "./types/types.d.ts",
+      "default": "./src/types.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "src/",
+    "types/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "keywords": [
+    "ifc",
+    "bim",
+    "editing",
+    "agent",
+    "tessifc"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/edit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/script-engine.test.mjs && node test/providers.test.mjs && node test/session.test.mjs && node test/script-runner.test.mjs",
+    "types": "node ../../scripts/build-types.mjs .",
+    "typecheck": "node ../../scripts/build-types.mjs --check .",
+    "prepack": "npm run types"
+  },
+  "peerDependencies": {
+    "@tessifc/core": "0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@tessifc/core": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

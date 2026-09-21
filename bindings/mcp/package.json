@@ -1,0 +1,72 @@
+{
+  "name": "@tessifc/mcp",
+  "version": "0.2.0",
+  "description": "An MCP server over the TessIFC kernel: agents edit or create IFC models and a viewer follows every change",
+  "license": "Apache-2.0",
+  "author": "Bharathi Kannan",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "./types/index.d.ts",
+  "bin": {
+    "tessifc-mcp": "src/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./server": {
+      "types": "./types/server.d.ts",
+      "default": "./src/server.js"
+    },
+    "./session-host": {
+      "types": "./types/session-host.d.ts",
+      "default": "./src/session-host.js"
+    },
+    "./viewer-server": {
+      "types": "./types/viewer-server.d.ts",
+      "default": "./src/viewer-server.js"
+    },
+    "./contract": "./contract.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "src/",
+    "types/",
+    "contract.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node test/viewer-server.test.mjs && node test/mcp.test.mjs",
+    "types": "node ../../scripts/build-types.mjs .",
+    "typecheck": "node ../../scripts/build-types.mjs --check .",
+    "prepack": "npm run types"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@tessifc/edit": "0.2.0",
+    "zod": "4.6.5"
+  },
+  "peerDependencies": {
+    "@tessifc/core": "0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@tessifc/core": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nbharathik/tessifc.git",
+    "directory": "bindings/mcp"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "preview"
+  }
+}

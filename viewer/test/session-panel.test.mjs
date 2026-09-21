@@ -263,7 +263,9 @@ try {
   // fresh worker at its last revision with the scene and the edits kept.
   await page.click("#rail-script");
   await page.evaluate((id) => window.__tessifc.selectExpressId(id), wallId);
-  await page.waitForFunction(() => window.__tessifc.state.selection?.infoState === "ready");
+  // The rows land in deferred panel work after the state says ready.
+  await page.waitForFunction(() => window.__tessifc.state.selection?.infoState === "ready"
+    && document.querySelectorAll("#property-list .prop-row").length > 0, null, { timeout: 10000 });
   await page.evaluate(() => {
     window.__tessifc.state.settings.scriptTimeoutMs = 500;
   });
@@ -278,7 +280,7 @@ try {
   assert.equal(await products(), productsBefore);
   assert.deepEqual(await page.evaluate(() => window.__tessifc.state.scriptHistory), { undo: 0, redo: 0 });
   assert.equal(await page.evaluate(() => window.__tessifc.state.dirty), true);
-  assert.equal(await page.evaluate(() => document.querySelectorAll("#property-list .prop-row").length), propertyRows);
+  await page.waitForFunction((expected) => document.querySelectorAll("#property-list .prop-row").length === expected, propertyRows, { timeout: 10000 });
   assert.match(await page.evaluate(() => window.__tessifc.state.selection.info.fields.find((item) => item.name === "Name").value), /Assistant renamed wall/);
   assert.match(await page.textContent("#status-text"), /reopened at revision 0/);
   console.log("ok an endless script is stopped at the limit and the model reopens at its last revision");

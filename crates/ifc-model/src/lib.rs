@@ -21,6 +21,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub mod inverse;
 pub mod value;
 

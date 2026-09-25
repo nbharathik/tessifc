@@ -173,7 +173,7 @@ export function createTessifcServer(host, { viewerUrl = null, version = "0.0.0" 
 
   server.registerTool("inspect_model", {
     title: "Inspect the model",
-    description: "Run read-only JavaScript against the model and return what it prints; every modification is discarded. Same names and time limit as edit_model scripts.",
+    description: "Run JavaScript against the model and return what it prints; its edits to the model are discarded. Same names and time limit as edit_model scripts. Not a sandbox: like edit_model, the script runs with this server's permissions.",
     inputSchema: { code: z.string().describe("JavaScript that prints what you need to know") },
   }, async ({ code }) => busyOr(async () => {
     const outcome = await host.run(code, null, { commit: false, label: "inspect" });
@@ -211,7 +211,7 @@ export function createTessifcServer(host, { viewerUrl = null, version = "0.0.0" 
 
   server.registerTool("new_model", {
     title: "New model",
-    description: "Start a new IFC model with a project, site, building and storeys, optionally saved to a path.",
+    description: "Start a new IFC model with a project, site, building and storeys, optionally saved to a new .ifc path. An existing file is refused unless force is set.",
     inputSchema: {
       schema: z.enum(["IFC2X3", "IFC4", "IFC4X3"]).default("IFC4"),
       name: z.string().default("New project"),
@@ -219,8 +219,8 @@ export function createTessifcServer(host, { viewerUrl = null, version = "0.0.0" 
       site: z.string().optional(),
       building: z.string().optional(),
       storeys: z.array(z.object({ name: z.string(), elevation: z.number().default(0) })).optional(),
-      path: z.string().optional().describe("Where every commit is saved"),
-      force: z.boolean().default(false).describe("Drop an unsaved current model"),
+      path: z.string().optional().describe("Where every commit is saved; must end with .ifc"),
+      force: z.boolean().default(false).describe("Overwrite an existing file and drop unsaved changes to the current model"),
     },
   }, async ({ path, force = false, ...options }) => busyOr(async () => {
     const opened = await host.newModel(options, { path, force });
@@ -229,10 +229,10 @@ export function createTessifcServer(host, { viewerUrl = null, version = "0.0.0" 
 
   server.registerTool("open_model", {
     title: "Open a model",
-    description: "Open an IFC file; it becomes the followed file that commits are saved to.",
-    inputSchema: { path: z.string() },
-  }, async ({ path }) => busyOr(async () => {
-    const opened = await host.openFile(path);
+    description: "Open an IFC file; it becomes the followed file that commits are saved to. Unsaved changes to the current model are refused unless force is set.",
+    inputSchema: { path: z.string(), force: z.boolean().default(false).describe("Drop unsaved changes to the current model") },
+  }, async ({ path, force = false }) => busyOr(async () => {
+    const opened = await host.openFile(path, { force });
     return result({ revision: opened.revision, version: opened.version, generation: opened.generation, products: opened.products, entities: opened.info.entities, schema: opened.info.schema ?? null, path: host.path });
   }));
 

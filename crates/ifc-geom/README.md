@@ -8,29 +8,32 @@ and provenance. A `Registry` maps an IFC class to its evaluator; an `EvalCtx`
 carries the model, the units, the tolerances, the settings, the caches and a
 diagnostic sink through every evaluation.
 
-```rust
+```rust no_run
 use tessifc_geom::{DiagnosticSink, EvalCtx, Registry, Settings, Tolerances, Units, product_parts};
 use tessifc_model::Model;
 use tessifc_step::{ParseOptions, parse};
 
-let bytes = std::fs::read("model.ifc")?;
-let image = parse(&bytes, &ParseOptions::default());
-let registry = Registry::shared(image.schema);
-let model = Model::new(image);
-let settings = Settings::default();
-let sink = DiagnosticSink::default();
-let ctx = EvalCtx::new(&model, Units::from_model(&model), Tolerances::default(), &settings, &sink);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("model.ifc")?;
+    let image = parse(&bytes, &ParseOptions::default());
+    let registry = Registry::shared(image.schema);
+    let model = Model::new(image);
+    let settings = Settings::default();
+    let sink = DiagnosticSink::default();
+    let units = Units::from_model(&model);
+    let ctx = EvalCtx::new(&model, units, Tolerances::default(), &settings, &sink);
 
-for wall in model.entities_of_type("IfcWall") {
-    match product_parts(&ctx, registry, &model, wall) {
-        Some(parts) => println!("#{}: {} coloured parts", wall.id(), parts.len()),
-        None => println!("#{}: nothing to draw", wall.id()),
+    for wall in model.entities_of_type("IfcWall") {
+        match product_parts(&ctx, registry, &model, wall) {
+            Some(parts) => println!("#{}: {} coloured parts", wall.id(), parts.len()),
+            None => println!("#{}: nothing to draw", wall.id()),
+        }
     }
+    for diagnostic in sink.take() {
+        println!("{diagnostic}");
+    }
+    Ok(())
 }
-for diagnostic in sink.take() {
-    println!("{diagnostic}");
-}
-# Ok::<(), std::io::Error>(())
 ```
 
 ## Extension point

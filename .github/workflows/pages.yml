@@ -16,8 +16,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deployment at a time. A newer push waits rather than cancelling, so the
 # site always ends on the newest commit.
@@ -87,9 +85,12 @@ jobs:
       # A project site lives under /<repo>/, so every URL the pages emit has to
       # carry that prefix. A user site is served from the root instead.
       - name: build the site
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
-          base="${{ github.event.repository.name }}"
-          if [ "$base" = "${{ github.repository_owner }}.github.io" ]; then
+          base="$REPO_NAME"
+          if [ "$base" = "$REPO_OWNER.github.io" ]; then
             python scripts/build-site.py --base /
           else
             python scripts/build-site.py --base "/$base/"
@@ -102,7 +103,11 @@ jobs:
   deploy:
     name: deploy
     needs: build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

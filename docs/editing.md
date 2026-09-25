@@ -162,6 +162,10 @@ file, so any other process may save it too. The panel switches its examples
 and its language when the session is connected. `--new` creates the file
 first and `--mcp` puts the same tools on stdio for an agent.
 
+Both hosts print an address that ends in `#token=...`. Open it as printed:
+the page needs that token for every request to the host, and a page opened
+without it says so.
+
 ## The assistant
 
 The **Assistant** tab has Ask and Edit modes. Ask reads the model through a
@@ -174,15 +178,21 @@ viewer changed.
 
 In the browser, choose the provider under **Settings > Assistant**:
 OpenRouter, Anthropic, or any OpenAI-compatible chat-completions URL such as
-Ollama or LM Studio on your machine. The key is stored in this browser only
-and sent only to that provider. With a Python session the assistant runs on
-the session process instead (`--assistant anthropic` with `ANTHROPIC_API_KEY`).
+Ollama or LM Studio on your machine. Each provider and address keeps its own
+key, for the open tab only unless you tick *Remember key on this device*, and
+a key is sent only to its provider. With a Python session the assistant runs
+on the session process instead (`--assistant anthropic` with
+`ANTHROPIC_API_KEY`).
 An agent of your own, Claude Code or Claude Desktop connects through the MCP
 servers described in [Agents and pipelines](agents.md) and the viewer shows
 its work the same way.
 
 Scripts, whether typed or generated, run with your user's permissions and
 without a sandbox: in the page's worker for JavaScript, in a worker thread of
-the `tessifc-mcp` process, in the session process for Python. The JavaScript
+the `tessifc-mcp` process, in the session process for Python. In the browser
+the worker removes its network, module-loading and code-generation functions
+before the first script runs, so a script there can read and change the model
+but cannot send it anywhere; for the same reason a browser script may not
+contain the word `import`, even in a string or a comment. The JavaScript
 hosts stop a script at a time limit; the Python session does not. Review
 generated code before running it.

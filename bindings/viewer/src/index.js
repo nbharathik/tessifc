@@ -358,16 +358,18 @@ export function createViewer(container, options = {}) {
 
   /**
    * Follow a local editing session (tessifc-mcp or the Python session server)
-   * at `target`, a base URL or `{ baseUrl }`; "" means the page's own origin.
+   * at `target`, a base URL or `{ baseUrl, token }`; "" means the page's own
+   * origin, whose token comes from the `#token=` the page was opened with.
    * Every published version is opened or applied as a delta and reported as a
    * `revision` event; `session` events carry the host's status. Returns the client.
-   * @param {string | { baseUrl?: string }} [target]
+   * @param {string | { baseUrl?: string, token?: string }} [target]
    */
   function follow(target = "") {
     unfollow();
     const baseUrl = typeof target === "string" ? target : target?.baseUrl ?? "";
     const client = createSessionClient({
       baseUrl: baseUrl.replace(/\/$/, ""),
+      token: typeof target === "string" ? undefined : target?.token,
       ready: () => !disposed && !streaming,
       loaded: () => Boolean(model?.kernel || model?.remote),
       open: (file) => open(file),

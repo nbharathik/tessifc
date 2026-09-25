@@ -3,8 +3,8 @@
 //! IFC stores relationships as separate objects, so the reverse direction is
 //! built once, lazily, as compressed sparse rows per relation.
 
-use crate::Model;
-use tessifc_schema::ClassId;
+use crate::{Entity, Model, Value};
+use tessifc_schema::{ClassId, Schema};
 
 /// Which relationship an index answers for.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -103,8 +103,15 @@ pub struct Inverse {
     dropped: Vec<u32>,
 }
 
-/// Upper bound on the pairs one relationship record may contribute.
+/// Upper bound on the pairs one relationship record may contribute when both
+/// of its sides are lists.
 const MAX_PAIRS_PER_RELATIONSHIP: usize = 1 << 16;
+
+/// Pairs the whole index may hold for each instance in the model.
+const PAIRS_PER_INSTANCE: usize = 8;
+
+/// The pair budget of a small model.
+const MIN_PAIR_BUDGET: usize = 1 << 20;
 
 impl Inverse {
     /// Targets of a relation for one key, ascending. Empty when there are none.
@@ -115,8 +122,9 @@ impl Inverse {
         }
     }
 
-    /// Express ids of relationship records whose links were too many to index,
-    /// ascending. Their targets are missing from every relation.
+    /// Express ids of relationship records left out of the index, ascending:
+    /// a list where the schema allows one reference, or more links than the
+    /// index has room for. Their targets are missing from every relation.
     pub fn dropped_relationships(&self) -> &[u32] {
         &self.dropped
     }
@@ -128,151 +136,78 @@ impl Inverse {
 
     /// Build every relation in one pass over the relationship instances.
     pub(crate) fn build(model: &Model) -> Inverse {
-        let schema = model.schema();
-        let mut pairs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); Relation::ALL.len()];
-        let mut dropped: Vec<u32> = Vec::new();
+        let budget = model
+            .len()
+            .saturating_mul(PAIRS_PER_INSTANCE)
+            .max(MIN_PAIR_BUDGET);
+        Inverse::build_within(model, budget)
+    }
 
-        // Class ids and attribute slots are resolved once, outside the loop.
-        let collect_rel = |class_name: &str,
-                           from_attr: &str,
-                           to_attr: &str,
-                           relation: Relation,
-                           reverse: bool,
-                           pairs: &mut Vec<Vec<(u32, u32)>>,
-                           dropped: &mut Vec<u32>| {
-            let Some(class) = schema.class_by_name(class_name) else {
-                return;
-            };
-            let Some(from_slot) = schema.attr_index(class, from_attr) else {
-                return;
-            };
-            let Some(to_slot) = schema.attr_index(class, to_attr) else {
-                return;
-            };
-            let out = &mut pairs[relation as usize];
-            for id in model.image().ids_of_type(class) {
-                let Some(entity) = model.entity(id) else {
-                    continue;
-                };
-                let froms = ids_of(entity.attr_at(from_slot));
-                let tos = ids_of(entity.attr_at(to_slot));
-                // Only a list on both sides can multiply out. A well-formed
-                // one-to-many record is accepted whole, however long it is.
-                if froms.len() > 1
-                    && tos.len() > 1
-                    && froms.len().saturating_mul(tos.len()) > MAX_PAIRS_PER_RELATIONSHIP
-                {
-                    dropped.push(id);
-                    continue;
-                }
-                for &f in &froms {
-                    for &t in &tos {
-                        if reverse {
-                            out.push((t, f))
-                        } else {
-                            out.push((f, t))
-                        }
-                    }
-                }
-            }
+    /// [`Inverse::build`] holding at most `budget` pairs across every relation.
+    fn build_within(model: &Model, budget: usize) -> Inverse {
+        let mut builder = Builder {
+            model,
+            pairs: vec![Vec::new(); Relation::ALL.len()],
+            dropped: Vec::new(),
+            budget,
         };
-
-        collect_rel(
+        builder.collect(
             "IfcRelVoidsElement",
-            "RelatingBuildingElement",
-            "RelatedOpeningElement",
-            Relation::Voids,
-            false,
-            &mut pairs,
-            &mut dropped,
+            End::Attr("RelatingBuildingElement"),
+            End::Attr("RelatedOpeningElement"),
+            &[(Relation::Voids, false)],
         );
-        collect_rel(
+        builder.collect(
             "IfcRelFillsElement",
-            "RelatingOpeningElement",
-            "RelatedBuildingElement",
-            Relation::Fills,
-            false,
-            &mut pairs,
-            &mut dropped,
+            End::Attr("RelatingOpeningElement"),
+            End::Attr("RelatedBuildingElement"),
+            &[(Relation::Fills, false)],
         );
-        collect_rel(
+        builder.collect(
             "IfcRelAssociatesMaterial",
-            "RelatedObjects",
-            "RelatingMaterial",
-            Relation::Material,
-            false,
-            &mut pairs,
-            &mut dropped,
+            End::Attr("RelatedObjects"),
+            End::Attr("RelatingMaterial"),
+            &[(Relation::Material, false)],
         );
-        collect_rel(
+        // One pass feeds both directions, so a record is kept or dropped in both.
+        builder.collect(
             "IfcRelAggregates",
-            "RelatingObject",
-            "RelatedObjects",
-            Relation::Aggregates,
-            false,
-            &mut pairs,
-            &mut dropped,
+            End::Attr("RelatingObject"),
+            End::Attr("RelatedObjects"),
+            &[
+                (Relation::Aggregates, false),
+                (Relation::AggregatedInto, true),
+            ],
         );
-        collect_rel(
-            "IfcRelAggregates",
-            "RelatingObject",
-            "RelatedObjects",
-            Relation::AggregatedInto,
-            true,
-            &mut pairs,
-            &mut dropped,
-        );
-        collect_rel(
+        builder.collect(
             "IfcRelContainedInSpatialStructure",
-            "RelatedElements",
-            "RelatingStructure",
-            Relation::ContainedIn,
-            false,
-            &mut pairs,
-            &mut dropped,
+            End::Attr("RelatedElements"),
+            End::Attr("RelatingStructure"),
+            &[(Relation::ContainedIn, false)],
         );
-        collect_rel(
+        builder.collect(
             "IfcRelDefinesByType",
-            "RelatedObjects",
-            "RelatingType",
-            Relation::DefinedByType,
-            false,
-            &mut pairs,
-            &mut dropped,
+            End::Attr("RelatedObjects"),
+            End::Attr("RelatingType"),
+            &[(Relation::DefinedByType, false)],
+        );
+        // Plain attributes rather than relationship objects.
+        builder.collect(
+            "IfcStyledItem",
+            End::Attr("Item"),
+            End::Record,
+            &[(Relation::Styles, false)],
+        );
+        builder.collect(
+            "IfcMappedItem",
+            End::Attr("MappingSource"),
+            End::Record,
+            &[(Relation::MapUsers, false)],
         );
 
-        // IfcStyledItem.Item is a plain attribute, not a relationship object.
-        if let Some(class) = schema.class_by_name("IfcStyledItem")
-            && let Some(slot) = schema.attr_index(class, "Item")
-        {
-            let out = &mut pairs[Relation::Styles as usize];
-            for id in model.image().ids_of_type(class) {
-                let Some(entity) = model.entity(id) else {
-                    continue;
-                };
-                for item in ids_of(entity.attr_at(slot)) {
-                    out.push((item, id));
-                }
-            }
-        }
-
-        // IfcMappedItem.MappingSource points at the representation map.
-        if let Some(class) = schema.class_by_name("IfcMappedItem")
-            && let Some(slot) = schema.attr_index(class, "MappingSource")
-        {
-            let out = &mut pairs[Relation::MapUsers as usize];
-            for id in model.image().ids_of_type(class) {
-                let Some(entity) = model.entity(id) else {
-                    continue;
-                };
-                for source in ids_of(entity.attr_at(slot)) {
-                    out.push((source, id));
-                }
-            }
-        }
-
-        // IfcRelAggregates is collected twice, so the same record can be
-        // recorded twice.
+        let Builder {
+            pairs, mut dropped, ..
+        } = builder;
         dropped.sort_unstable();
         dropped.dedup();
         Inverse {
@@ -280,14 +215,110 @@ impl Inverse {
             dropped,
         }
     }
+
+    /// Pairs held across every relation.
+    #[cfg(test)]
+    fn pair_count(&self) -> usize {
+        self.relations.iter().map(|csr| csr.targets.len()).sum()
+    }
 }
 
-/// Express ids referenced by a value: one for a reference, many for a list.
-fn ids_of(value: crate::Value<'_>) -> Vec<u32> {
-    match value {
-        crate::Value::Ref(e) => vec![e.id()],
-        crate::Value::List(list) => list.filter_map(|v| v.as_entity().map(|e| e.id())).collect(),
-        _ => Vec::new(),
+/// One side of a relation: an attribute of the record, or the record itself.
+#[derive(Copy, Clone)]
+enum End {
+    Attr(&'static str),
+    Record,
+}
+
+/// A side resolved against the schema once, outside the loop over records.
+#[derive(Copy, Clone)]
+enum Side {
+    Attr { index: usize, aggregate: bool },
+    Record,
+}
+
+impl Side {
+    fn resolve(schema: &Schema, class: ClassId, end: End) -> Option<Side> {
+        match end {
+            End::Record => Some(Side::Record),
+            End::Attr(name) => {
+                let index = schema.attr_index(class, name)?;
+                let aggregate = schema.attr(class, index)?.agg_depth > 0;
+                Some(Side::Attr { index, aggregate })
+            }
+        }
+    }
+
+    /// Referenced express ids, ascending and unique; `None` for a list where
+    /// the schema allows a single reference.
+    fn ids(self, entity: Entity<'_>) -> Option<Vec<u32>> {
+        let (index, aggregate) = match self {
+            Side::Record => return Some(vec![entity.id()]),
+            Side::Attr { index, aggregate } => (index, aggregate),
+        };
+        let mut ids = match entity.attr_at(index) {
+            Value::Ref(e) => vec![e.id()],
+            Value::List(list) if aggregate => {
+                list.filter_map(|v| v.as_entity().map(|e| e.id())).collect()
+            }
+            Value::List(_) => return None,
+            _ => Vec::new(),
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+}
+
+/// The pairs gathered so far, and what is left of the budget.
+struct Builder<'m> {
+    model: &'m Model,
+    pairs: Vec<Vec<(u32, u32)>>,
+    dropped: Vec<u32>,
+    budget: usize,
+}
+
+impl Builder<'_> {
+    /// Index every record of a class into each `(relation, reverse)` target.
+    fn collect(&mut self, class_name: &str, from: End, to: End, targets: &[(Relation, bool)]) {
+        let schema = self.model.schema();
+        let Some(class) = schema.class_by_name(class_name) else {
+            return;
+        };
+        let (Some(from), Some(to)) = (
+            Side::resolve(schema, class, from),
+            Side::resolve(schema, class, to),
+        ) else {
+            return;
+        };
+        for id in self.model.image().ids_of_type(class) {
+            let Some(entity) = self.model.entity(id) else {
+                continue;
+            };
+            let (Some(froms), Some(tos)) = (from.ids(entity), to.ids(entity)) else {
+                self.dropped.push(id);
+                continue;
+            };
+            let per_target = froms.len().saturating_mul(tos.len());
+            let cost = per_target.saturating_mul(targets.len());
+            // Only a list on both sides can multiply out. A well-formed
+            // one-to-many record is accepted whole while the budget lasts.
+            let crossed =
+                froms.len() > 1 && tos.len() > 1 && per_target > MAX_PAIRS_PER_RELATIONSHIP;
+            if crossed || cost > self.budget {
+                self.dropped.push(id);
+                continue;
+            }
+            self.budget -= cost;
+            for &(relation, reverse) in targets {
+                let out = &mut self.pairs[relation as usize];
+                for &f in &froms {
+                    for &t in &tos {
+                        out.push(if reverse { (t, f) } else { (f, t) });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -375,8 +406,7 @@ END-ISO-10303-21;
                 .join(",")
         };
         let rel = side * 2 + 1;
-        // A list in the single-reference RelatingObject slot is the malformed
-        // shape the cap exists for.
+        // A list in the single-reference RelatingObject slot is malformed.
         src.push_str(&format!(
             "#{rel}=IFCRELAGGREGATES('r',$,$,$,({}),({}));
 ENDSEC;
@@ -389,6 +419,73 @@ END-ISO-10303-21;
         let model = model_from(&src);
         assert!(model.parts_of(1).is_empty());
         assert_eq!(model.inverse().dropped_relationships(), &[rel]);
+    }
+
+    /// `count` aggregation records, each `IFCRELAGGREGATES` with the given
+    /// RelatingObject and RelatedObjects text, after one wall `#1`.
+    fn aggregates(count: u32, relating: &str, related: &str) -> String {
+        let mut src = String::from(HEADER);
+        src.push_str("#1=IFCWALL('w',$,$,$,$,$,$,$,$);\n");
+        for id in 2..count + 2 {
+            src.push_str(&format!(
+                "#{id}=IFCRELAGGREGATES('r',$,$,$,{relating},{related});\n"
+            ));
+        }
+        src.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+        src
+    }
+
+    #[test]
+    fn a_list_in_a_single_reference_slot_is_dropped_not_multiplied() {
+        // Each record would be 256 by 256 pairs if RelatingObject took a list.
+        let refs = vec!["#1"; 256].join(",");
+        let list = format!("({refs})");
+        let count = 64;
+        let model = model_from(&aggregates(count, &list, &list));
+        let inverse = model.inverse();
+        assert_eq!(inverse.pair_count(), 0);
+        let dropped: Vec<u32> = (2..count + 2).collect();
+        assert_eq!(inverse.dropped_relationships(), dropped.as_slice());
+    }
+
+    #[test]
+    fn repeated_references_in_one_record_count_once() {
+        let refs = vec!["#1"; 256].join(",");
+        let model = model_from(&aggregates(1, "#1", &format!("({refs})")));
+        assert_eq!(model.parts_of(1), &[1]);
+        assert_eq!(model.inverse().pair_count(), 2, "one pair each way");
+        assert!(model.inverse().dropped_relationships().is_empty());
+    }
+
+    #[test]
+    fn records_past_the_whole_index_budget_are_dropped() {
+        let mut src = String::from(HEADER);
+        src.push_str("#1=IFCBUILDINGSTOREY('s',$,$,$,$,$,$,$,$,$);\n");
+        for id in 2..=11 {
+            src.push_str(&format!("#{id}=IFCWALL('w',$,$,$,$,$,$,$,$);\n"));
+        }
+        let walls = (2..=11)
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for id in 20..23 {
+            src.push_str(&format!(
+                "#{id}=IFCRELCONTAINEDINSPATIALSTRUCTURE('r',$,$,$,({walls}),#1);\n"
+            ));
+        }
+        src.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+
+        let model = model_from(&src);
+        // Ten pairs a record: two fit in 25, the third does not.
+        let inverse = Inverse::build_within(&model, 25);
+        assert_eq!(
+            inverse.pair_count(),
+            10,
+            "the first two records are identical"
+        );
+        assert_eq!(inverse.dropped_relationships(), &[22]);
+        assert_eq!(inverse.get(Relation::ContainedIn, 2), &[1]);
+        assert!(model.inverse().dropped_relationships().is_empty());
     }
 
     #[test]

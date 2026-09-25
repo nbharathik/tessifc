@@ -664,7 +664,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6M4 20h16" /></svg>
             <span class="badge" id="quality-badge" data-count="0"></span>
           </button>
-          <button class="rail-btn" id="rail-script" type="button" aria-pressed="false" title="Python script" aria-label="Python script">
+          <button class="rail-btn" id="rail-script" type="button" aria-pressed="false" title="Script" aria-label="Script">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14" /></svg>
           </button>
           <button class="rail-btn" id="rail-assistant" type="button" aria-pressed="false" title="Assistant" aria-label="Assistant">
@@ -788,6 +788,10 @@
           <span class="field-label">API key<span class="hint">Sent only to the provider above.</span></span>
           <input type="password" id="set-assistant-key" autocomplete="off" spellcheck="false" />
         </div>
+        <label class="field check" id="set-assistant-remember-row">
+          <input type="checkbox" id="set-assistant-remember" />
+          <span class="field-label">Remember key on this device<span class="hint">Off: the key is forgotten when this tab closes. On: it is kept in this browser, where other pages from the same host can read it.</span></span>
+        </label>
 
         <div class="group-title">Your data</div>
         <p class="note">Every file is read in this tab. Nothing is uploaded unless you configure an assistant, and the only things kept between sessions are the choices on this page.</p>

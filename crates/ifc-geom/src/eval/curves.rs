@@ -1415,8 +1415,8 @@ mod tests {
     fn an_absurd_trim_parameter_does_not_hang() {
         // A parameter this large absorbs the whole-turn step; it must give up, not loop.
         let model = model_of(&format!(
-            "{CIRCLE}#4=IFCTRIMMEDCURVE(#3,(IFCPARAMETERVALUE(0.)),             (IFCPARAMETERVALUE(1.E300)),.T.,.PARAMETER.);
-"
+            "{CIRCLE}#4=IFCTRIMMEDCURVE(#3,(IFCPARAMETERVALUE(0.)),\
+             (IFCPARAMETERVALUE(1.E300)),.T.,.PARAMETER.);\n"
         ));
         // Reaching this line is the assertion; the untrimmed conic stands.
         let curve = eval_curve(&model, 4).expect("the untrimmed conic still evaluates");

@@ -18,10 +18,14 @@ tessifc-session model.ifc                # or: python scripts/serve-edit-session
 tessifc-session house.ifc --new          # a new model: project, site, building and storeys
 ```
 
-Open the printed address. The viewer's **Session** panel then runs Python
-instead of its built-in browser JavaScript, and, when a provider is
-configured, the Ask and Edit assistant runs on this process. `--new` creates
-the file first (`--schema IFC2X3|IFC4|IFC4X3`, `--storeys "Ground floor:0,Upper floor:3"`).
+Open the printed address as it is: the part after `#token=` is the session's
+key, which the page keeps and removes from the address bar. The viewer's
+**Session** panel then runs Python instead of its built-in browser
+JavaScript, and, when a provider is configured, the Ask and Edit assistant
+runs on this process. `--new` creates the file when it is missing
+(`--schema IFC2X3|IFC4|IFC4X3`, `--storeys "Ground floor:0,Upper floor:3"`).
+The server listens on port 8000, or on a free port when 8000 is taken;
+`--port` names one and fails if it is taken (`0` picks a free one).
 
 ## For an agent over MCP
 
@@ -32,7 +36,8 @@ claude mcp add tessifc-py -- python scripts/serve-edit-session.py house.ifc --mc
 With `--mcp` (the `mcp` extra) the process speaks the Model Context Protocol
 on stdin and stdout while the viewer server keeps running, so Claude Code,
 Claude Desktop or any MCP client edits the model with Python scripts and a
-person watches at the printed address. The tools are the ones `@tessifc/mcp`
+person watches at the printed address (`describe_model` returns it as
+`viewer.url` when the client hides stderr). The tools are the ones `@tessifc/mcp`
 offers (`describe_model`, `find_products`, `product_info`, `inspect_model`,
 `edit_model`, `undo`, `redo`, `export_model`, `new_model`, `open_model`,
 `get_selection`, `list_examples`; `verify_revision` needs the TessIFC kernel
@@ -74,7 +79,7 @@ with `ifcopenshell.api` on top of it.
 
 Set `ANTHROPIC_API_KEY` and start with `--assistant anthropic` (the default
 when a key is present). `--model` and `--effort` tune the request. Ask mode
-inspects the model through a read-only script tool; Edit mode proposes one
+inspects the model through a script tool whose model edits are discarded; Edit mode proposes one
 script that you review and run from the panel, or runs it immediately when
 the panel's automatic policy is on. `--assistant fake` is a deterministic
 stand-in used by the tests.
@@ -87,13 +92,16 @@ shaped response (`content` blocks, `stop_reason`, `usage`); `FakeProvider`
 is the smallest example. To drive the tools from a loop you already have,
 call `assistant.execute_tool(name, arguments, selection, policy)` with the
 definitions in `INSPECT_TOOL`, `PROPOSE_TOOL` and `UNDO_TOOL`; it returns the
-tool result text and an error flag. [Agents and pipelines](../../docs/agents.md)
+tool result text and an error flag. [Agents and pipelines](https://github.com/nbharathik/tessifc/blob/main/docs/agents.md)
 describes the loop and the review policy.
 
 ## Boundary
 
 The server binds to the loopback interface, checks the Host and Origin
-headers, and requires a per-session token on every command. Scripts run inside
-the session process with your user's permissions and without a sandbox, so
+headers, and requires a per-session token on every session request, reads
+included; the token reaches the page only through the printed address. Scripts
+run inside the session process with your user's permissions and without a
+sandbox, `inspect_model` included (only its model edits are discarded), so
 review generated code before running it. The provider key is removed from the
-process environment before any script runs.
+process environment before any script runs, but the provider client still
+holds it in memory, where a script can reach it.

@@ -48,7 +48,7 @@ TOOLS = [
          "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}}, "additionalProperties": False}},
     {"name": "product_info", "description": "One entity by express id or GlobalId: attributes, container, property sets, representation items and placement.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "guid": {"type": "string"}}, "additionalProperties": False}},
-    {"name": "inspect_model", "description": "Run read-only Python against the model and return what it prints; every modification is discarded. Same names as edit_model scripts.",
+    {"name": "inspect_model", "description": "Run Python against the model and return what it prints; its edits to the model are discarded. Same names as edit_model scripts. Not a sandbox: like edit_model, the script runs with this server's permissions.",
      "inputSchema": {"type": "object", "properties": {"code": {"type": "string", "description": "Python that prints what you need to know"}}, "required": ["code"], "additionalProperties": False}},
     {"name": "edit_model", "description": "Run a Python script that changes the model inside a transaction; the file is saved and the viewer follows. The result carries the revision and, when a viewer is attached, the kernel's affected and removed products.",
      "inputSchema": {"type": "object", "properties": {"script": {"type": "string", "description": "Complete script using model, ifcopenshell, api, element, guid, selection, selected"},
@@ -58,15 +58,17 @@ TOOLS = [
     {"name": "redo", "description": "Redo the change the last undo removed, as a new version.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "outputSchema": _RUN_RESULT},
     {"name": "export_model", "description": "Write the committed IFC to a path (default: the followed file).",
      "inputSchema": {"type": "object", "properties": {"path": {"type": "string", "description": "Destination .ifc path"}}, "additionalProperties": False}},
-    {"name": "new_model", "description": "Start a new IFC model with a project, site, building and storeys, saved to a path that the session then follows.",
+    {"name": "new_model", "description": "Start a new IFC model with a project, site, building and storeys, saved to a new .ifc path that the session then follows. An existing file is refused unless force is set.",
      "inputSchema": {"type": "object", "properties": {
          "schema": {"type": "string", "enum": ["IFC2X3", "IFC4", "IFC4X3"], "default": "IFC4"}, "name": {"type": "string", "default": "New project"},
          "units": {"type": "string", "enum": ["m", "mm"], "default": "m"}, "site": {"type": "string"}, "building": {"type": "string"},
          "storeys": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "elevation": {"type": "number"}}, "required": ["name"]}},
-         "path": {"type": "string", "description": "Where the model is saved and followed"},
+         "path": {"type": "string", "description": "Where the model is saved and followed; must end with .ifc"},
          "force": {"type": "boolean", "default": False, "description": "Overwrite an existing file"}}, "additionalProperties": False}},
     {"name": "open_model", "description": "Follow another IFC file; it becomes the file that commits are saved to.",
-     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": False}},
+     "inputSchema": {"type": "object", "properties": {"path": {"type": "string"},
+                                                      "force": {"type": "boolean", "default": False, "description": "Accepted for parity with the Node server; this session saves every change, so nothing is dropped"}},
+                     "required": ["path"], "additionalProperties": False}},
     {"name": "get_selection", "description": "What the user selected in the viewer that follows this session, if any.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "list_examples", "description": "Ready-made Python scripts: a door, a wall raise, and more.",
@@ -248,8 +250,10 @@ print(json.dumps({{"id": entity.id(), "class": entity.is_a(), "guid": getattr(en
         from .model import create_model, write_model
 
         target = Path(path).resolve() if path else self.session.path.with_name(f"{options.get('name', 'New project')}.ifc")
-        if target.exists() and not force and target != self.session.path:
-            raise ToolError(json.dumps({"error": f"{target} exists; pass force to overwrite it"}))
+        if target.suffix.lower() != ".ifc":
+            raise ToolError(json.dumps({"error": "The path must end with .ifc"}))
+        if target.exists() and not force:
+            raise ToolError(json.dumps({"error": f"{target} exists; pass force to overwrite it, or open it with open_model."}))
         model = create_model(options.get("schema", "IFC4"), name=options.get("name", "New project"), units=options.get("units", "m"),
                              site=options.get("site", "Site"), building=options.get("building", "Building"), storeys=options.get("storeys"))
         write_model(model, target)

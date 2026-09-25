@@ -42,8 +42,9 @@ npm ci
 node bindings/mcp/src/cli.js house.ifc --new
 ```
 
-Open <http://127.0.0.1:8000/examples/embed-viewer/?session=file>, or press
-**Follow the local session** on the page. The viewer opens the host's model
+Take the address the server prints, replace `/viewer/` with
+`/examples/embed-viewer/` and keep the rest (`?session=file#token=...`: the
+token is what lets the page talk to the host). The viewer opens the host's model
 (empty at first) and applies every revision the host publishes as a delta;
 the status line reports the kernel's affected-product count after each one.
 Edit through an MCP client, or run `node examples/agent-building/build-house.mjs

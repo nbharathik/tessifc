@@ -57,11 +57,16 @@ claude mcp add tessifc -- node bindings/mcp/src/cli.js --new house.ifc
 ```
 
 Start a conversation and ask for a building; the server prints
-`Viewer: http://127.0.0.1:8000/viewer/?session=file` on stderr, and that page
-shows every revision as it is committed. `--new` starts from a project, site,
-building and storeys (`--schema`, `--units`, `--storeys "Ground floor:0,Upper floor:3"`);
-without it the server opens an existing file. For Claude Desktop, put the
-same command in `claude_desktop_config.json`:
+`Viewer: http://127.0.0.1:8000/viewer/?session=file#token=...` on stderr, and
+that page shows every revision as it is committed. Open the address as
+printed: the `#token=` part is the session's key. When the client hides
+stderr, ask the agent for it; `describe_model` returns it as `viewer.url`.
+`--new` creates the file from a project, site, building and storeys when it
+is missing and opens it otherwise (`--schema`, `--units`,
+`--storeys "Ground floor:0,Upper floor:3"`). Both servers listen on port
+8000, or on a free port when 8000 is taken, so they can be registered side
+by side. For Claude Desktop, put the same command in
+`claude_desktop_config.json`:
 
 ```json
 {
@@ -90,12 +95,12 @@ structured content.
 | `describe_model` | | `name`, `schema`, `revision`, `version`, `lengthUnit`, `products` by class, `storeys`, `history`, `viewer`, `text` (a prompt-ready summary) | yes |
 | `find_products` | `class`, `name`, `storey`, `limit` | `products` (`id`, `class`, `name`, `guid`, `storey`), `total` | yes |
 | `product_info` | `id` or `guid` | `id`, `class`, `guid`, `name`, `attributes`, `container`, `propertySets`, `representations`, `placement` | yes |
-| `inspect_model` | `code` | `ok`, `timedOut`, `stdout`, `error`, `traceback`; a read-only run, nothing is published | yes |
+| `inspect_model` | `code` | `ok`, `timedOut`, `stdout`, `error`, `traceback`; the script's model edits are discarded and nothing is published, but it runs with the server's permissions like `edit_model` | yes |
 | `edit_model` | `script`, `summary` | `ok`, `timedOut`, `changed`, `revision`, `version`, `stdout`, `operations`, `affectedProducts`, `removedProducts`, `metadataProducts`, `fullRebuild`, `diagnostics`, `history`, `saved` | yes |
 | `undo`, `redo` | | as `edit_model`, plus `label` | yes |
 | `export_model` | `path` | `path`, `bytes`, `version` | yes |
-| `new_model` | `schema`, `name`, `units`, `site`, `building`, `storeys`, `path`, `force` | `revision`, `version`, `generation`, `storeys`, `products` | yes |
-| `open_model` | `path` | `revision`, `version`, `generation`, `products` | yes |
+| `new_model` | `schema`, `name`, `units`, `site`, `building`, `storeys`, `path`, `force` | `revision`, `version`, `generation`, `storeys`, `products`; `path` must end with `.ifc`, and an existing file is replaced only with `force` | yes |
+| `open_model` | `path`, `force` | `revision`, `version`, `generation`, `products`; in Node, unsaved changes are dropped only with `force` | yes |
 | `get_selection` | | `ids`, `guids`, `className`, `name`, `reportedAt`: what the person clicked in the viewer | yes |
 | `verify_revision` | | `ok`, `revision`, `products`, `mismatches`: a fresh evaluation of the exported file against the scene built from the deltas | Node only |
 | `list_examples` | | `examples` (`title`, `source`), including a small house | yes |
@@ -269,7 +274,8 @@ at the limit is stopped by ending that worker, its edits are discarded and
 the result says `timedOut`. The limit catches a script that never returns;
 it is not a security boundary, and the Python session has none. The MCP servers bind to the loopback interface
 only, check the Host and Origin headers and require a per-process token on
-every viewer command. The session reparses the whole candidate file and scans
+every viewer request, reads included; the token travels only in the printed
+address, never in an HTTP response. The session reparses the whole candidate file and scans
 dependencies model-wide; selective work is the tessellation and the renderer
 update. The kernel is synchronous, so a large `edit_model` blocks the server
 until it is done: keep steps small. Very long sessions should export and

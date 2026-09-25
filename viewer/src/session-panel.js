@@ -10,6 +10,26 @@ import { JAVASCRIPT_EXAMPLES, PYTHON_EXAMPLES } from "./script-examples.js";
 const $ = (id) => document.getElementById(id);
 
 const SESSION_COMMAND = "python scripts/serve-edit-session.py model.ifc";
+// Anything that could end a one-line comment in JavaScript or Python, and other controls.
+const COMMENT_BREAKS = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/g;
+
+/** Model text made safe for a one-line comment: every line break or control becomes a space. */
+export function commentText(value) {
+  return String(value ?? "").replace(COMMENT_BREAKS, " ");
+}
+
+/**
+ * The code line the Selection button inserts: the selection as a target, its
+ * class and name in a trailing comment the model's text cannot end early.
+ * @param {{ expressId: number, className: string, globalId?: string | null, name?: string | null }} selection
+ * @param {boolean} python
+ */
+export function selectionLine(selection, python) {
+  const guid = selection.globalId ? JSON.stringify(String(selection.globalId)) : null;
+  const label = `${commentText(selection.className)}${selection.name ? ` ${JSON.stringify(commentText(selection.name))}` : ""}`;
+  if (python) return `target = ${guid ? `model.by_guid(${guid})` : `model.by_id(${Number(selection.expressId)})`}  # ${label}\n`;
+  return `const target = ${guid ? `ifc.byGuid(${guid})` : `ifc.get(${Number(selection.expressId)})`};  // ${label}\n`;
+}
 
 export function createSessionPanel({ shell, getSession, getSelection, browser, assistant, hasModel }) {
   const editor = $("script-editor");
@@ -278,16 +298,7 @@ export function createSessionPanel({ shell, getSession, getSelection, browser, a
   });
   $("script-insert").addEventListener("click", () => {
     const selection = getSelection();
-    if (!selection) return;
-    const python = engine().language === "python";
-    const target = selection.globalId
-      ? `model.by_guid(${JSON.stringify(selection.globalId)})`
-      : `model.by_id(${selection.expressId})`;
-    const browserTarget = selection.globalId ? `ifc.byGuid(${JSON.stringify(selection.globalId)})` : `ifc.get(${selection.expressId})`;
-    const label = selection.name ? ` ${JSON.stringify(selection.name)}` : "";
-    insertAtCursor(python
-      ? `target = ${target}  # ${selection.className}${label}\n`
-      : `const target = ${browserTarget};  // ${selection.className}${label}\n`);
+    if (selection) insertAtCursor(selectionLine(selection, engine().language === "python"));
   });
 
   function insertAtCursor(text) {

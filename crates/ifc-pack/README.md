@@ -27,6 +27,7 @@ writer.add_instance(Instance {
     color: [200, 200, 200, 255],
     flags: 0,
     provenance: Provenance::default(),
+    material: None,
 });
 let bytes = writer.finish();
 assert_eq!(&bytes[0..4], b"IGP\0");

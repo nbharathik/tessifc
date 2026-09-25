@@ -50,7 +50,7 @@ by a worker of your own or the `tessifc` CLI.
 | `on(event, listener)` | `load`, `progress`, `select`, `visibility`, `camera`, `overlay`, `close`, `revision`, `session`, `reopen`; returns the unsubscribe function. |
 | `session()` | The `@tessifc/edit` editing session over the open model, adopted to the streamed scene: `runScript`, `setAttributes`, `applySnapshot`, `undo`, `redo`, `export`. In worker mode the same calls return promises. |
 | `applyDelta(delta)` | Applies a session delta: retires the affected and removed products, adds their replacements (or rebuilds everything for a `full` delta), keeps selection and visibility by GlobalId, flashes the changed products and emits `revision`. |
-| `follow(baseUrl)`, `unfollow()` | Follows a local session host (`tessifc-mcp` or the Python session server) at `baseUrl` (`""` is the page's own origin): every published version is opened or applied as a delta; `session` events carry the host's status. `follow` returns the client, with `run`, `undo`, `redo` and `reportSelection`. |
+| `follow(baseUrl)`, `unfollow()` | Follows a local session host (`tessifc-mcp` or the Python session server) at `baseUrl` (`""` is the page's own origin): every published version is opened or applied as a delta; `session` events carry the host's status. The host's token comes from the `#token=` of the address the host printed, which the page was opened with, or from `follow({ baseUrl, token })`. `follow` returns the client, with `run`, `undo`, `redo` and `reportSelection`. |
 | `worker()` | Worker mode's state: whether its worker runs, the kernel version and the script limit; `null` on the page-thread path. |
 | `lodState()` | How many coarse levels the pack carries, how many batches draw them, whether the switch is on and whether the last frame used them. |
 | `pack()`, `hierarchy()`, `modelId()`, `overlayState()`, `renderer` | The assembled pack, the kernel's spatial tree, the model id, whether the coincident-surface overlay has been refined (`pending`, `ready`, `exhausted` when the model was too large for the analysis budget and whole products stay in the overlay, `failed`, `off`) and the renderer itself for anything not covered above. |
@@ -105,7 +105,7 @@ const { delta } = session.runScript(`ifc.addWall({ from: [0, 0], to: [6, 0], hei
 viewer.applyDelta(delta);                    // only the wall is tessellated and uploaded
 viewer.on("revision", ({ revision, affectedProducts }) => console.log(revision, affectedProducts.length));
 
-viewer.follow("");                           // a tessifc-mcp or Python session serving this page
+viewer.follow("");                           // the session serving this page, opened at its printed address
 ```
 
 `@tessifc/viewer/renderer` exports the `IfcRenderer` class for hosts that want
@@ -146,6 +146,12 @@ startKernelWorker({ glue, edit: { createEditingSession, createScriptEngine, runS
 
 and passes it as `worker: { url: new URL("./tessifc.worker.js", import.meta.url) }`.
 
+Once the kernel has loaded, the worker removes its network, module-loading
+and code-generation globals and refuses any script that contains the word
+`import`, so a script can change the model but cannot send it anywhere. An
+entry that needs the network in the same worker afterwards passes
+`lockdown: false` to `startKernelWorker`.
+
 A script that runs past `scriptTimeoutMs` (30 seconds by default, 0 for no
 limit) is stopped by ending the worker: `runScript` resolves with
 `report.timedOut`, the model is reopened in a fresh worker from its last
@@ -161,5 +167,6 @@ implementation.
 `examples/embed-viewer/index.html` is a complete page that uses the package
 through an import map; serve the checkout and open
 `/examples/embed-viewer/`. Its "Follow the local session" button (or
-`?session=file`) shows a `tessifc-mcp` or Python session at work.
+`?session=file`) shows a `tessifc-mcp` or Python session at work; open it
+from a session host with the `#token=` of the address the host printed.
 `bindings/viewer/test/embed.test.mjs` drives the same page in a browser.

@@ -46,19 +46,23 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@tessifc/core": "0.2.0",
     "@tessifc/edit": "0.2.0",
     "zod": "4.6.5"
   },
-  "peerDependencies": {
-    "@tessifc/core": "0.2.0"
-  },
-  "peerDependenciesMeta": {
-    "@tessifc/core": {
-      "optional": true
-    }
-  },
   "engines": {
     "node": ">=20"
+  },
+  "keywords": [
+    "ifc",
+    "bim",
+    "mcp",
+    "agent",
+    "tessifc"
+  ],
+  "homepage": "https://github.com/nbharathik/tessifc#readme",
+  "bugs": {
+    "url": "https://github.com/nbharathik/tessifc/issues"
   },
   "repository": {
     "type": "git",

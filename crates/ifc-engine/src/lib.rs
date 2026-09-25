@@ -19,6 +19,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 pub mod pack;
 pub mod report;
 #[cfg(feature = "revision")]
@@ -28,7 +32,8 @@ pub mod revision;
 pub mod codes {
     use tessifc_step::DiagCode;
 
-    /// A relationship record with too many links to index; its targets are lost.
+    /// A relationship record that is malformed or has too many links to index;
+    /// its targets are lost.
     pub const RELATIONSHIP_TOO_LARGE: DiagCode = DiagCode("W_RELATIONSHIP_TOO_LARGE");
     /// A coordinate did not survive the narrowing to f32; the part was dropped.
     pub const NON_FINITE_GEOMETRY: DiagCode = DiagCode("W_NON_FINITE_GEOMETRY");
@@ -588,8 +593,8 @@ impl Session {
                 Diagnostic::warning(
                     codes::RELATIONSHIP_TOO_LARGE,
                     line,
-                    "this relationship has too many links to index; the objects \
-                     it relates are not connected",
+                    "this relationship is malformed or has too many links to index; \
+                     the objects it relates are not connected",
                 )
                 .with_id(id),
             );

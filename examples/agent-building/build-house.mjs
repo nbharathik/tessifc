@@ -41,7 +41,7 @@ let viewer = null;
 if (values.serve) {
   viewer = createViewerServer(host, { root, port: Number(values.port) || 0 });
   await viewer.listen();
-  console.log(`Open ${viewer.url}/viewer/?session=file and watch; the build starts in 5 seconds`);
+  console.log(`Open ${viewer.viewerUrl} and watch; the build starts in 5 seconds`);
   await new Promise((done) => setTimeout(done, 5000));
 }
 

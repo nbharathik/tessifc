@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// The loopback viewer server over a model host: status, origin checks, snapshots,
-// the long poll, scripts, undo, the reports and static file containment.
+// The loopback viewer server over a model host: status, token and origin checks,
+// snapshots, the long poll, scripts, undo, the reports, static file containment,
+// the viewer's session client, a port in use, and the host's guards against
+// overwriting files or edits.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,14 +37,22 @@ const server = createViewerServer(host, { root, port: 0 });
 const base = await server.listen();
 const hostHeader = new URL(base).host;
 const origin = `http://${hostHeader}`;
-const get = (path, headers = {}) => fetch(`${base}${path}`, { headers: { host: hostHeader, ...headers } });
+const get = (path, headers = {}) => fetch(`${base}${path}`, { headers: { host: hostHeader, "x-tessifc-token": server.token, ...headers } });
+const bare = (path, headers = {}) => fetch(`${base}${path}`, { headers: { host: hostHeader, ...headers }, redirect: "manual" });
 const post = (path, body, headers = {}) => fetch(`${base}${path}`, {
   method: "POST", headers: { host: hostHeader, origin, "content-type": "application/json", "x-tessifc-token": server.token, ...headers }, body: JSON.stringify(body),
 });
 try {
   const status = await (await get("/__tessifc/session")).json();
-  ok(status.token === server.token && status.revision === "0" && status.capabilities.authoring === "javascript" && status.capabilities.selection === true
-    && status.examples.some((example) => example.title === "Build a small house"), "the status carries the token, the revision, the JavaScript capability and the examples");
+  ok(!("token" in status) && !JSON.stringify(status).includes(server.token) && status.revision === "0" && status.capabilities.authoring === "javascript"
+    && status.capabilities.selection === true && status.examples.some((example) => example.title === "Build a small house"),
+  "the status carries the revision, the JavaScript capability and the examples, never the token");
+  ok(server.viewerUrl === `${base}/viewer/?session=file#token=${server.token}`, "the address to open carries the token in its fragment");
+  ok((await bare("/__tessifc/session")).status === 403 && (await bare(`/__tessifc/model.ifc?version=${status.version}`)).status === 403
+    && (await bare("/__tessifc/session", { "x-tessifc-token": `${server.token}x` })).status === 403 && (await bare("/__tessifc/session", { "x-tessifc-token": "" })).status === 403,
+  "the status and the snapshot need the token");
+  const root302 = await bare("/");
+  ok(root302.status === 302 && root302.headers.get("location") === "/viewer/?session=file", "the root redirects to the viewer without the token");
   // fetch drops a custom Host header, so the check goes through node:http.
   const rawStatus = (headers) => new Promise((done, fail) => {
     const url = new URL(`${base}/__tessifc/session`);
@@ -53,7 +63,8 @@ try {
     req.on("error", fail);
     req.end();
   });
-  ok((await rawStatus({ host: "evil.example:1" })) === 403 && (await rawStatus({ host: hostHeader })) === 200, "a foreign Host is refused");
+  ok((await rawStatus({ host: "evil.example:1", "x-tessifc-token": server.token })) === 403 && (await rawStatus({ host: hostHeader, "x-tessifc-token": server.token })) === 200,
+    "a foreign Host is refused");
   ok((await get("/__tessifc/session", { origin: "http://evil.example" })).status === 403, "a foreign Origin is refused");
   ok((await fetch(`${base}/__tessifc/run`, { method: "POST", headers: { host: hostHeader, origin, "content-type": "application/json" }, body: "{}" })).status === 403,
     "a POST without the token is refused");
@@ -93,13 +104,91 @@ try {
   ok((await post("/__tessifc/assistant", { prompt: "x" })).status === 404, "the assistant route says there is none");
   ok((await post("/__tessifc/run", "not json", {})).status === 400, "a non-object body answers 400");
 
-  ok((await get("/")).status === 302 || (await get("/")).redirected, "the root redirects to the viewer");
-  ok((await get("/viewer/index.html")).status === 200 && (await get("/bindings/edit/src/session.js")).status === 200, "the viewer and the packages are served");
+  ok((await bare("/viewer/index.html")).status === 200 && (await bare("/bindings/edit/src/session.js")).status === 200, "the viewer and the packages are served without the token");
   ok((await get("/bindings/mcp/src/cli.js")).status === 404 && (await get("/viewer/node_modules/playwright/package.json")).status === 404 && (await get("/../Cargo.toml")).status === 404,
     "files outside the static roots, node_modules and traversals are refused");
+
+  // The viewer's session client against this server, on a simulated page opened at the printed address.
+  const { createSessionClient, pageSessionToken } = await import("../../viewer/src/session-client.js");
+  const stored = new Map();
+  let replaced = null;
+  const page = {
+    location: { hash: `#token=${server.token}&view=top`, pathname: "/viewer/", search: "?session=file", href: server.viewerUrl, origin: base },
+    history: { state: null, replaceState: (_state, _title, url) => { replaced = url; } },
+    sessionStorage: { getItem: (key) => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, String(value)) },
+  };
+  for (const [name, value] of Object.entries(page)) Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  try {
+    ok(pageSessionToken() === server.token && replaced === "/viewer/?session=file#view=top" && stored.get("tessifc-session-token") === server.token,
+      "the page takes the token from the fragment, removes it from the address and keeps it for the tab");
+    page.location.hash = "";
+    ok(pageSessionToken() === server.token, "a reload of the tab keeps the token");
+    // A browser sends the page's origin with every POST; Node's fetch does not, so the wrapper adds it.
+    let requests = 0;
+    const browserFetch = (url, init = {}) => {
+      requests += 1;
+      return fetch(new URL(url, base), { ...init, headers: { ...init.headers, origin } });
+    };
+    const follow = async (token) => {
+      const seen = { opened: 0, errors: [] };
+      const client = createSessionClient({ baseUrl: "", ...(token === undefined ? {} : { token }), fetch: browserFetch, ready: () => true,
+        loaded: () => seen.opened > 0, open: async () => { seen.opened += 1; return { revision: host.session.revision }; }, update: async () => ({}),
+        report: (message) => seen.errors.push(message), status: () => {} });
+      for (let attempt = 0; attempt < 100 && !seen.opened && !seen.errors.length; attempt += 1) await new Promise((done) => setTimeout(done, 50));
+      return { client, seen };
+    };
+    const followed = await follow(undefined);
+    const ran = await followed.client.run('print("from the page")', null);
+    ok(followed.seen.opened === 1 && !("token" in followed.client.status()) && ran.ok && ran.stdout.includes("from the page"),
+      "the client uses the page's token to follow the host and run a script");
+    followed.client.stop();
+    const wrong = await follow("not-the-token");
+    ok(wrong.seen.opened === 0 && /refused this page/.test(wrong.seen.errors[0] ?? ""), "a wrong token is refused and the page says to open the printed address");
+    wrong.client.stop();
+    const before = requests;
+    const none = await follow(null);
+    ok(none.seen.opened === 0 && /no session token/.test(none.seen.errors[0] ?? "") && requests === before,
+      "without a token the client sends nothing and says to open the printed address");
+    none.client.stop();
+  } finally {
+    for (const name of Object.keys(page)) delete globalThis[name];
+  }
+
+  // A port in use rejects the listen, and the same server can then take a free port.
+  const second = createViewerServer(host, { root, port: server.port });
+  let code = null;
+  await second.listen().catch((error) => { code = error.code; });
+  const fallback = await second.listen(0);
+  ok(code === "EADDRINUSE" && second.port !== server.port && (await fetch(`${fallback}/__tessifc/session`, { headers: { "x-tessifc-token": second.token } })).status === 200,
+    "a port in use rejects with EADDRINUSE and a retry on port 0 serves");
+  await second.close();
 } finally {
   await server.close();
   host.dispose();
   rmSync(dir, { recursive: true, force: true });
+}
+
+// The host refuses to overwrite files or drop unsaved edits without force.
+const scratch = mkdtempSync(join(tmpdir(), "tessifc-mcp-host-"));
+const guarded = createModelHost({ Kernel, version: "test" });
+try {
+  const existing = join(scratch, "existing.ifc");
+  writeFileSync(existing, "keep me");
+  const refused = async (work) => work.then(() => null, (error) => error.message);
+  ok(/\.ifc/.test(await refused(guarded.newModel({}, { path: join(scratch, "profile.txt") }))) && !existsSync(join(scratch, "profile.txt")),
+    "a new model refuses a path without .ifc");
+  ok(/exists/.test(await refused(guarded.newModel({}, { path: existing }))) && readFileSync(existing, "utf8") === "keep me", "a new model refuses an existing file");
+  await guarded.newModel({ name: "Scratch" }, { path: existing, force: true });
+  ok(readFileSync(existing, "latin1").includes("IFCPROJECT"), "force overwrites it");
+  await guarded.newModel({ name: "In memory" });
+  await guarded.run('ifc.addWall({ from: [0, 0], to: [3, 0], height: 3 });');
+  ok(guarded.describe().saved === false && guarded.session.revision === "1", "an edit to a model in memory is unsaved");
+  ok(/not saved/.test(await refused(guarded.openFile(existing))) && guarded.session.revision === "1", "opening a file refuses to drop unsaved edits");
+  ok(/not saved/.test(await refused(guarded.newModel({}, { path: join(scratch, "fresh.ifc") }))) && guarded.session.revision === "1" && !existsSync(join(scratch, "fresh.ifc")),
+    "a new model refuses to drop unsaved edits");
+  ok((await guarded.openFile(existing, { force: true })).generation === 3, "force drops them");
+} finally {
+  guarded.dispose();
+  rmSync(scratch, { recursive: true, force: true });
 }
 console.log(`PASS ${passed} checks`);

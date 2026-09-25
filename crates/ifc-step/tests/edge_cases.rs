@@ -118,6 +118,18 @@ fn a_missing_endsec_does_not_lose_the_records() {
 // ------------------------------------------------------------------- the header
 
 #[test]
+fn a_header_without_endsec_ends_at_data() {
+    let source = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nDATA;\n\
+                  #1=IFCWALL('a',$,$,$,$,$,$,$,$);\n#2=IFCSLAB('b',$,$,$,$,$,$,$,$);\n\
+                  ENDSEC;\nEND-ISO-10303-21;\n";
+    let image = read(source);
+    assert_eq!(image.len(), 2);
+    assert_eq!(image.header.schema_identifiers, vec!["IFC4".to_string()]);
+    assert!(has_code(&image, DiagCode::BAD_HEADER));
+    assert!(!image.diagnostics.has_errors());
+}
+
+#[test]
 fn the_header_is_decoded() {
     let image = read(&ifc("IFC4", ""));
     assert_eq!(image.header.name, "t");

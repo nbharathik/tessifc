@@ -6,11 +6,11 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use tessifc_engine::Engine;
 use tessifc_engine::pack::Packer;
+use tessifc_engine::{Engine, EvaluationResult, ProductOutcome, ProductState};
 use tessifc_geom::Settings;
 use tessifc_model::Model;
-use tessifc_step::ParseOptions;
+use tessifc_step::{DiagCode, Diagnostic, ParseOptions, Severity};
 
 #[derive(Serialize)]
 struct Report {
@@ -109,6 +109,14 @@ pub struct Options<'a> {
 
 pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
     let started = Instant::now();
+    if let Some(output) = options.output
+        && crate::same_path(path, output)
+    {
+        eprintln!(
+            "tessifc: refusing to overwrite the input IFC with a pack; choose a different --output"
+        );
+        return ExitCode::from(2);
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -182,19 +190,18 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
     let timings = result.timings;
 
     let pack_started = Instant::now();
-    let mut packer = Packer::new(&schema, result.units.length_to_m, result.model_offset);
-    packer.set_georef(result.georef.clone());
+    let mut packer = packer_for(&schema, &result);
     let shape_classes: Vec<String> = result
         .shapes
         .iter()
         .map(|shape| shape.class.clone())
         .collect();
     let products_with_geometry = result.shapes.len();
-    // One record per colour: a window's frame and glass are two records sharing an express id.
-    for shape in &result.shapes {
-        packer.add_shape_ref(shape);
-    }
     let triangles = packer.triangles();
+    // The packer's own, such as a part it had to leave out, count like the evaluation's.
+    let pack_diagnostics = packer.diagnostics().to_vec();
+    let diagnostics: Vec<&Diagnostic> =
+        result.diagnostics.iter().chain(&pack_diagnostics).collect();
 
     let mut by_code: std::collections::BTreeMap<String, usize> = Default::default();
     let mut by_class: std::collections::BTreeMap<String, usize> = Default::default();
@@ -206,7 +213,7 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
     let mut diagnostic_infos = 0;
     let mut diagnostic_errors = 0;
     let mut diagnostic_warnings = 0;
-    for diagnostic in &result.diagnostics {
+    for diagnostic in diagnostics.iter().copied() {
         let code = diagnostic.code.as_str().to_string();
         let class = match diagnostic.express_id {
             Some(id) => model.image().class_name_of(id),
@@ -289,34 +296,8 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
             .with_geometry += 1;
     }
 
-    let refused = options.strict
-        && result.diagnostics.iter().any(|diagnostic| {
-            diagnostic.severity == tessifc_step::Severity::Error
-                || diagnostic.code.as_str().starts_with("E_")
-                || matches!(
-                    diagnostic.code.as_str(),
-                    "W_PCURVE_DOMAIN_RECOVERED"
-                        | "W_PCURVE_REFERENCE_RECOVERED"
-                        | "W_PCURVE_3D_FALLBACK"
-                        | "W_EDGE_ORIENTATION_RECOVERED"
-                        | "W_TESSELLATION_TOLERANCE_UNMET"
-                        | "W_PROFILE_DETAIL_APPROXIMATED"
-                        | "W_TRIM_IGNORED"
-                        | "W_SWEEP_PARAMETERS_APPROXIMATED"
-                        | "W_SWEEP_FILLET_IGNORED"
-                        | "W_BOUNDING_BOX_SUBSTITUTED"
-                        | "W_NON_MANIFOLD_INPUT"
-                        | "W_OPENING_CUT_ON_SURFACE"
-                        | "W_BOOLEAN_REFUSED"
-                        | "W_PLACEMENT_UNSUPPORTED"
-                        | "W_ALIGNMENT_SEGMENT_GAP"
-                        | "W_CANT_APPROXIMATED"
-                        | "W_LINEAR_PLACEMENT_MISMATCH"
-                        | "W_NO_DRAWN_REPRESENTATION"
-                        | "W_TEXTURE_DROPPED_BY_BOOLEAN"
-                        | "W_TEXTURE_OMITTED"
-                )
-        });
+    let product_outcomes = engine.outcomes(&model, &result);
+    let refused = options.strict && strict_refuses(&diagnostics, &product_outcomes);
     if !refused
         && let Some(target) = options.output
         && let Err(error) = write_whole(target, &pack)
@@ -358,12 +339,12 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
         model_offset: result.model_offset.to_array(),
         length_scale_to_m: result.units.length_to_m,
         effective_settings: settings,
-        product_outcomes: engine.outcomes(&model, &result),
+        product_outcomes,
         limit_reached: result.limit_reached.clone(),
         output_written: options.output.is_some() && !refused,
         product_classes,
         diagnostics: DiagnosticSummary {
-            total: result.diagnostics.len(),
+            total: diagnostics.len(),
             infos: diagnostic_infos,
             errors: diagnostic_errors,
             warnings: diagnostic_warnings,
@@ -456,6 +437,50 @@ pub fn run(path: &Path, options: Options<'_>) -> ExitCode {
     }
 }
 
+/// A packer holding every shape of an evaluation, with the coarse levels its settings ask for.
+fn packer_for(schema: &str, result: &EvaluationResult) -> Packer {
+    let mut packer = Packer::new(schema, result.units.length_to_m, result.model_offset);
+    packer.set_lod_levels(
+        result.settings.lod_levels,
+        result.settings.chord_tolerance_m,
+    );
+    packer.set_georef(result.georef.clone());
+    // One record per colour: a window's frame and glass are two records sharing an express id.
+    for shape in &result.shapes {
+        packer.add_shape_ref(shape);
+    }
+    packer
+}
+
+/// The diagnostics `--strict` accepts: they say something about the file but
+/// leave the geometry as complete and exact as the file describes it. Any
+/// other code, and any error, refuses the output.
+const STRICT_ALLOWED: [DiagCode; 5] = [
+    DiagCode::COMPLEX_INSTANCE,
+    DiagCode::MISSING_SEMICOLON,
+    tessifc_geom::codes::UNITS_ASSUMED,
+    tessifc_geom::codes::FULLY_TRANSPARENT_STYLE,
+    tessifc_geom::codes::VERTEX_LOOP_IGNORED,
+];
+
+/// Whether `--strict` refuses a conversion: a diagnostic outside the allowed
+/// few, or a selected product that produced no geometry.
+fn strict_refuses(diagnostics: &[&Diagnostic], outcomes: &[ProductOutcome]) -> bool {
+    let refused_diagnostic = diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == Severity::Error || !STRICT_ALLOWED.contains(&diagnostic.code)
+    });
+    let missing_product = outcomes.iter().any(|outcome| {
+        matches!(
+            outcome.state,
+            ProductState::NoUsableRepresentation
+                | ProductState::Pending
+                | ProductState::EmptyOrFailed
+                | ProductState::SkippedByLimit
+        )
+    });
+    refused_diagnostic || missing_product
+}
+
 /// Write through a sibling file and rename, so a failure leaves no half-written pack.
 fn write_whole(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut partial = target.as_os_str().to_owned();
@@ -465,4 +490,97 @@ fn write_whole(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&partial, target).inspect_err(|_| {
         let _ = std::fs::remove_file(&partial);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tessifc_geom::codes;
+
+    fn outcome(state: ProductState) -> ProductOutcome {
+        ProductOutcome {
+            express_id: 1,
+            class: "IfcWall".into(),
+            state,
+        }
+    }
+
+    #[test]
+    fn strict_accepts_only_the_informational_codes() {
+        for code in STRICT_ALLOWED {
+            let diagnostic = Diagnostic::warning(code, 0, "");
+            assert!(!strict_refuses(&[&diagnostic], &[]), "{code}");
+        }
+        // Repairs, approximations, losses, and a code this list does not know.
+        for code in [
+            codes::SHELL_REORIENTED,
+            codes::FACE_BOUND_RECOVERED,
+            codes::OPEN_PROFILE_SURFACE,
+            codes::NO_USABLE_REPRESENTATION,
+            codes::PROFILE_SELF_INTERSECTING,
+            codes::TEXTURE_LAYERS_IGNORED,
+            tessifc_engine::codes::NON_FINITE_GEOMETRY,
+            tessifc_engine::codes::TEXTURE_OMITTED,
+            tessifc_engine::codes::RELATIONSHIP_TOO_LARGE,
+            DiagCode::ARITY_MISMATCH,
+            DiagCode("W_NOT_YET_WRITTEN"),
+        ] {
+            let diagnostic = Diagnostic::warning(code, 0, "");
+            assert!(strict_refuses(&[&diagnostic], &[]), "{code}");
+        }
+        let error = Diagnostic::error(DiagCode::COMPLEX_INSTANCE, 0, "");
+        assert!(
+            strict_refuses(&[&error], &[]),
+            "an error, whatever its code"
+        );
+    }
+
+    #[test]
+    fn a_part_the_packer_leaves_out_reaches_the_strict_check() {
+        let source = "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;\
+            #1=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,1.,1.);#2=IFCDIRECTION((0.,0.,1.));\
+            #3=IFCEXTRUDEDAREASOLID(#1,$,#2,1.);\
+            #4=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#3));\
+            #5=IFCPRODUCTDEFINITIONSHAPE($,$,(#4));#6=IFCWALL('w',$,$,$,$,$,#5,$,$);\
+            ENDSEC;END-ISO-10303-21;";
+        let model = Model::new(tessifc_step::parse(
+            source.as_bytes(),
+            &ParseOptions::default(),
+        ));
+        let mut result = Engine::new().evaluate(&model);
+        assert!(!strict_refuses(
+            &result.diagnostics.iter().collect::<Vec<_>>(),
+            &[]
+        ));
+        // Past what f32 holds; only the packer can notice this late.
+        match &mut result.shapes[0].parts[0].geometry {
+            tessifc_engine::PartGeometry::Unique(mesh) => mesh.positions[0].x = 1.0e39,
+            _ => panic!("a plain extrusion is the product's own mesh"),
+        }
+        let packer = packer_for("IFC4", &result);
+        let own = packer.diagnostics();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].code, tessifc_engine::codes::NON_FINITE_GEOMETRY);
+        let all: Vec<&Diagnostic> = result.diagnostics.iter().chain(own).collect();
+        assert!(strict_refuses(&all, &[]));
+    }
+
+    #[test]
+    fn strict_refuses_a_selected_product_without_geometry() {
+        for state in [
+            ProductState::Filtered,
+            ProductState::NoRepresentation,
+            ProductState::Emitted,
+        ] {
+            assert!(!strict_refuses(&[], &[outcome(state)]), "{state:?}");
+        }
+        for state in [
+            ProductState::NoUsableRepresentation,
+            ProductState::Pending,
+            ProductState::EmptyOrFailed,
+            ProductState::SkippedByLimit,
+        ] {
+            assert!(strict_refuses(&[], &[outcome(state)]), "{state:?}");
+        }
+    }
 }

@@ -297,23 +297,17 @@ fn decode_hex_run(raw: &[u8], start: usize, width: usize, out: &mut String) -> O
         groups += 1;
 
         if width == 4 {
-            match (pending_high, value) {
-                (None, 0xd800..=0xdbff) => {
-                    pending_high = Some(value);
+            if let Some(high) = pending_high.take() {
+                if (0xdc00..=0xdfff).contains(&value) {
+                    push_code_point(out, 0x10000 + ((high - 0xd800) << 10) + (value - 0xdc00));
                     continue;
                 }
-                (Some(high), 0xdc00..=0xdfff) => {
-                    let cp = 0x10000 + ((high - 0xd800) << 10) + (value - 0xdc00);
-                    push_code_point(out, cp);
-                    pending_high = None;
-                    continue;
-                }
-                (Some(_), _) => {
-                    // A high surrogate that was never completed.
-                    out.push('\u{fffd}');
-                    pending_high = None;
-                }
-                _ => {}
+                // A high surrogate that was never completed.
+                out.push('\u{fffd}');
+            }
+            if (0xd800..=0xdbff).contains(&value) {
+                pending_high = Some(value);
+                continue;
             }
         }
         push_code_point(out, value);
@@ -431,6 +425,13 @@ mod tests {
     #[test]
     fn lone_surrogate_becomes_replacement() {
         assert_eq!(decode(b"\\X2\\D83D\\X0\\"), "\u{fffd}");
+    }
+
+    #[test]
+    fn a_high_surrogate_after_an_unpaired_one_starts_a_new_pair() {
+        assert_eq!(decode(b"\\X2\\D83DD83DDE00\\X0\\"), "\u{fffd}\u{1F600}");
+        assert_eq!(decode(b"\\X2\\D83D0041\\X0\\"), "\u{fffd}A");
+        assert_eq!(decode(b"\\X2\\DE00D83D\\X0\\"), "\u{fffd}\u{fffd}");
     }
 
     #[test]

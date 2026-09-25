@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Session semantics, the assistant tool loop and the loopback routes."""
+"""Session semantics, the assistant tool loop, the MCP tools and the loopback routes."""
 
 from __future__ import annotations
 
+import errno
 import json
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from http.client import HTTPConnection
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -17,8 +19,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO = PACKAGE_ROOT.parents[1]
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from tessifc_session import Assistant, EditSession, FakeProvider, SessionError, create_server  # noqa: E402
+from tessifc_session import Assistant, EditSession, FakeProvider, SessionError, cli, create_server  # noqa: E402
 from tessifc_session.assistant import AnthropicProvider, create_provider  # noqa: E402
+from tessifc_session.mcp import TOOLS, ModelTools, ToolError  # noqa: E402
 
 try:
     import ifcopenshell  # noqa: F401
@@ -80,6 +83,31 @@ class SessionFixture(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+
+class ModelToolTests(SessionFixture):
+    """The MCP tools without the transport, so they run without the mcp package."""
+
+    def test_tools_match_the_shared_contract(self):
+        contract = json.loads((REPO / "bindings" / "mcp" / "contract.json").read_text(encoding="utf-8"))
+        tools = {tool["name"]: tool for tool in TOOLS}
+        self.assertEqual(sorted(tools), sorted(name for name, spec in contract["tools"].items() if spec["python"]))
+        for name, tool in tools.items():
+            spec = contract["tools"][name]["input"]
+            self.assertEqual(sorted(tool["inputSchema"].get("properties", {})), sorted(spec["properties"]), name)
+            self.assertEqual(sorted(tool["inputSchema"].get("required", [])), sorted(spec["required"]), name)
+        self.assertIn("Not a sandbox", tools["inspect_model"]["description"])
+        self.assertNotIn("read-only", tools["inspect_model"]["description"])
+
+    def test_new_model_refuses_existing_files_and_other_suffixes(self):
+        tools = ModelTools(self.session)
+        profile = self.path.with_name("profile.txt")
+        for path, message in ((self.path, "exists"), (profile, ".ifc")):
+            with self.subTest(path=path), self.assertRaises(ToolError) as error:
+                tools.call("new_model", {"path": str(path)})
+            self.assertIn(message, json.loads(str(error.exception))["error"])
+        self.assertEqual(self.path.read_bytes(), FIXTURE.encode())
+        self.assertFalse(profile.exists())
 
 
 class SnapshotTests(SessionFixture):
@@ -271,7 +299,7 @@ class ServerTests(SessionFixture):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
-        self.token = self.status()["token"]
+        self.token = self.server.session_token
 
     def tearDown(self):
         self.server.shutdown()
@@ -279,8 +307,10 @@ class ServerTests(SessionFixture):
         self.thread.join()
         super().tearDown()
 
-    def get(self, path, headers=None):
-        with urlopen(Request(self.origin + path, headers=headers or {}), timeout=30) as response:
+    def get(self, path, headers=None, token=True):
+        request_headers = {"X-Tessifc-Token": self.token} if token else {}
+        request_headers.update(headers or {})
+        with urlopen(Request(self.origin + path, headers=request_headers), timeout=30) as response:
             return response.read()
 
     def status(self):
@@ -315,13 +345,51 @@ class ServerTests(SessionFixture):
         self.assertLess(time.monotonic() - started, 4.0)
 
     def test_static_routes_do_not_expose_workspace_files(self):
-        self.assertIn(b"TessIFC", self.get("/viewer/"))
+        self.assertIn(b"TessIFC", self.get("/viewer/", token=False))
         for path in ("/Cargo.toml", "/viewer/%2e%2e/Cargo.toml", "/viewer/node_modules/playwright/index.js"):
             with self.subTest(path=path), self.assertRaises(HTTPError) as error:
                 self.get(path)
             self.assertEqual(error.exception.code, 404)
 
+    def test_session_routes_need_the_token_which_no_response_carries(self):
+        status = self.status()
+        self.assertNotIn("token", status)
+        self.assertNotIn(self.token, json.dumps(status))
+        self.assertEqual(self.server.viewer_url, f"{self.origin}/viewer/?session=file#token={self.token}")
+        for path, headers in (("/__tessifc/session", {}), ("/__tessifc/model.ifc?version=" + status["version"], {}),
+                              ("/__tessifc/session", {"X-Tessifc-Token": self.token + "x"}), ("/__tessifc/session", {"X-Tessifc-Token": "é"})):
+            with self.subTest(path=path, headers=headers), self.assertRaises(HTTPError) as error:
+                self.get(path, headers, token=False)
+            self.assertEqual(error.exception.code, 403)
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=30)
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            self.assertEqual((response.status, response.getheader("Location")), (302, "/viewer/?session=file"))
+        finally:
+            connection.close()
+
+    def test_a_taken_default_port_falls_back_and_an_explicit_one_fails(self):
+        taken = self.server.server_port
+        with self.assertRaises(OSError) as error:
+            create_server(self.session, taken, root=REPO)
+        self.assertEqual(error.exception.errno, errno.EADDRINUSE)
+        with self.assertRaises(OSError):
+            cli.bind_server(self.session, taken, root=REPO)
+        default = cli.DEFAULT_PORT
+        cli.DEFAULT_PORT = taken
+        try:
+            fallback = cli.bind_server(self.session, None, root=REPO)
+        finally:
+            cli.DEFAULT_PORT = default
+        try:
+            self.assertNotEqual(fallback.server_port, taken)
+            self.assertIn(f":{fallback.server_port}/viewer/", fallback.viewer_url)
+        finally:
+            fallback.server_close()
+
     def test_rejects_foreign_origin_and_host(self):
+        # The token is sent, so the refusal comes from the Origin or Host check.
         for headers in ({"Origin": "https://example.com"}, {"Host": "example.com"}):
             with self.subTest(headers=headers), self.assertRaises(HTTPError) as error:
                 self.get("/__tessifc/session", headers)

@@ -10,7 +10,7 @@
     "redo": { "input": { "properties": [], "required": [] }, "result": ["ok", "changed", "revision", "version", "affectedProducts", "removedProducts", "history", "saved", "label"], "python": true },
     "export_model": { "input": { "properties": ["path"], "required": [] }, "result": ["path", "bytes", "version"], "python": true },
     "new_model": { "input": { "properties": ["schema", "name", "units", "site", "building", "storeys", "path", "force"], "required": [] }, "result": ["revision", "version", "generation", "storeys", "products"], "python": true },
-    "open_model": { "input": { "properties": ["path"], "required": ["path"] }, "result": ["revision", "version", "generation", "products"], "python": true },
+    "open_model": { "input": { "properties": ["path", "force"], "required": ["path"] }, "result": ["revision", "version", "generation", "products"], "python": true },
     "get_selection": { "input": { "properties": [], "required": [] }, "result": ["ids", "guids", "className", "name", "reportedAt"], "python": true },
     "verify_revision": { "input": { "properties": [], "required": [] }, "result": ["ok", "revision", "products", "mismatches", "elapsedMs"], "python": false },
     "list_examples": { "input": { "properties": [], "required": [] }, "result": ["examples"], "python": true }

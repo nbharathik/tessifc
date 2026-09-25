@@ -11,7 +11,7 @@
 
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -24,6 +24,7 @@ const log = (...parts) => console.error("[tessifc-mcp]", ...parts);
 console.log = console.info = console.debug = log;
 
 const here = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_PORT = 8000;
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
@@ -32,7 +33,7 @@ const { values, positionals } = parseArgs({
     schema: { type: "string", default: "IFC4" },
     units: { type: "string", default: "m" },
     storeys: { type: "string" },
-    port: { type: "string", default: "8000" },
+    port: { type: "string" },
     "no-viewer": { type: "boolean", default: false },
     "no-save": { type: "boolean", default: false },
     "script-timeout-ms": { type: "string", default: "30000" },
@@ -48,6 +49,11 @@ if (values.help) {
 const scriptTimeoutMs = Number(values["script-timeout-ms"]);
 if (!Number.isInteger(scriptTimeoutMs) || scriptTimeoutMs < 0) {
   log("--script-timeout-ms takes a whole number of milliseconds; 0 disables the limit");
+  process.exit(1);
+}
+const port = values.port === undefined ? DEFAULT_PORT : Number(values.port);
+if (!Number.isInteger(port) || port < 0 || port > 65535) {
+  log("--port takes a port number; 0 picks a free one");
   process.exit(1);
 }
 
@@ -78,24 +84,37 @@ function parseStoreys(text) {
 
 const host = createModelHost({ Kernel, save: !values["no-save"], log, version: packageVersion, scriptTimeoutMs, kernelModule });
 const file = positionals[0] ? resolve(positionals[0]) : null;
-if (file && (values.new || !existsSync(file))) {
-  if (existsSync(file) && !values.force) {
-    log(`${file} exists; pass --force to overwrite it, or drop --new to open it`);
+// A missing file is created, so a registered `--new house.ifc` reopens its model on the next start.
+if (file && (!existsSync(file) || (values.new && values.force))) {
+  if (!/\.ifc$/i.test(file)) {
+    log(`${file}: a new model needs a file name ending with .ifc`);
     process.exit(1);
   }
-  await host.newModel({ schema: values.schema, units: values.units, storeys: parseStoreys(values.storeys), name: positionals[0].replace(/\.ifc$/i, "") }, { path: file, force: true });
+  // The project and header carry the file name only, never the folders around it.
+  const name = basename(file).replace(/\.ifc$/i, "");
+  await host.newModel({ schema: values.schema, units: values.units, storeys: parseStoreys(values.storeys), name }, { path: file, force: true });
 } else if (file) {
   await host.openFile(file);
 }
 
 let viewer = null;
 if (!values["no-viewer"]) {
-  viewer = createViewerServer(host, { root, port: Number(values.port) || 0, log });
-  await viewer.listen();
-  log(`Viewer: ${viewer.url}/viewer/?session=file`);
+  viewer = createViewerServer(host, { root, port, log });
+  try {
+    await viewer.listen();
+  } catch (error) {
+    // Only the default port gives way, so two servers registered side by side both start.
+    if (error?.code !== "EADDRINUSE" || values.port !== undefined) {
+      log(`The viewer server could not listen on port ${port}: ${error?.message ?? error}. Choose another --port, 0 for a free one, or --no-viewer.`);
+      process.exit(1);
+    }
+    await viewer.listen(0);
+    log(`Port ${port} is in use; the viewer takes a free port instead`);
+  }
+  log(`Viewer: ${viewer.viewerUrl}`);
 }
 
-const server = createTessifcServer(host, { viewerUrl: viewer ? `${viewer.url}/viewer/?session=file` : null, version: packageVersion });
+const server = createTessifcServer(host, { viewerUrl: viewer?.viewerUrl ?? null, version: packageVersion });
 const transport = new StdioServerTransport();
 let closing = false;
 async function shutdown() {

@@ -10,6 +10,8 @@ const ENTITY = Symbol("entity");
 const DERIVED = Symbol("derived");
 const GUID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
 const MAX_OUTPUT = 64_000;
+// Captured at load: a host may take the global constructor away before scripts run.
+const ScriptFunction = Function;
 
 /** A reference to an entity by express id. */
 export class Ref {
@@ -875,7 +877,7 @@ export function runScript(engine, source, selection) {
   const selected = engine.resolve(selection);
   let compiled;
   try {
-    compiled = new Function("ifc", "selected", "selection", "print", `"use strict";\n${source}`);
+    compiled = new ScriptFunction("ifc", "selected", "selection", "print", `"use strict";\n${source}`);
   } catch (error) {
     return failure(engine, error, source);
   }

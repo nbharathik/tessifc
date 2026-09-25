@@ -7,6 +7,10 @@ assignees: ""
 ---
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
+<!-- A panic, hang or runaway memory use on crafted input is a security
+     issue. Report it privately through the Security tab ("Report a
+     vulnerability"), not in a public issue with the file attached. -->
+
 ## What happened
 
 <!-- One or two sentences. -->
@@ -36,10 +40,9 @@ paste here
 
 </details>
 
-<!-- If it panicked, paste the panic message and set RUST_BACKTRACE=1 first.
-     A panic in the parser is a security bug, not a correctness bug: it goes
-     straight to the top of the list. Mention if the file came from an
-     untrusted source. -->
+<!-- If it panicked on a file you made or trust, paste the panic message and
+     set RUST_BACKTRACE=1 first. If the input could be used against other
+     users, report it privately instead (see the note at the top). -->
 
 ## The file
 

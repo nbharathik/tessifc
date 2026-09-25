@@ -849,7 +849,8 @@ fn product_body_parts(
                 codes::NO_DRAWN_REPRESENTATION,
                 product.id(),
                 format!(
-                    "{} carries only representations this kernel does not draw,                      such as 2D annotation or grid axes",
+                    "{} carries only representations this kernel does not draw, \
+                     such as 2D annotation or grid axes",
                     product.class_name()
                 ),
             );
@@ -1649,7 +1650,8 @@ mod tests {
         assert_eq!(
             parts.len(),
             2,
-            "one colour per part: taking the first for the whole window paints              the glass in the frame's white and it stops being see-through"
+            "one colour per part: taking the first for the whole window paints \
+             the glass in the frame's white and it stops being see-through"
         );
         assert_eq!(parts[0].color, Rgba([255, 255, 255, 255]), "the frame");
         assert_eq!(parts[1].color, Rgba([0, 128, 191, 64]), "the glass");

@@ -259,7 +259,7 @@ shell.register([
   { id: "toggle-inspector", label: "Toggle the inspector", section: "Panels", hint: "\\", run: () => shell.togglePanel("inspector") },
   { id: "toggle-editor", label: "Toggle the edit panel", section: "Panels", hint: "E", run: () => setEditor(!shell.panelVisible("editor")) },
   { id: "toggle-session", label: "Toggle the session panel", section: "Panels", run: () => shell.togglePanel("session") },
-  { id: "session-script", label: "Python script panel", section: "Session", run: () => sessionPanel.open("script") },
+  { id: "session-script", label: "Script panel", section: "Session", run: () => sessionPanel.open("script") },
   { id: "session-assistant", label: "Assistant panel", section: "Session", run: () => sessionPanel.open("assistant") },
   { id: "properties", label: "Show properties", section: "Panels", run: () => shell.setInspectorPanel("properties") },
   { id: "element", label: "Show element details", section: "Panels", run: () => shell.setInspectorPanel("element") },
@@ -363,9 +363,11 @@ function syncAssistantFields() {
   $("set-assistant-model").placeholder = provider.model ?? "";
   $("set-assistant-url").value = settings.baseUrl;
   $("set-assistant-key").value = settings.key;
+  $("set-assistant-remember").checked = settings.remember;
   $("set-assistant-model-row").classList.toggle("hidden", settings.provider === "off");
   $("set-assistant-url-row").classList.toggle("hidden", settings.provider !== "compatible");
   $("set-assistant-key-row").classList.toggle("hidden", settings.provider === "off");
+  $("set-assistant-remember-row").classList.toggle("hidden", settings.provider === "off");
 }
 $("set-assistant-provider").addEventListener("change", (event) => {
   const provider = PROVIDERS[event.target.value] ?? PROVIDERS.off;
@@ -376,14 +378,18 @@ $("set-assistant-provider").addEventListener("change", (event) => {
 for (const [id, key] of [["set-assistant-model", "model"], ["set-assistant-url", "baseUrl"], ["set-assistant-key", "key"]]) {
   $(id).addEventListener("input", (event) => {
     assistant.update({ [key]: event.target.value.trim() });
+    // Keys are kept per provider and origin, so another URL shows its own.
+    if (key === "baseUrl") $("set-assistant-key").value = assistant.settings().key;
     sessionPanel.refresh();
   });
 }
+$("set-assistant-remember").addEventListener("change", (event) => assistant.update({ remember: event.target.checked }));
 $("assistant-settings").addEventListener("click", () => shell.openSettings());
 
 $("set-hidden").addEventListener("change", (event) => {
   state.settings.hideSemantic = event.target.checked;
   state.hiddenInstanceFlags = event.target.checked ? DEFAULT_HIDDEN_INSTANCE_FLAGS : 0;
+  saveSettings();
   if (!state.model) return;
   if (event.target.checked) {
     for (let record = 0; record < state.model.pack.instances.count; record += 1) {
@@ -392,7 +398,6 @@ $("set-hidden").addEventListener("change", (event) => {
       }
     }
   }
-  saveSettings();
   refreshVisibility();
 });
 
@@ -848,8 +853,9 @@ function startWorker() {
       finishLoading();
       restoreModelLabel();
       state.dismissLoadError = shell.toast(data.message, "error", 0);
-      state.loadOutcome = "failed";
-      setStatus(state.loadOutcome === "empty" ? "No drawable geometry" : "Conversion stopped", "err");
+      // A file that parsed but holds no entities is empty, not broken.
+      state.loadOutcome = data.empty ? "empty" : "failed";
+      setStatus(data.empty ? "No drawable geometry" : "Conversion stopped", "err");
     } else if (data.type === "result") {
       showResult(data);
     }
@@ -1898,6 +1904,8 @@ $("set-motion-lod").checked = state.settings.motionLod;
 renderer.setTextures?.(state.settings.textures);
 $("set-textures").checked = state.settings.textures;
 $("set-script-timeout").value = String(state.settings.scriptTimeoutMs);
+$("set-hidden").checked = state.settings.hideSemantic;
+state.hiddenInstanceFlags = state.settings.hideSemantic ? DEFAULT_HIDDEN_INSTANCE_FLAGS : 0;
 tools.reset(false);
 tree.clear();
 enableModelCommands(false);

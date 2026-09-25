@@ -10,17 +10,19 @@ bug to report; the developer preview is not a proof against every malformed file
 Malformed, truncated or hostile input yields whatever was readable plus
 diagnostics saying what went wrong.
 
-```rust
+```rust no_run
 use tessifc_step::{ParseOptions, parse};
 
-let bytes = std::fs::read("model.ifc")?;
-let image = parse(&bytes, &ParseOptions::default());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("model.ifc")?;
+    let image = parse(&bytes, &ParseOptions::default());
 
-println!("{} instances, schema {}", image.len(), image.schema);
-for d in image.diagnostics.items() {
-    println!("{d}");
+    println!("{} instances, schema {}", image.len(), image.schema);
+    for d in image.diagnostics.items() {
+        println!("{d}");
+    }
+    Ok(())
 }
-# Ok::<(), std::io::Error>(())
 ```
 
 What it handles: complex instances, the string escapes `''`, `\X\`, `\X2\`,

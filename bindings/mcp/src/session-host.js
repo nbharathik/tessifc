@@ -5,6 +5,7 @@
 //! mirror for verification. Every change goes through the session.
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { createEditingSession } from "@tessifc/edit/session";
@@ -152,22 +153,37 @@ export function createModelHost({ Kernel, settings = GEOMETRY_SETTINGS, save = t
     return { revision: session.revision, version, generation, info, products: initial.pack.instances.count };
   }
 
-  async function openFile(file) {
+  /** Refuse to drop edits that are in no file, unless `force` says to. */
+  function guardUnsaved(force) {
+    if (!force && session && session.revision !== "0" && savedVersion !== version) {
+      throw new Error("The current model has changes that are not saved to a file; export it first, or pass force to drop them.");
+    }
+  }
+
+  /**
+   * Open an IFC file and follow it; `force` drops unsaved changes to the current model.
+   * @param {string} file
+   * @param {{ force?: boolean }} [options]
+   */
+  async function openFile(file, { force = false } = {}) {
+    guardUnsaved(force);
     const target = resolve(file);
     const data = await readFile(target);
     return openBytes(new Uint8Array(data), { name: basename(target), path: target });
   }
 
   /**
-   * A model from nothing (see `createModel`); `path` is where it will be saved.
+   * A model from nothing (see `createModel`); `path` is where it will be saved
+   * and must end with `.ifc`. An existing file, or unsaved changes to the
+   * current model, are replaced only with `force`.
    * @param {import("@tessifc/edit/create-model").ModelOptions} [options]
    * @param {{ path?: string | null, force?: boolean }} [target]
    */
   async function newModel(options = {}, { path: file = null, force = false } = {}) {
-    if (session && !path && session.revision !== "0" && !force) {
-      throw new Error("The current model is not saved to a file; pass force to drop its changes.");
-    }
     const target = file ? resolve(file) : null;
+    if (target && !/\.ifc$/i.test(target)) throw new Error("The path must end with .ifc");
+    if (target && !force && existsSync(target)) throw new Error(`${target} exists; pass force to overwrite it, or open it with open_model.`);
+    guardUnsaved(force);
     const created = createModel(options);
     const opened = openBytes(created, { name: target ? basename(target) : `${options.name ?? "New project"}.ifc`, path: target });
     savedVersion = null;

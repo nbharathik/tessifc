@@ -25,6 +25,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 use std::collections::HashMap;
 use std::mem::size_of;
 
@@ -794,7 +798,8 @@ impl IgpWriter {
              \"class_id\":{{\"off\":{class_id_at},\"type\":\"u16\"}},\
              \"transform\":{{\"off\":{transform_at},\"type\":\"f32x16\"}},\
              \"color\":{{\"off\":{color_at},\"type\":\"u8x4\"}},\
-             \"flags\":{{\"off\":{flags_at},\"type\":\"u16\"}},             \"provenance\":{{\"off\":{provenance_at},\"type\":\"u32\"}}{}}},",
+             \"flags\":{{\"off\":{flags_at},\"type\":\"u16\"}},\
+             \"provenance\":{{\"off\":{provenance_at},\"type\":\"u32\"}}{}}},",
             match material_at {
                 Some(at) => format!(",\"material\":{{\"off\":{at},\"type\":\"u32\"}}"),
                 None => String::new(),
@@ -1381,6 +1386,55 @@ mod tests {
                 .unwrap()
                 .contains("quoted")
         );
+    }
+
+    #[test]
+    fn the_index_has_no_whitespace_outside_its_strings() {
+        let mut writer = IgpWriter::new("IFC4", 1.0);
+        let (positions, indices) = triangle();
+        let geometry = writer.add_geometry(&positions, &indices);
+        let material = writer.add_material(MaterialRecord {
+            color: [1, 2, 3, 255],
+            diffuse: Some([0.5, 0.5, 0.5]),
+            specular: None,
+            shininess: Some(8.0),
+            roughness: None,
+            reflectance: Some("BLINN".into()),
+            texture: None,
+            source: 9,
+        });
+        writer.add_instance(Instance {
+            material: Some(material),
+            ..instance(geometry, 1, "IfcWall")
+        });
+        writer.add_diagnostic(DiagnosticRecord {
+            express_id: None,
+            line: 0,
+            severity: "info".into(),
+            code: "W_TEST".into(),
+            message: "words  with   spaces".into(),
+        });
+        writer.set_stat("products", 1.0);
+        let bytes = writer.finish();
+        let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let json = std::str::from_utf8(&bytes[24..24 + json_len]).unwrap();
+
+        let mut in_string = false;
+        let mut escaped = false;
+        for (at, ch) in json.char_indices() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
+                }
+            } else if ch == '"' {
+                in_string = true;
+            } else {
+                assert!(!ch.is_whitespace(), "whitespace at {at}: {json}");
+            }
+        }
     }
 
     #[test]

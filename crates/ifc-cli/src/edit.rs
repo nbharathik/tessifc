@@ -15,7 +15,7 @@ pub(crate) struct Options<'a> {
 }
 
 pub(crate) fn run(input: &Path, output: &Path, options: Options<'_>) -> ExitCode {
-    if same_path(input, output) {
+    if crate::same_path(input, output) {
         eprintln!(
             "refusing to overwrite the input IFC; choose a different --output so the original remains recoverable"
         );
@@ -118,10 +118,4 @@ pub(crate) fn run(input: &Path, output: &Path, options: Options<'_>) -> ExitCode
         output.display()
     );
     ExitCode::SUCCESS
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
-    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
-    left == right
 }

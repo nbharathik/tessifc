@@ -34,7 +34,7 @@ let stderr = "";
 const viewerUrl = new Promise((done) => {
   transport.stderr.on("data", (chunk) => {
     stderr += chunk;
-    const match = /Viewer: (http:\/\/127\.0\.0\.1:\d+\/viewer\/\?session=file)/.exec(stderr);
+    const match = /Viewer: (http:\/\/127\.0\.0\.1:\d+\/viewer\/\?session=file#token=[\w-]+)/.exec(stderr);
     if (match) done(match[1]);
   });
 });
@@ -56,7 +56,15 @@ try {
   assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "0");
   assert.equal(await page.evaluate(() => window.__tessifc.pack().instances.count), 0);
   assert.match(await page.textContent("#status-text"), /Empty model/);
+  assert.ok(!page.url().includes("token="), "the page removes the token from the address bar");
   console.log("ok the viewer opens the empty model the host created");
+
+  // A new tab without the token gets nothing from the host and says where to go.
+  const tokenless = await browser.newPage({ viewport: { width: 800, height: 600 } });
+  await tokenless.goto(url.split("#")[0]);
+  await tokenless.waitForFunction(() => /address the session server printed/.test(document.querySelector("#status-text")?.textContent ?? ""), null, { timeout: 60000 });
+  await tokenless.close();
+  console.log("ok a session page opened without the token says to open the printed address");
 
   const wall = text(await client.callTool({ name: "edit_model", arguments: { script: 'const w = ifc.addWall({ from: [0, 0], to: [6, 0], height: 3, thickness: 0.3, name: "South wall" }); print(w.id);', summary: "South wall" } }));
   assert.equal(wall.revision, "1");

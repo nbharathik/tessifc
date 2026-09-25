@@ -60,7 +60,13 @@ class McpTransportTests(unittest.TestCase):
                     self.assertEqual(sorted(tool.inputSchema.get("properties", {}).keys()), sorted(spec["input"]["properties"]), tool.name)
                     self.assertEqual(sorted(tool.inputSchema.get("required", [])), sorted(spec["input"]["required"]), tool.name)
 
+                inspect_tool = next(tool for tool in listed.tools if tool.name == "inspect_model")
+                self.assertIn("discarded", inspect_tool.description)
+                self.assertIn("Not a sandbox", inspect_tool.description)
+                self.assertNotIn("read-only", inspect_tool.description)
+
                 described = text(await session.call_tool("describe_model", {}))
+                self.assertRegex(described["viewer"]["url"], r"^http://127\.0\.0\.1:\d+/viewer/\?session=file#token=[\w-]{20,}$")
                 self.assertEqual(described["revision"], "0")
                 self.assertEqual([item["name"] for item in described["storeys"]], ["Ground floor", "Upper floor"])
                 for key in CONTRACT["tools"]["describe_model"]["result"]:
@@ -116,6 +122,15 @@ print(wall.id())
                 self.assertEqual(selection["ids"], [])
                 examples = text(await session.call_tool("list_examples", {}))
                 self.assertTrue(any(example["title"] == "Add a door to a wall" for example in examples["examples"]))
+
+                overwrite = await session.call_tool("new_model", {"name": "Clobber", "path": str(copy)})
+                self.assertTrue(overwrite.isError)
+                self.assertIn("exists", text(overwrite)["error"])
+                self.assertEqual(copy.stat().st_size, exported["bytes"])
+                outside = await session.call_tool("new_model", {"name": "Profile", "path": str(directory / "profile.txt")})
+                self.assertTrue(outside.isError)
+                self.assertIn(".ifc", text(outside)["error"])
+                self.assertFalse((directory / "profile.txt").exists())
 
                 second = directory / "second.ifc"
                 fresh = text(await session.call_tool("new_model", {"name": "Second", "path": str(second)}))

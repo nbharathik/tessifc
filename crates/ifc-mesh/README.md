@@ -16,6 +16,7 @@ let mesh = Mesh64 {
     positions: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
     indices: vec![0, 1, 2],
     closed: Some(false),
+    uvs: Vec::new(),
 };
 let normals = face_normals(&mesh);
 assert_eq!(normals, vec![DVec3::Z]);
@@ -24,13 +25,13 @@ assert_eq!(normals, vec![DVec3::Z]);
 A coarse level for a large mesh, over the mesh's own vertices:
 
 ```rust
-use tessifc_mesh::{DecimateOptions, decimate};
+use tessifc_mesh::{DecimateOptions, Mesh64, decimate};
 
-let options = DecimateOptions { target_ratio: 0.25, tolerance: 0.01, max_triangles: 1_000_000 };
-// `None` when the mesh is small, cannot lose a quarter of its triangles
-// within the tolerance, or is not a valid triangle list.
-if let Some(coarse) = decimate(&mesh, &options) {
-    assert!(coarse.len() < mesh.indices.len());
+fn coarse_level(mesh: &Mesh64) -> Option<Vec<u32>> {
+    let options = DecimateOptions { target_ratio: 0.25, tolerance: 0.01, max_triangles: 1_000_000 };
+    // `None` when the mesh is small, cannot lose a quarter of its triangles
+    // within the tolerance, or is not a valid triangle list.
+    decimate(mesh, &options)
 }
 ```
 

@@ -215,7 +215,9 @@ release; the IGP document describes the members it adds.
 
 CLI flags `--circle-segments` and `--chord-tolerance-m` override their JSON fields.
 `convert --strict` returns failure and does not write the requested pack when
-loss or approximation diagnostics are present. Its JSON report says `output_written`.
+a selected product produced no geometry or when any diagnostic is present
+other than a short list of informational codes, which the CLI README names.
+Its JSON report says `output_written`.
 
 Every included helper product carries an IGP instance flag. A viewer can keep
 the geometry available for inspection while excluding it from its initial
@@ -585,8 +587,9 @@ reports `timedOut` and changes nothing. As a library,
 kernel, the session, the saved file and a scene mirror, with the limit active
 when `kernelModule` names the Node kernel;
 `createViewerServer(host, { root, port })` is the loopback server the viewer
-follows; `createTessifcServer(host)` is the MCP server for a transport of
-your choice. The package README lists the flags and the tools.
+follows, and its `viewerUrl` the address to open, token included;
+`createTessifcServer(host)` is the MCP server for a transport of your choice.
+The package README lists the flags and the tools.
 
 ### The embeddable viewer
 
@@ -630,7 +633,9 @@ and `viewer.applyDelta(delta)` applies any delta while keeping selection and
 visibility by GlobalId and emits `revision`. `viewer.follow(baseUrl)` runs the
 session client against `tessifc-mcp` or the Python session server, opening
 or applying every published version and emitting `session` with the host's
-status; `unfollow()` stops it. `createSessionClient` from
+status; `unfollow()` stops it. A page opened at the address the host printed
+takes the host's token from its `#token=`; `follow({ baseUrl, token })`
+passes one explicitly. `createSessionClient` from
 `@tessifc/viewer/session-client` is that client on its own, for a page that
 wants to send scripts, undo, redo or the selection to the host.
 
@@ -684,14 +689,16 @@ a valid owner history. `tessifc_session.model.create_model(schema, name=,
 units=, site=, building=, storeys=)` writes the same skeleton as
 `createModel` in JavaScript, and `write_model(model, path)` saves atomically.
 
-The server exposes the session on the loopback interface. Every command needs
-the `X-Tessifc-Token` header carried by the status response, and a matching
-`Origin` header. `tessifc-mcp` speaks the same protocol, so one viewer client
-follows either.
+The server exposes the session on the loopback interface. Every
+`/__tessifc/` request needs the `X-Tessifc-Token` header, and every POST a
+matching `Origin` header as well. No response carries the token: the host
+prints the viewer address with it in the fragment
+(`/viewer/?session=file#token=...`), and the page reads it from there.
+`tessifc-mcp` speaks the same protocol, so one viewer client follows either.
 
 | Route | Effect |
 |---|---|
-| `GET /__tessifc/session?after=<version>&timeout=<s>` | Status JSON: `name`, `version`, `revision`, `generation`, `busy`, `undo`, `redo`, `capabilities` (`authoring` is `"python"`, `"javascript"` or `false`, plus `assistant`, `selection`, `applied`), `examples` and `token`. With `after`, it waits until the version changes or the timeout passes. A changed `generation` means the host opened another file. |
+| `GET /__tessifc/session?after=<version>&timeout=<s>` | Status JSON: `name`, `version`, `revision`, `generation`, `busy`, `undo`, `redo`, `capabilities` (`authoring` is `"python"`, `"javascript"` or `false`, plus `assistant`, `selection`, `applied`) and `examples`. With `after`, it waits until the version changes or the timeout passes. A changed `generation` means the host opened another file. |
 | `GET /__tessifc/model.ifc?version=<version>` | The snapshot bytes for that version, or 409 when the content moved on. |
 | `POST /__tessifc/run` | `{ "script": "...", "selection": { "guids": [], "ids": [] } }` runs a script; the result is the `run_script` record plus `status`. |
 | `POST /__tessifc/undo`, `POST /__tessifc/redo` | Publish the previous or restored content. |
@@ -710,6 +717,7 @@ The assistant provider is selected with `--assistant anthropic`, `fake` or
 `pip install anthropic`. `--model` and `--effort` pass through to the request.
 `--mcp` speaks MCP on stdin and stdout for an agent while the viewer server
 keeps running, `--new` creates the file first (`--schema`, `--storeys`).
+Without `--port` the server takes 8000, or a free port when 8000 is taken.
 Scripts run in the session process without a sandbox and without a time
 limit.
 

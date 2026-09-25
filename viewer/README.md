@@ -55,7 +55,8 @@ Session panel's examples add a door, raise or move the selection, build a
 small house and more, straight in the browser. A local Python session runs
 IfcOpenShell scripts and picks up saved revisions from any process, and
 `node bindings/mcp/src/cli.js --new house.ifc` serves an empty model that an
-agent fills while this page follows (`?session=file`); see the
+agent fills while this page follows at the address the server prints
+(`?session=file#token=...`); see the
 [agent-building example](../examples/agent-building/README.md). Geometry
 updates preserve the camera and valid selection; changes with global effects
 use a full rebuild. See [editing](../docs/editing.md) for the revision and

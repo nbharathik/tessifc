@@ -22,13 +22,14 @@ try {
   let errors = "";
   let output = "";
   child.stderr.on("data", (chunk) => { errors += chunk; });
-  const origin = await new Promise((resolve, reject) => {
+  // The printed address carries the session token in its fragment.
+  const address = await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`File session did not start: ${errors}`)), 30000);
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
     child.once("exit", (code) => { clearTimeout(timeout); reject(new Error(`File session exited ${code}: ${errors}`)); });
     child.stdout.on("data", (chunk) => {
       output += chunk;
-      const match = output.match(/Open (http:\/\/127\.0\.0\.1:\d+)/);
+      const match = output.match(/Open (http:\/\/127\.0\.0\.1:\d+\/viewer\/\?session=file#token=[\w-]+)/);
       if (match) { clearTimeout(timeout); resolve(match[1]); }
     });
   });
@@ -39,9 +40,10 @@ try {
   await instrumentViewer(page);
   const problems = [];
   page.on("pageerror", (error) => problems.push(error.message));
-  await page.goto(`${origin}/viewer/?session=file`);
+  await page.goto(address);
   await page.waitForFunction(() => window.__tessifc?.ready(), null, { timeout: 60000 });
   assert.equal(await page.evaluate(() => window.__tessifc.state.model.revision), "0");
+  assert.ok(!page.url().includes("token="), "the page removes the token from the address bar");
   const revision = (value) => page.waitForFunction((expected) => window.__tessifc.state.model.revision === expected, value, { timeout: 60000 });
 
   async function save(next) {

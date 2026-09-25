@@ -37,7 +37,9 @@ test and the agent brief expect.
 claude mcp add tessifc -- node bindings/mcp/src/cli.js --new house.ifc
 ```
 
-Start a conversation, open the viewer address the server prints on start, and
+Start a conversation, open the viewer address the server prints on start
+exactly as printed (its `#token=` part is the session's key; when the client
+hides stderr, `describe_model` returns the address), and
 ask for the `build-a-building` prompt (or say: "build a small two-storey house
 in the open model, one step at a time, and verify it at the end"). The server
 exposes `describe_model`, `inspect_model`, `edit_model`, `undo`, `redo`,

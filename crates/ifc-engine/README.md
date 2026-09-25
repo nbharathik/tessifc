@@ -8,21 +8,27 @@ which products to evaluate, evaluates them, in batches or all at once and on
 one core or every core, and collects shapes and diagnostics in a fixed order
 so geometry order is reproducible. Timing metadata and stream boundaries can differ.
 
-```rust
+```rust no_run
 use tessifc_engine::Engine;
 use tessifc_model::Model;
 use tessifc_step::{ParseOptions, parse};
 
-let bytes = std::fs::read("model.ifc")?;
-let model = Model::new(parse(&bytes, &ParseOptions::default()));
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("model.ifc")?;
+    let model = Model::new(parse(&bytes, &ParseOptions::default()));
 
-let result = Engine::new().evaluate(&model);
-println!("{} shapes, {} triangles, offset {:?}",
-    result.shapes.len(), result.triangles(), result.model_offset);
-for diagnostic in &result.diagnostics {
-    println!("{diagnostic}");
+    let result = Engine::new().evaluate(&model);
+    println!(
+        "{} shapes, {} triangles, offset {:?}",
+        result.shapes.len(),
+        result.triangles(),
+        result.model_offset
+    );
+    for diagnostic in &result.diagnostics {
+        println!("{diagnostic}");
+    }
+    Ok(())
 }
-# Ok::<(), std::io::Error>(())
 ```
 
 ## Streaming
@@ -35,15 +41,16 @@ the caller brings its own clock:
 
 ```rust
 use tessifc_engine::Engine;
-# use tessifc_model::Model;
-# use tessifc_step::{ParseOptions, parse};
-# let model = Model::new(parse(b"", &ParseOptions::default()));
-let engine = Engine::new();
-let mut session = engine.session(&model);
-while !session.is_finished() {
-    let batch = session.next(&model, |progress| progress.triangles >= 200_000);
-    // batch.shapes are ready to pack or draw; batch.is_final says when to stop
-    let _ = batch;
+use tessifc_model::Model;
+
+fn stream(model: &Model) {
+    let engine = Engine::new();
+    let mut session = engine.session(model);
+    while !session.is_finished() {
+        let batch = session.next(model, |progress| progress.triangles >= 200_000);
+        // batch.shapes are ready to pack or draw; batch.is_final says when to stop
+        let _ = batch;
+    }
 }
 ```
 
@@ -57,7 +64,9 @@ agree on it.
 The `pack` module turns shapes into IGP: `Packer::new(schema, length_to_m,
 model_offset)`, then `add_shape` per shape, `add_diagnostics`, `set_stat`,
 and `finish()` for the bytes. A `PackState` carries geometry ids and the
-shared-family table across the chunks of a stream.
+shared-family table across the chunks of a stream. What the packer itself
+leaves out, such as a part whose coordinates do not survive f32, is written
+into the pack and handed back by `diagnostics()`.
 
 ## Parallelism
 

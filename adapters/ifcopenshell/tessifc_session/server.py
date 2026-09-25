@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import mimetypes
 import secrets
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,9 +21,21 @@ MAX_WAIT_SECONDS = 25.0
 STATIC_SUFFIXES = {".html", ".js", ".css", ".wasm", ".svg"}
 
 
+class LoopbackServer(ThreadingHTTPServer):
+    """The HTTP server with a port that stays exclusive on Windows too."""
+
+    # On Windows SO_REUSEADDR lets a second server bind a port that is in use.
+    allow_reuse_address = sys.platform != "win32"
+    daemon_threads = True
+
+
 def create_server(session: EditSession, port: int = 8000, *, root: Path, assistant: Assistant | None = None,
                   static_roots=("viewer", "bindings/wasm/pkg", "bindings/edit/src", "bindings/viewer/src")):
-    """A loopback-only server; `root` is the checkout that holds the viewer and the WASM package."""
+    """A loopback-only server; `root` is the checkout that holds the viewer and the WASM package.
+
+    Every `/__tessifc/` route needs the `X-Tessifc-Token` header. The server's
+    `viewer_url` is the address to open, with the token in its fragment.
+    """
     token = secrets.token_urlsafe(24)
     allowed = tuple((Path(root) / name).resolve() for name in static_roots)
 
@@ -32,6 +46,8 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
             if not self.check_origin():
                 return
             target = urlsplit(self.path)
+            if target.path.startswith("/__tessifc/") and not self.check_token():
+                return
             query = parse_qs(target.query)
             if target.path == "/__tessifc/session":
                 after = query.get("after", [None])[0]
@@ -48,9 +64,7 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
                     self.send_error(503, "IFC snapshot not ready")
                     return
                 session.viewer_seen = time.time()
-                status = session.describe(assistant)
-                status["token"] = token
-                self.respond_json(status)
+                self.respond_json(session.describe(assistant))
             elif target.path == "/__tessifc/model.ifc":
                 try:
                     version, payload = session.snapshot()
@@ -70,10 +84,7 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
                 self.serve_static(target.path)
 
         def do_POST(self):
-            if not self.check_origin(require_origin=True):
-                return
-            if self.headers.get("X-Tessifc-Token") != token:
-                self.send_error(403, "Missing session token")
+            if not self.check_origin(require_origin=True) or not self.check_token():
                 return
             target = urlsplit(self.path)
             try:
@@ -134,6 +145,13 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
                 return False
             return True
 
+        def check_token(self) -> bool:
+            given = (self.headers.get("X-Tessifc-Token") or "").encode("utf-8")
+            if hmac.compare_digest(given, token.encode("ascii")):
+                return True
+            self.send_error(403, "Missing session token")
+            return False
+
         def read_json(self) -> dict:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -183,7 +201,7 @@ def create_server(session: EditSession, port: int = 8000, *, root: Path, assista
             if not str(args[1] if len(args) > 1 else "").startswith(("2", "3")):
                 super().log_message(format, *args)
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    server.daemon_threads = True
+    server = LoopbackServer(("127.0.0.1", port), Handler)
     server.session_token = token
+    server.viewer_url = f"http://127.0.0.1:{server.server_port}/viewer/?session=file#token={token}"
     return server

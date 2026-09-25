@@ -105,6 +105,87 @@ fn flags_override_json_and_effective_settings_are_reported() {
     assert_eq!(report["product_outcomes"][0]["state"], "emitted");
 }
 
+/// The JSON index of an IGP pack.
+fn pack_index(bytes: &[u8]) -> serde_json::Value {
+    let json_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    serde_json::from_slice(&bytes[24..24 + json_len]).unwrap()
+}
+
+#[test]
+fn coarse_levels_in_the_settings_reach_the_pack() {
+    let fixture = Fixture::new();
+    let levels = |settings: &str| {
+        let output = fixture.run(&["--circle-segments", "512", "--settings", settings]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let index = pack_index(&std::fs::read(fixture.0.join("output.igp")).unwrap());
+        index["geometries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|geometry| geometry.get("lod").is_some())
+            .count()
+    };
+    assert_eq!(levels("{}"), 0);
+    assert_eq!(levels(r#"{"lodLevels":2}"#), 2);
+}
+
+#[test]
+fn convert_refuses_to_write_over_its_input() {
+    let fixture = Fixture::new();
+    let input = fixture.0.join("input.ifc");
+    let before = std::fs::read(&input).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tessifc"))
+        .arg("convert")
+        .arg(&input)
+        .arg("--output")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+}
+
+#[test]
+fn a_product_that_evaluates_to_nothing_is_refused_by_strict() {
+    let fixture = Fixture::new();
+    // A face set whose only triangle repeats a vertex: no error, and no geometry.
+    std::fs::write(
+        fixture.0.join("input.ifc"),
+        concat!(
+            "ISO-10303-21;HEADER;FILE_SCHEMA(('IFC4'));ENDSEC;DATA;",
+            "#1=IFCCARTESIANPOINTLIST3D(((0.,0.,0.),(1.,0.,0.),(0.,1.,0.)));",
+            "#2=IFCTRIANGULATEDFACESET(#1,$,.F.,((1,1,2)),$);",
+            "#3=IFCSHAPEREPRESENTATION($,'Body','Tessellation',(#2));",
+            "#4=IFCPRODUCTDEFINITIONSHAPE($,$,(#3));",
+            "#5=IFCWALL('wall',$,$,$,$,$,#4,$,$);",
+            "ENDSEC;END-ISO-10303-21;"
+        ),
+    )
+    .unwrap();
+    let output = fixture.run(&[]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["products_with_geometry"], 0);
+    assert_eq!(report["product_outcomes"][0]["state"], "empty_or_failed");
+    let diagnostics = &report["diagnostics"];
+    let counted: u64 = diagnostics["by_code"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_u64().unwrap())
+        .sum();
+    assert_eq!(diagnostics["total"], counted);
+
+    let strict = fixture.run(&["--strict"]);
+    assert_eq!(strict.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&strict.stdout).unwrap();
+    assert_eq!(report["output_written"], false);
+}
+
 #[test]
 fn malformed_settings_fail_before_writing_a_pack() {
     let fixture = Fixture::new();

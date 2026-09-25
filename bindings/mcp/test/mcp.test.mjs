@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // The MCP server end to end over a spawned CLI: the tools match the contract,
-// a model is created, edited, undone, exported and verified, and a script
-// that never returns is stopped at the time limit.
+// a model is created, edited, undone, exported and verified, a script that
+// never returns is stopped at the time limit, and a restart with --new on a
+// taken default port opens the file on a free port.
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
+import { createServer as createNetServer } from "node:net";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -35,13 +37,14 @@ const transport = new StdioClientTransport({
   cwd: root,
 });
 const stderrLines = [];
-const viewerUrl = new Promise((done) => {
+const VIEWER_LINE = /Viewer: ((http:\/\/127\.0\.0\.1:(\d+))\/viewer\/\?session=file#token=([\w-]+))/;
+const printed = new Promise((done) => {
   transport.stderr.on("data", (chunk) => {
     for (const line of String(chunk).split(/\r?\n/)) {
       if (!line) continue;
       stderrLines.push(line);
-      const match = /Viewer: (http:\/\/127\.0\.0\.1:\d+)\//.exec(line);
-      if (match) done(match[1]);
+      const match = VIEWER_LINE.exec(line);
+      if (match) done(match);
     }
   });
 });
@@ -49,8 +52,13 @@ const client = new Client({ name: "tessifc-test", version: "0" });
 const text = (response) => JSON.parse(response.content[0].text);
 try {
   await client.connect(transport);
-  const base = await viewerUrl;
-  ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(base), "the CLI prints the viewer address on stderr");
+  const [, viewerUrl, base, , token] = await printed;
+  ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(base) && token.length >= 20, "the CLI prints the viewer address with the token in its fragment on stderr");
+  const session = (query = "") => fetch(`${base}/__tessifc/session${query}`, { headers: { "x-tessifc-token": token } });
+  ok((await fetch(`${base}/__tessifc/session`)).status === 403, "the status needs the token");
+  const created = readFileSync(file, "latin1");
+  ok(created.includes("FILE_NAME('house.ifc'") && /IFCPROJECT\('[^']*',(\$|#\d+),'house'/.test(created) && !created.includes("tessifc-mcp-"),
+    "the new file names its project and header after the file, without the folders");
 
   const { tools } = await client.listTools();
   const names = tools.map((tool) => tool.name).sort();
@@ -70,8 +78,11 @@ try {
   ok(/ifc\.addWall/.test(api.contents[0].text), "the script API resource documents the building helpers");
 
   const described = text(await client.callTool({ name: "describe_model", arguments: {} }));
-  ok(described.open && described.revision === "0" && described.storeys.length === 2 && described.lengthUnit === "m" && described.viewer.url.startsWith(base),
-    "describe_model reports the new model, its storeys and the viewer");
+  ok(described.open && described.revision === "0" && described.storeys.length === 2 && described.lengthUnit === "m" && described.viewer.url === viewerUrl,
+    "describe_model reports the new model, its storeys and the viewer address to open");
+  const inspectTool = tools.find((tool) => tool.name === "inspect_model");
+  ok(/discarded/.test(inspectTool.description) && /not a sandbox/i.test(inspectTool.description) && !/read-only/i.test(inspectTool.description),
+    "inspect_model says its edits are discarded but it is not a sandbox");
   for (const key of contract.tools.describe_model.result) assert.ok(key in described, `describe_model result has ${key}`);
 
   const inspected = text(await client.callTool({ name: "inspect_model", arguments: { code: 'print(ifc.storeys().map((s) => s.Name).join("|"))' } }));
@@ -86,8 +97,8 @@ try {
   ok(edited.structuredContent?.revision === "1", "the structured content carries the same record");
   const after = readFileSync(file);
   ok(after.length > before.length && after.toString("latin1").includes("'South wall'"), "the file on disk carries the wall");
-  const status = await (await fetch(`${base}/__tessifc/session`)).json();
-  ok(status.revision === "1" && status.capabilities.authoring === "javascript", "the viewer route reports the new revision");
+  const status = await (await session()).json();
+  ok(status.revision === "1" && status.capabilities.authoring === "javascript" && !("token" in status), "the viewer route reports the new revision");
 
   const failing = await client.callTool({ name: "edit_model", arguments: { script: "missing()" } });
   ok(failing.isError && /ReferenceError/.test(text(failing).error) && text(failing).revision === "1", "a failing script is an error result and publishes nothing");
@@ -101,7 +112,7 @@ try {
     && loop.saved === false && performance.now() - loopStarted < 10000, "an endless edit_model is stopped at the limit, reports timedOut and changes nothing");
   ok(text(await client.callTool({ name: "describe_model", arguments: {} })).revision === "1" && readFileSync(file).toString("latin1").includes("'South wall'")
     && !readFileSync(file).toString("latin1").includes("'never'"), "the model and the file are as before the stopped script");
-  const status2 = await (await fetch(`${base}/__tessifc/session`)).json();
+  const status2 = await (await session()).json();
   ok(status2.busy === false && status2.capabilities.scriptTimeoutMs === 500, "the host is not busy afterwards and reports the limit");
   const peek = text(await client.callTool({ name: "inspect_model", arguments: { code: 'print(ifc.byType("IfcWall").length)' } }));
   ok(peek.ok && peek.timedOut === false && peek.stdout === "1", "the next script runs on a fresh worker");
@@ -126,13 +137,49 @@ try {
   const examples = text(await client.callTool({ name: "list_examples", arguments: {} }));
   ok(examples.examples.some((example) => example.title === "Build a small house"), "the examples include the house");
 
+  const overwrite = await client.callTool({ name: "new_model", arguments: { name: "Clobber", path: join(dir, "copy.ifc") } });
+  const outside = await client.callTool({ name: "new_model", arguments: { name: "Profile", path: join(dir, "profile.txt") } });
+  ok(overwrite.isError && /exists/.test(text(overwrite).error) && readFileSync(join(dir, "copy.ifc")).length === exported.bytes
+    && outside.isError && /\.ifc/.test(text(outside).error) && !existsSync(join(dir, "profile.txt")), "new_model refuses an existing file and a path without .ifc");
   const fresh = text(await client.callTool({ name: "new_model", arguments: { name: "Second", path: join(dir, "second.ifc") } }));
   ok(fresh.revision === "0" && fresh.generation === 2 && existsSync(join(dir, "second.ifc")), "new_model starts a second generation saved to its file");
   const reopened = text(await client.callTool({ name: "open_model", arguments: { path: file } }));
   ok(reopened.generation === 3 && reopened.products === 1, "open_model reopens the first file with its wall");
 } finally {
   await client.close().catch(() => {});
-  rmSync(dir, { recursive: true, force: true });
 }
 ok(stderrLines.some((line) => /ready/.test(line)) && !stderrLines.some((line) => /^\{/.test(line)), "diagnostics went to stderr");
+
+/** Start the CLI without a client; resolve with its stderr once it is ready (code null), or with its exit code. */
+function start(args) {
+  return new Promise((done) => {
+    const child = spawn(process.execPath, [resolve(here, "../src/cli.js"), ...args], { cwd: root, stdio: ["pipe", "ignore", "pipe"] });
+    let errors = "";
+    let ready = false;
+    child.stderr.on("data", (chunk) => {
+      errors += chunk;
+      if (!ready && /\[tessifc-mcp\] ready/.test(errors)) {
+        ready = true;
+        child.kill();
+      }
+    });
+    child.once("exit", (code) => done({ errors, code: ready ? null : code }));
+  });
+}
+
+// Port 8000 is taken, by this test or by something else, for the next two starts.
+const holder = createNetServer();
+await new Promise((done) => holder.once("error", () => done()).listen(8000, "127.0.0.1", () => done()));
+try {
+  const again = await start([file, "--new", "--no-save"]);
+  const port = Number(VIEWER_LINE.exec(again.errors)?.[3]);
+  ok(again.code === null && /opened house\.ifc/.test(again.errors) && readFileSync(file, "latin1").includes("'South wall'"),
+    "a second start with --new opens the existing file instead of refusing or overwriting it");
+  ok(port > 0 && port !== 8000 && /Port 8000 is in use/.test(again.errors), "a taken default port falls back to a free one");
+  const strict = await start([file, "--port", "8000"]);
+  ok(strict.code === 1 && /--port/.test(strict.errors), "a taken --port is an error that names the flag");
+} finally {
+  holder.close(() => {});
+  rmSync(dir, { recursive: true, force: true });
+}
 console.log(`PASS ${passed} checks`);

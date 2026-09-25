@@ -6,13 +6,53 @@
 
 const WAIT_SECONDS = 20;
 const RETRY_MS = 1000;
+const TOKEN_KEY = "tessifc-session-token";
+const NO_TOKEN = "This page has no session token: open the address the session server printed.";
+const REFUSED = "The session refused this page: open the address the session server printed.";
+
+/**
+ * The session token this page was opened with. A `#token=` in the address is
+ * taken, removed from the address bar and kept for reloads of this tab.
+ * @returns {string | null}
+ */
+export function pageSessionToken() {
+  if (typeof location === "undefined") return null;
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  const given = fragment.get("token") || null;
+  try {
+    if (fragment.has("token")) {
+      fragment.delete("token");
+      const rest = fragment.toString();
+      history.replaceState(history.state, "", `${location.pathname}${location.search}${rest ? `#${rest}` : ""}`);
+    }
+    if (given) sessionStorage.setItem(TOKEN_KEY, given);
+    return given ?? sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    // Blocked storage: the token from the address still serves this load.
+    return given;
+  }
+}
+
+function samePage(baseUrl) {
+  if (!baseUrl) return true;
+  try {
+    return typeof location !== "undefined" && new URL(baseUrl, location.href).origin === location.origin;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Follow the session; `status` receives every server status seen. A changed
  * `generation` (the host opened another model) reopens instead of updating,
  * and hosts that ask for it get the applied report and the selection.
+ * `token` goes with every request; without one, a client of the page's own
+ * origin uses the token the page was opened with (see `pageSessionToken`).
+ * @param {{ baseUrl?: string, token?: string | null, fetch?: any, ready: any, loaded: any, open: any, update: any, report: any, status: any }} options
  */
-export function createSessionClient({ baseUrl = "", fetch: fetchImpl = globalThis.fetch.bind(globalThis), ready, loaded, open, update, report, status }) {
+export function createSessionClient({ baseUrl = "", token, fetch: fetchImpl = globalThis.fetch.bind(globalThis), ready, loaded, open, update, report, status }) {
+  const secret = token === undefined ? (samePage(baseUrl) ? pageSessionToken() : null) : token;
+  const auth = secret ? { "X-Tessifc-Token": secret } : {};
   let stopped = false;
   let version = null;
   let generation = null;
@@ -30,7 +70,8 @@ export function createSessionClient({ baseUrl = "", fetch: fetchImpl = globalThi
 
   async function fetchStatus(wait) {
     const query = wait && version ? `?after=${encodeURIComponent(version)}&timeout=${WAIT_SECONDS}` : "";
-    const response = await fetchImpl(`${baseUrl}/__tessifc/session${query}`, { cache: "no-store", signal: controller.signal });
+    const response = await fetchImpl(`${baseUrl}/__tessifc/session${query}`, { cache: "no-store", headers: auth, signal: controller.signal });
+    if (response.status === 403) throw new Error(REFUSED);
     if (!response.ok) throw new Error("The local IFC file session is unavailable.");
     const session = await response.json();
     known = session;
@@ -56,11 +97,13 @@ export function createSessionClient({ baseUrl = "", fetch: fetchImpl = globalThi
     try {
       if (!ready()) return;
       idle = false;
+      if (!secret) throw new Error(NO_TOKEN);
       const session = await fetchStatus(true);
       if (session.version === version) return;
       const source = await fetchImpl(`${baseUrl}/__tessifc/model.ifc?version=${encodeURIComponent(session.version)}`,
-        { cache: "no-store", signal: controller.signal });
+        { cache: "no-store", headers: auth, signal: controller.signal });
       if (source.status === 409) return;
+      if (source.status === 403) throw new Error(REFUSED);
       if (!source.ok) throw new Error("The edited IFC snapshot is unavailable.");
       const file = new File([await source.arrayBuffer()], session.name, { type: "application/octet-stream" });
       if (stopped || !ready()) return;
@@ -91,19 +134,21 @@ export function createSessionClient({ baseUrl = "", fetch: fetchImpl = globalThi
   }
 
   async function post(path, body) {
-    if (!known?.token) throw new Error("The editing session is not connected.");
+    if (!secret) throw new Error(NO_TOKEN);
+    if (!known) throw new Error("The editing session is not connected.");
     const marker = sequence;
     const response = await fetchImpl(`${baseUrl}/__tessifc/${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Tessifc-Token": known.token },
+      headers: { "Content-Type": "application/json", ...auth },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (response.status === 204) return { marker };
+    if (response.status === 403) throw new Error(REFUSED);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error ?? `The session returned ${response.status}.`);
     if (payload.status) {
-      known = { ...payload.status, token: known.token };
+      known = payload.status;
       status?.(known);
     }
     payload.marker = marker;

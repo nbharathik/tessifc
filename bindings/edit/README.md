@@ -60,8 +60,9 @@ from `@tessifc/edit/providers` are `complete` functions for the two common
 wire formats, `describeModel(session)` builds the context, and
 `verifyRevision` from `@tessifc/edit/verify` checks the scene built from the
 deltas against a fresh evaluation of the exported file. The [SDK
-page](../../docs/sdk.md) documents every module and the script API; [Agents
-and pipelines](../../docs/agents.md) shows the loop, the MCP server that
+page](https://github.com/nbharathik/tessifc/blob/main/docs/sdk.md) documents
+every module and the script API; [Agents and
+pipelines](https://github.com/nbharathik/tessifc/blob/main/docs/agents.md) shows the loop, the MCP server that
 packages it and how a renderer applies a delta.
 
 Scripts run with your program's permissions and without a sandbox.

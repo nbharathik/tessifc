@@ -58,7 +58,7 @@ let viewer = null;
 if (values.serve) {
   viewer = createViewerServer(host, { root, port: Number(values.port) || 0 });
   await viewer.listen();
-  console.log(`Open ${viewer.url}/viewer/?session=file to watch`);
+  console.log(`Open ${viewer.viewerUrl} to watch`);
 }
 
 const transcript = { provider: values.provider, model, file, startedAt: new Date().toISOString(), turns: [] };

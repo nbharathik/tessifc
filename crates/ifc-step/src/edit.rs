@@ -226,9 +226,9 @@ fn argument_span(
 ) -> Result<Range<usize>, EditError> {
     let record_start = entry.source_off as usize;
     let record_end = record_start + entry.source_len as usize;
-    let mut at = record_start;
+    let unsupported = || EditError::UnsupportedValue(entry.express_id);
 
-    at = skip_trivia(source, at, record_end);
+    let mut at = skip_trivia(source, record_start, record_end).ok_or_else(unsupported)?;
     if source.get(at) != Some(&b'#') {
         return Err(EditError::SourceMismatch);
     }
@@ -236,17 +236,16 @@ fn argument_span(
     while source.get(at).is_some_and(u8::is_ascii_digit) {
         at += 1;
     }
-    at = skip_trivia(source, at, record_end);
+    at = skip_trivia(source, at, record_end).ok_or_else(unsupported)?;
     if source.get(at) != Some(&b'=') {
         return Err(EditError::SourceMismatch);
     }
-    at = skip_trivia(source, at + 1, record_end);
+    at = skip_trivia(source, at + 1, record_end).ok_or_else(unsupported)?;
     if source.get(at) == Some(&b'(') {
         return Err(EditError::ComplexInstance(entry.express_id));
     }
-    at = scan_keyword(source, at, record_end)
-        .ok_or(EditError::UnsupportedValue(entry.express_id))?;
-    at = skip_trivia(source, at, record_end);
+    at = scan_keyword(source, at, record_end).ok_or_else(unsupported)?;
+    at = skip_trivia(source, at, record_end).ok_or_else(unsupported)?;
     if source.get(at) != Some(&b'(') {
         return Err(EditError::SourceMismatch);
     }
@@ -260,21 +259,21 @@ fn list_argument_span(
     wanted: usize,
     express_id: u32,
 ) -> Result<Range<usize>, EditError> {
+    let unsupported = || EditError::UnsupportedValue(express_id);
     let mut at = open + 1;
     let mut index = 0usize;
     loop {
-        at = skip_trivia(source, at, limit);
+        at = skip_trivia(source, at, limit).ok_or_else(unsupported)?;
         if source.get(at) == Some(&b')') {
             break;
         }
         let start = at;
-        let end = scan_value(source, at, limit, 0, Origin::Source)
-            .ok_or(EditError::UnsupportedValue(express_id))?;
+        let end = scan_value(source, at, limit, 0, Origin::Source).ok_or_else(unsupported)?;
         if index == wanted {
             return Ok(start..end);
         }
         index += 1;
-        at = skip_trivia(source, end, limit);
+        at = skip_trivia(source, end, limit).ok_or_else(unsupported)?;
         match source.get(at) {
             Some(b',') => at += 1,
             Some(b')') => break,
@@ -296,7 +295,8 @@ fn leaf_argument_span(
 ) -> Result<Range<usize>, EditError> {
     let record_start = entry.source_off as usize;
     let record_end = record_start + entry.source_len as usize;
-    let mut at = skip_trivia(source, record_start, record_end);
+    let unsupported = || EditError::UnsupportedValue(entry.express_id);
+    let mut at = skip_trivia(source, record_start, record_end).ok_or_else(unsupported)?;
     if source.get(at) != Some(&b'#') {
         return Err(EditError::SourceMismatch);
     }
@@ -304,11 +304,11 @@ fn leaf_argument_span(
     while source.get(at).is_some_and(u8::is_ascii_digit) {
         at += 1;
     }
-    at = skip_trivia(source, at, record_end);
+    at = skip_trivia(source, at, record_end).ok_or_else(unsupported)?;
     if source.get(at) != Some(&b'=') {
         return Err(EditError::SourceMismatch);
     }
-    at = skip_trivia(source, at + 1, record_end);
+    at = skip_trivia(source, at + 1, record_end).ok_or_else(unsupported)?;
     if source.get(at) != Some(&b'(') {
         return Err(EditError::NoSuchLeaf {
             express_id: entry.express_id,
@@ -317,22 +317,20 @@ fn leaf_argument_span(
     }
     at += 1;
     loop {
-        at = skip_trivia(source, at, record_end);
+        at = skip_trivia(source, at, record_end).ok_or_else(unsupported)?;
         if source.get(at) == Some(&b')') {
             break;
         }
         let name_start = at;
-        let name_end = scan_keyword(source, at, record_end)
-            .ok_or(EditError::UnsupportedValue(entry.express_id))?;
-        let open = skip_trivia(source, name_end, record_end);
+        let name_end = scan_keyword(source, at, record_end).ok_or_else(unsupported)?;
+        let open = skip_trivia(source, name_end, record_end).ok_or_else(unsupported)?;
         if source.get(open) != Some(&b'(') {
-            return Err(EditError::UnsupportedValue(entry.express_id));
+            return Err(unsupported());
         }
         if source[name_start..name_end].eq_ignore_ascii_case(leaf_class.as_bytes()) {
             return list_argument_span(source, open, record_end, wanted, entry.express_id);
         }
-        at = scan_list(source, open, record_end, 0, Origin::Source)
-            .ok_or(EditError::UnsupportedValue(entry.express_id))?;
+        at = scan_list(source, open, record_end, 0, Origin::Source).ok_or_else(unsupported)?;
     }
     Err(EditError::NoSuchLeaf {
         express_id: entry.express_id,
@@ -419,11 +417,12 @@ fn encode_string(value: &str) -> String {
 
 #[cfg(feature = "edit")]
 fn validate_raw(value: &[u8]) -> Result<(), EditError> {
-    let start = skip_trivia(value, 0, value.len());
+    let unclosed = || EditError::InvalidValue("a comment is not closed".to_owned());
+    let start = skip_trivia(value, 0, value.len()).ok_or_else(unclosed)?;
     let Some(end) = scan_value(value, start, value.len(), 0, Origin::Replacement) else {
         return Err(EditError::InvalidValue("expected one value".to_owned()));
     };
-    if skip_trivia(value, end, value.len()) != value.len() {
+    if skip_trivia(value, end, value.len()).ok_or_else(unclosed)? != value.len() {
         return Err(EditError::InvalidValue(
             "trailing bytes after the value".to_owned(),
         ));
@@ -431,7 +430,8 @@ fn validate_raw(value: &[u8]) -> Result<(), EditError> {
     Ok(())
 }
 
-fn skip_trivia(source: &[u8], mut at: usize, limit: usize) -> usize {
+/// Skip whitespace and comments; `None` when a comment is not closed before `limit`.
+fn skip_trivia(source: &[u8], mut at: usize, limit: usize) -> Option<usize> {
     loop {
         while at < limit && source[at].is_ascii_whitespace() {
             at += 1;
@@ -441,10 +441,13 @@ fn skip_trivia(source: &[u8], mut at: usize, limit: usize) -> usize {
             while at + 1 < limit && !(source[at] == b'*' && source[at + 1] == b'/') {
                 at += 1;
             }
-            at = at.saturating_add(2).min(limit);
+            if at + 1 >= limit {
+                return None;
+            }
+            at += 2;
             continue;
         }
-        return at;
+        return Some(at);
     }
 }
 
@@ -509,7 +512,7 @@ fn scan_value(
         b'(' => scan_list(source, at, limit, depth + 1, origin),
         byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'!' => {
             let name_end = scan_keyword(source, at, limit)?;
-            let open = skip_trivia(source, name_end, limit);
+            let open = skip_trivia(source, name_end, limit)?;
             if source.get(open) == Some(&b'(') {
                 scan_list(source, open, limit, depth + 1, origin)
             } else if origin == Origin::Source {
@@ -599,15 +602,15 @@ fn scan_list(
     if depth > 256 || source.get(at) != Some(&b'(') {
         return None;
     }
-    let mut cursor = skip_trivia(source, at + 1, limit);
+    let mut cursor = skip_trivia(source, at + 1, limit)?;
     if source.get(cursor) == Some(&b')') {
         return Some(cursor + 1);
     }
     loop {
         cursor = scan_value(source, cursor, limit, depth, origin)?;
-        cursor = skip_trivia(source, cursor, limit);
+        cursor = skip_trivia(source, cursor, limit)?;
         match source.get(cursor) {
-            Some(b',') => cursor = skip_trivia(source, cursor + 1, limit),
+            Some(b',') => cursor = skip_trivia(source, cursor + 1, limit)?,
             Some(b')') => return Some(cursor + 1),
             _ => return None,
         }
@@ -704,6 +707,31 @@ mod tests {
         for valid in [".5", "-1.2E+3", ".T.", "TYPE(1.)", "(1.,#2,$)"] {
             validate_raw(valid.as_bytes()).unwrap();
         }
+    }
+
+    #[test]
+    fn an_unclosed_comment_in_a_raw_value_is_refused() {
+        for invalid in ["$/*", "$/*/", "/* $", "$ /* never closed *", "(1.,/*2.)"] {
+            let error = validate_raw(invalid.as_bytes()).unwrap_err();
+            assert!(matches!(error, EditError::InvalidValue(_)), "{invalid}");
+        }
+        for valid in ["$/**/", "/* lead */ $", "(1.,/* two */2.)"] {
+            validate_raw(valid.as_bytes()).unwrap();
+        }
+
+        let image = parse(SOURCE, &ParseOptions::default());
+        let error = apply_edits(
+            SOURCE,
+            &image,
+            &[AttributeEdit {
+                express_id: 1,
+                argument_index: 2,
+                leaf_class: None,
+                value: EditValue::Raw("$/*".to_owned()),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, EditError::InvalidValue(_)));
     }
 
     const KEYWORDS: &[u8] = b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\

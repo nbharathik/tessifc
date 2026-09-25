@@ -4,18 +4,20 @@
 Typed views over a parsed model image: entities, attributes by name, and the
 inverse relationships IFC does not store directly.
 
-```rust
+```rust no_run
 use tessifc_model::Model;
 use tessifc_step::{ParseOptions, parse};
 
-let bytes = std::fs::read("model.ifc")?;
-let model = Model::new(parse(&bytes, &ParseOptions::default()));
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read("model.ifc")?;
+    let model = Model::new(parse(&bytes, &ParseOptions::default()));
 
-for wall in model.entities_of_type("IfcWall") {
-    let name = wall.attr("Name").as_string().unwrap_or_default();
-    println!("#{} {name}: {} openings", wall.id(), model.voids_of(wall.id()).len());
+    for wall in model.entities_of_type("IfcWall") {
+        let name = wall.attr("Name").as_string().unwrap_or_default();
+        println!("#{} {name}: {} openings", wall.id(), model.voids_of(wall.id()).len());
+    }
+    Ok(())
 }
-# Ok::<(), std::io::Error>(())
 ```
 
 `Entity::attr` resolves a name every call. In a hot loop, resolve the index once

@@ -14,8 +14,6 @@ struct Row {
     schemas: Vec<String>,
 }
 
-const SCHEMAS: [SchemaId; 3] = [SchemaId::Ifc2x3, SchemaId::Ifc4, SchemaId::Ifc4x3];
-
 pub fn run(json: bool, markdown: bool, inventory: bool) -> ExitCode {
     if inventory {
         let schemas: Vec<_> = SchemaId::all().iter().map(|&schema| {
@@ -30,7 +28,8 @@ pub fn run(json: bool, markdown: bool, inventory: bool) -> ExitCode {
     // A class handled in one schema and absent from another is worth seeing,
     // so the schemas are merged rather than reported one at a time.
     let mut rows: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
-    for schema in SCHEMAS {
+    // Only the schemas compiled into this build have tables to read.
+    for &schema in SchemaId::all() {
         let registry = Registry::defaults(schema);
         for (class, kind) in registry.coverage() {
             rows.entry((class.to_string(), kind.to_string()))
@@ -80,7 +79,7 @@ pub fn run(json: bool, markdown: bool, inventory: bool) -> ExitCode {
     for (kind, items) in &by_kind {
         println!("{kind} ({} classes)", items.len());
         for row in items {
-            let all = row.schemas.len() == SCHEMAS.len();
+            let all = row.schemas.len() == SchemaId::all().len();
             println!(
                 "  {:<44} {}",
                 row.class,

@@ -48,6 +48,14 @@ Openings, annotations and non-physical references are independent opt-in
 groups. Space and zone volumes are included by default and flagged separately
 so a viewer can hide them without discarding them.
 
+`--strict` writes nothing and exits 1 when a selected product produced no
+geometry, when any diagnostic has error severity, or when any diagnostic is
+present other than these informational ones: `W_UNITS_ASSUMED`,
+`W_FULLY_TRANSPARENT_STYLE`, `W_MISSING_SEMICOLON`, `I_COMPLEX_INSTANCE` and
+`I_VERTEX_LOOP_IGNORED`. Every other code, including one added in a later
+release, counts as missing, degraded or repaired geometry. The JSON report
+says `output_written`. `convert` never writes its pack over its input file.
+
 ## edit
 
 ```sh

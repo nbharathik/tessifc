@@ -4,7 +4,7 @@
 //! version, a long poll, scripts, undo and redo, the page's reports and the
 //! checkout's static files. The same routes as the Python session server.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { realpath, readFile, stat } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
@@ -90,14 +90,19 @@ function resultRecord(outcome) {
 /**
  * Create the server over a model host. `root` is the checkout that holds the
  * viewer and the WASM package; `port` 0 picks a free one. Call `listen()`.
+ * Every `/__tessifc/` route needs the `x-tessifc-token` header; `viewerUrl`
+ * is the address to open, with the token in its fragment.
  * @param {import("./session-host.js").ModelHost} host
  * @param {{ root: string, port?: number, staticRoots?: string[], log?: (line: string) => void }} options
  */
 export function createViewerServer(host, { root, port = 8000, staticRoots = DEFAULT_ROOTS, log = () => {} }) {
   if (!root) throw new Error("createViewerServer needs the checkout root.");
   const token = randomBytes(18).toString("base64url");
+  const expected = Buffer.from(token);
   const checkout = resolve(root);
   const allowedRoots = staticRoots.map((name) => resolve(checkout, name));
+  // Compared with real paths, so a different drive-letter case still matches on Windows.
+  let realRoots = null;
   let server = null;
   let boundPort = port;
 
@@ -113,11 +118,17 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
     return allowed.some((name) => origin === `http://${name}`);
   }
 
+  function tokenOk(request) {
+    const given = Buffer.from(String(request.headers["x-tessifc-token"] ?? ""));
+    return given.length === expected.length && timingSafeEqual(given, expected);
+  }
+
   async function serveStatic(pathname, response) {
     try {
       const relative = decodeURIComponent(pathname).replace(/^\/+/, "");
       let file = await realpath(resolve(checkout, relative));
-      const inside = (target) => allowedRoots.some((base) => target === base || target.startsWith(base + sep));
+      realRoots ??= await Promise.all(allowedRoots.map((base) => realpath(base).catch(() => base)));
+      const inside = (target) => realRoots.some((base) => target === base || target.startsWith(base + sep));
       if (!inside(file) || file.split(sep).includes("node_modules")) throw new Error("outside");
       if ((await stat(file)).isDirectory()) file = await realpath(resolve(file, "index.html"));
       if (!STATIC_SUFFIXES.has(extname(file)) || !inside(file)) throw new Error("suffix");
@@ -128,13 +139,17 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
   }
 
   async function handleGet(request, response, url) {
+    if (url.pathname.startsWith("/__tessifc/") && !tokenOk(request)) {
+      response.writeHead(403).end("Missing session token");
+      return;
+    }
     if (url.pathname === "/__tessifc/session") {
       const after = url.searchParams.get("after");
       if (after !== null) {
         const timeout = Math.min(Number(url.searchParams.get("timeout") ?? 20) || 0, MAX_WAIT_SECONDS);
         await host.waitForChange(after, timeout * 1000);
       }
-      json(response, { ...host.describe(), token });
+      json(response, host.describe());
       return;
     }
     if (url.pathname === "/__tessifc/model.ifc") {
@@ -159,7 +174,7 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
   }
 
   async function handlePost(request, response, url) {
-    if (request.headers["x-tessifc-token"] !== token) {
+    if (!tokenOk(request)) {
       response.writeHead(403).end("Missing session token");
       return;
     }
@@ -221,14 +236,25 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
 
   return {
     token,
-    listen() {
+    /**
+     * Listen on `listenPort` (the constructor's port by default) and resolve with the base URL.
+     * A failed attempt, such as a port in use, rejects and may be retried with another port.
+     * @param {number} [listenPort]
+     */
+    listen(listenPort = port) {
       return new Promise((done, fail) => {
-        server.once("error", fail);
-        server.listen(port, "127.0.0.1", () => {
-          server.off("error", fail);
+        const failed = (error) => {
+          server.off("listening", listening);
+          fail(error);
+        };
+        const listening = () => {
+          server.off("error", failed);
           boundPort = /** @type {import("node:net").AddressInfo} */ (server.address()).port;
           done(this.url);
-        });
+        };
+        server.once("error", failed);
+        server.once("listening", listening);
+        server.listen(listenPort, "127.0.0.1");
       });
     },
     get port() {
@@ -236,6 +262,10 @@ export function createViewerServer(host, { root, port = 8000, staticRoots = DEFA
     },
     get url() {
       return boundPort ? `http://127.0.0.1:${boundPort}` : null;
+    },
+    /** The address to open: the viewer following this session, with the token in the fragment. */
+    get viewerUrl() {
+      return boundPort ? `http://127.0.0.1:${boundPort}/viewer/?session=file#token=${token}` : null;
     },
     /** Stop listening and drop the open long polls, so the promise settles. */
     close() {

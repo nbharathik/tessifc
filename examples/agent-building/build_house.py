@@ -244,7 +244,7 @@ def main(argv=None):
         session = EditSession(path)
         server = create_server(session, args.port, root=ROOT)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        print(f"Open http://127.0.0.1:{server.server_port}/viewer/?session=file and watch; the build starts in 5 seconds", flush=True)
+        print(f"Open {server.viewer_url} and watch; the build starts in 5 seconds", flush=True)
         time.sleep(5)
 
     def on_step(index, title, description):

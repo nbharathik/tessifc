@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import sys
 import threading
@@ -12,6 +13,8 @@ from pathlib import Path
 from .assistant import Assistant, AssistantError, create_provider
 from .server import create_server
 from .session import EditSession
+
+DEFAULT_PORT = 8000
 
 
 def default_root() -> Path:
@@ -22,16 +25,30 @@ def default_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def bind_server(session: EditSession, port: int | None, *, root: Path, assistant: Assistant | None = None):
+    """The viewer server on `port`; without one, on the default port, or a free one when that is taken.
+
+    An explicit port that is taken raises the OSError.
+    """
+    try:
+        return create_server(session, DEFAULT_PORT if port is None else port, root=root, assistant=assistant)
+    except OSError as error:
+        if port is not None or error.errno != errno.EADDRINUSE:
+            raise
+    return create_server(session, 0, root=root, assistant=assistant)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="tessifc-session", description=__doc__)
     parser.add_argument("ifc", type=Path, help="The IFC file to follow and edit")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=None,
+                        help=f"Viewer port (default {DEFAULT_PORT}, or a free one when that is taken; 0 picks a free one)")
     parser.add_argument("--root", type=Path, default=None, help="Checkout holding viewer/ and bindings/wasm/pkg")
     parser.add_argument("--assistant", default=None, help="anthropic, fake or none (default: anthropic when a key is set)")
     parser.add_argument("--model", default=None, help="Assistant model id")
     parser.add_argument("--effort", default=None, help="Assistant effort: low, medium, high, xhigh or max")
     parser.add_argument("--mcp", action="store_true", help="Speak MCP on stdin and stdout for an agent; the viewer server keeps running")
-    parser.add_argument("--new", action="store_true", help="Create the IFC file first (a project, site, building and storeys)")
+    parser.add_argument("--new", action="store_true", help="Create the IFC file when it is missing (a project, site, building and storeys)")
     parser.add_argument("--schema", default="IFC4", help="Schema of a new file: IFC2X3, IFC4 or IFC4X3")
     parser.add_argument("--storeys", default=None, help='Storeys of a new file, e.g. "Ground floor:0,Upper floor:3"')
     args = parser.parse_args(argv)
@@ -70,10 +87,16 @@ def main(argv=None):
             provider.client()
         except AssistantError as error:
             parser.error(str(error))
-    # Scripts run in this process; keep the provider key out of their environment.
+    # Scripts run in this process: this keeps the key out of os.environ, not out of the client's memory.
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         os.environ.pop(name, None)
-    server = create_server(session, args.port, root=root, assistant=assistant)
+    try:
+        server = bind_server(session, args.port, root=root, assistant=assistant)
+    except OSError as error:
+        port = DEFAULT_PORT if args.port is None else args.port
+        parser.error(f"The viewer server could not listen on port {port}: {error}. Choose another --port, or 0 for a free one.")
+    if args.port is None and server.server_port != DEFAULT_PORT:
+        print(f"Port {DEFAULT_PORT} is in use; the viewer takes a free port instead", flush=True)
     print(f"Following {session.path}", flush=True)
     if session.authoring_available():
         print(f"Scripts run with IfcOpenShell {getattr(session.ifcopenshell, 'version', '')}", flush=True)
@@ -83,7 +106,7 @@ def main(argv=None):
         print(f"Assistant: {provider.name} ({getattr(provider, 'model', '')})", flush=True)
     else:
         print("Assistant: off (set ANTHROPIC_API_KEY or pass --assistant)", flush=True)
-    viewer_url = f"http://127.0.0.1:{server.server_port}/viewer/?session=file"
+    viewer_url = server.viewer_url
     print(f"Open {viewer_url}", flush=True)
     if args.mcp:
         try:

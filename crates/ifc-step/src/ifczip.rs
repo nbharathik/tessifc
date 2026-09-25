@@ -5,7 +5,7 @@
 
 use crate::diag::{DiagCode, Diagnostic};
 use crate::image::ModelImage;
-use crate::parse::{ParseOptions, parse};
+use crate::parse::{ParseOptions, parse, pick_available};
 use std::fmt;
 use tessifc_schema::SchemaId;
 
@@ -137,14 +137,31 @@ pub fn unzip_ifc(bytes: &[u8], opts: &UnzipOptions) -> Result<Unzipped, ZipError
             }
             data.to_vec()
         }
-        8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, opts.max_uncompressed_bytes)
-            .map_err(|error| match error.status {
-                miniz_oxide::inflate::TINFLStatus::HasMoreOutput => ZipError::TooLarge {
-                    declared: entry.uncompressed,
-                    limit: opts.max_uncompressed_bytes,
-                },
-                _ => ZipError::Malformed(format!("deflate stream: {error:?}")),
-            })?,
+        8 => {
+            // The declared size bounds the output; the extra byte tells a stream
+            // that runs past it from one that ends exactly there. Zero means unknown.
+            let declared = usize::try_from(entry.uncompressed).unwrap_or(usize::MAX);
+            let limit = match declared {
+                0 => opts.max_uncompressed_bytes,
+                size => size.saturating_add(1).min(opts.max_uncompressed_bytes),
+            };
+            miniz_oxide::inflate::decompress_to_vec_with_limit(data, limit).map_err(|error| {
+                match error.status {
+                    miniz_oxide::inflate::TINFLStatus::HasMoreOutput
+                        if limit < opts.max_uncompressed_bytes =>
+                    {
+                        ZipError::Malformed(format!(
+                            "entry inflates past its declared size of {declared} bytes"
+                        ))
+                    }
+                    miniz_oxide::inflate::TINFLStatus::HasMoreOutput => ZipError::TooLarge {
+                        declared: entry.uncompressed,
+                        limit: opts.max_uncompressed_bytes,
+                    },
+                    _ => ZipError::Malformed(format!("deflate stream: {error:?}")),
+                }
+            })?
+        }
         other => {
             return Err(ZipError::Malformed(format!(
                 "compression method {other} is not stored or deflate"
@@ -210,7 +227,8 @@ fn open_archive(bytes: &[u8], opts: &ParseOptions) -> (ModelImage, Option<Vec<u8
             (image, Some(unzipped.bytes))
         }
         Err(error) => {
-            let mut image = ModelImage::empty(opts.schema_override.unwrap_or(SchemaId::Ifc4));
+            let schema = pick_available(opts.schema_override.unwrap_or(SchemaId::Ifc4));
+            let mut image = ModelImage::empty(schema);
             image
                 .diagnostics
                 .push(Diagnostic::error(error.code(), 0, error.to_string()));
@@ -536,6 +554,7 @@ pub(crate) mod tests {
             Err(ZipError::TooLarge { limit: 16, .. })
         ));
         // A directory that lies about the size: declared small, inflates large.
+        // The inflate stops at the declared size, whatever the global limit.
         let mut lying = zip.clone();
         let central = lying
             .windows(4)
@@ -546,13 +565,18 @@ pub(crate) mod tests {
             max_uncompressed_bytes: 32,
             ..UnzipOptions::default()
         };
+        for options in [limit, UnzipOptions::default()] {
+            assert!(matches!(
+                unzip_ifc(&lying, &options),
+                Err(ZipError::Malformed(what)) if what.contains("past its declared size of 8")
+            ));
+        }
+        // An entry declared one byte short still inflates, and is refused by size.
+        let mut short = zip.clone();
+        short[central + 24..central + 28].copy_from_slice(&(WALL.len() as u32 - 1).to_le_bytes());
         assert!(matches!(
-            unzip_ifc(&lying, &limit),
-            Err(ZipError::TooLarge { .. })
-        ));
-        assert!(matches!(
-            unzip_ifc(&lying, &UnzipOptions::default()),
-            Err(ZipError::Malformed(what)) if what.contains("declared")
+            unzip_ifc(&short, &UnzipOptions::default()),
+            Err(ZipError::Malformed(what)) if what.contains("not the declared")
         ));
         let image = open(
             &zip,
@@ -566,6 +590,21 @@ pub(crate) mod tests {
             image.diagnostics.items()[0].code,
             DiagCode::IFCZIP_TOO_LARGE
         );
+    }
+
+    #[test]
+    fn an_unreadable_archive_gives_an_image_of_a_compiled_in_schema() {
+        let zip = archive(&[("model.ifc", WALL, true)]);
+        for schema in [SchemaId::Ifc2x3, SchemaId::Ifc4, SchemaId::Ifc4x3] {
+            let options = ParseOptions {
+                schema_override: Some(schema),
+                ..ParseOptions::default()
+            };
+            let image = open(&zip[..zip.len() - 1], &options);
+            assert!(image.is_empty());
+            assert!(SchemaId::all().contains(&image.schema), "{schema}");
+            assert_eq!(image.schema_tables().id, image.schema);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! application's worker and `createViewer`'s worker mode share it.
 
 import { findContestedTriangles } from "./depth-planes.js";
+import { lockdownScriptScope, scriptRefusal } from "./script-lockdown.js";
 
 /** Helper geometry stays in the pack so a host can reveal it without converting again. */
 export const GEOMETRY_SETTINGS = {
@@ -35,11 +36,14 @@ const CHUNK_TRIANGLES = 600_000;
 /**
  * Run the kernel in this worker. `glue` is the imported `@tessifc/core/web`
  * module (its default export initialises the WASM); `settings` are the
- * geometry settings a `convert` message merges its own over. Posts `ready`
- * with the kernel version, or `boot-error`.
- * @param {{ glue: { default: () => Promise<unknown>, Kernel: new () => any, version: () => string, simplifyMesh?: (positions: Float32Array, indices: Uint32Array, settings?: string) => Uint32Array | undefined }, edit: WorkerEdit, settings?: Record<string, unknown>, scope?: any }} options
+ * geometry settings a `convert` message merges its own over. Once the kernel
+ * is loaded, `lockdown` (on by default) takes the network, module loading and
+ * code generation away from the worker's global so scripts cannot send the
+ * model anywhere; a host that needs the network in this worker later turns
+ * it off. Posts `ready` with the kernel version, or `boot-error`.
+ * @param {{ glue: { default: () => Promise<unknown>, Kernel: new () => any, version: () => string, simplifyMesh?: (positions: Float32Array, indices: Uint32Array, settings?: string) => Uint32Array | undefined }, edit: WorkerEdit, settings?: Record<string, unknown>, scope?: any, lockdown?: boolean }} options
  */
-export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTINGS, scope = self }) {
+export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTINGS, scope = self, lockdown = true }) {
   /** @type {any} */
   let kernel = null;
   /** @type {number | undefined} */
@@ -49,6 +53,11 @@ export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTIN
   let session = null;
   // The settings the active model was evaluated with; its session uses the same ones.
   let activeSettings = settings;
+  // Only a worker's global is locked, never a page's.
+  const workerGlobal = /** @type {any} */ (globalThis).WorkerGlobalScope;
+  const locking = lockdown && typeof workerGlobal === "function" && globalThis instanceof workerGlobal;
+  // Globals the lockdown could not remove; scripts are refused while any remain.
+  let lockdownGaps = [];
   const post = (message, transfer) => scope.postMessage(message, transfer);
 
   scope.addEventListener("message", ({ data }) => {
@@ -71,6 +80,8 @@ export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTIN
   try {
     await glue.default();
     kernel = new glue.Kernel();
+    // The realm's own global, whatever channel `scope` is; no message is handled before this.
+    if (locking) lockdownGaps = lockdownScriptScope(globalThis);
     post({ type: "ready", version: glue.version(), streaming: typeof kernel.beginGeometryStream === "function" });
   } catch (error) {
     post({ type: "boot-error", message: readableError(error) });
@@ -95,7 +106,9 @@ export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTIN
 
       if (!info.entities) {
         const diagnostics = JSON.parse(kernel.getDiagnostics(modelId) ?? "[]");
-        throw new Error(diagnostics[0]?.message ?? "No IFC entities were found in this file.");
+        // Without a diagnostic the file parsed and simply holds nothing.
+        if (!diagnostics[0]?.message) throw Object.assign(new Error("No IFC entities were found in this file."), { empty: true });
+        throw new Error(diagnostics[0].message);
       }
 
       // Keep helper geometry in the pack so the viewer can reveal each group
@@ -141,7 +154,7 @@ export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTIN
     } catch (error) {
       if (modelId !== undefined) kernel.closeModel(modelId);
       activeModelId = previousModelId;
-      post({ type: "conversion-error", jobId, message: readableError(error) });
+      post({ type: "conversion-error", jobId, message: readableError(error), empty: Boolean(error?.empty) });
     }
   }
 
@@ -305,8 +318,20 @@ export async function startKernelWorker({ glue, edit, settings = GEOMETRY_SETTIN
   function runScript({ requestId, modelId, source, selection, patch, commit = true }) {
     const started = performance.now();
     publishRequest({ requestId, modelId, patch, run: (s) => {
+      const text = String(source ?? "");
+      let refused = null;
+      if (locking) {
+        refused = lockdownGaps.length
+          ? `ScriptRefused: scripts are off because this browser kept ${lockdownGaps.join(", ")} in the worker.`
+          : scriptRefusal(text);
+      }
+      if (refused) {
+        post({ type: "script-finished", requestId, modelId });
+        const operations = { created: 0, modified: 0, deleted: 0 };
+        return { delta: null, script: { ok: false, stdout: "", error: refused, traceback: "", changed: false, operations, elapsedMs: performance.now() - started } };
+      }
       const engine = edit.createScriptEngine(kernel, modelId);
-      const report = edit.runScript(engine, String(source ?? ""), selection);
+      const report = edit.runScript(engine, text, selection);
       // The main thread's time limit covers the script; publishing is the kernel's bounded work.
       post({ type: "script-finished", requestId, modelId });
       report.elapsedMs = performance.now() - started;

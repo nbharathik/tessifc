@@ -8,6 +8,8 @@ import { createAgentTools, runAgentTurn } from "../../bindings/edit/src/agent-to
 import { anthropicMessages, chatCompletions } from "../../bindings/edit/src/providers.js";
 
 const STORAGE_KEY = "tessifc.assistant";
+// Keys live for the tab unless the user asks to remember them on this device.
+const TAB_KEYS = "tessifc.assistant.keys";
 const MAX_HISTORY = 20;
 
 export const PROVIDERS = {
@@ -17,25 +19,71 @@ export const PROVIDERS = {
   compatible: { label: "OpenAI-compatible URL", baseUrl: "http://127.0.0.1:11434/v1", model: "", key: false },
 };
 
-/** Provider settings from the last visit; a blocked store means the assistant is off. */
-export function loadAssistantSettings() {
-  const settings = { provider: "off", model: "", baseUrl: "", key: "" };
+/**
+ * Where a key is kept: the provider and the origin it is sent to, so a key
+ * never follows a switch of provider or URL.
+ * @param {string} provider
+ * @param {string} baseUrl
+ */
+export function keySlot(provider, baseUrl) {
+  let origin = "";
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
-    for (const name of Object.keys(settings)) if (typeof stored?.[name] === "string") settings[name] = stored[name];
+    origin = new URL(baseUrl).origin;
   } catch {
-    // Nothing stored, or storage is blocked.
+    // An unfinished URL has no origin yet.
   }
-  if (!PROVIDERS[settings.provider]) settings.provider = "off";
-  return settings;
+  return origin ? `${provider} ${origin}` : provider;
 }
 
-export function saveAssistantSettings(settings) {
+function readKeys(value) {
+  const keys = {};
+  if (value && typeof value === "object") {
+    for (const [slot, key] of Object.entries(value)) if (typeof key === "string" && key) keys[slot] = key;
+  }
+  return keys;
+}
+
+function readJson(storage, name) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    return JSON.parse(globalThis[storage]?.getItem(name) ?? "null");
+  } catch {
+    return null;
+  }
+}
+
+function writeJson(storage, name, value) {
+  try {
+    if (value === null) globalThis[storage]?.removeItem(name);
+    else globalThis[storage]?.setItem(name, JSON.stringify(value));
   } catch {
     // A blocked storage backend must not break the interface.
   }
+}
+
+/**
+ * Provider settings from the last visit and the keys by `keySlot`: this
+ * tab's, and the device's when the user chose to remember them. A blocked
+ * store means the assistant is off.
+ */
+export function loadAssistantSettings() {
+  const settings = { provider: "off", model: "", baseUrl: "", remember: false, keys: {} };
+  const stored = readJson("localStorage", STORAGE_KEY);
+  for (const name of ["provider", "model", "baseUrl"]) if (typeof stored?.[name] === "string") settings[name] = stored[name];
+  if (!PROVIDERS[settings.provider]) settings.provider = "off";
+  // A key an earlier version stored was already kept on this device, so it stays remembered.
+  const legacy = typeof stored?.key === "string" && stored.key ? stored.key : "";
+  settings.remember = stored?.remember === true || Boolean(legacy);
+  const remembered = settings.remember ? readKeys(stored?.keys) : {};
+  if (legacy) remembered[keySlot(settings.provider, settings.baseUrl)] ??= legacy;
+  settings.keys = { ...remembered, ...readKeys(readJson("sessionStorage", TAB_KEYS)) };
+  return settings;
+}
+
+/** Store the settings: keys in the tab's storage, and on the device only when `remember` is set. */
+export function saveAssistantSettings({ provider, model, baseUrl, remember = false, keys = {} }) {
+  const kept = readKeys(keys);
+  writeJson("localStorage", STORAGE_KEY, remember ? { provider, model, baseUrl, remember: true, keys: kept } : { provider, model, baseUrl });
+  writeJson("sessionStorage", TAB_KEYS, Object.keys(kept).length ? kept : null);
 }
 
 /** The panel's chat log as the loop's history: alternating user and assistant text, newest last. */
@@ -59,27 +107,45 @@ function history(items) {
  * the open model and the selection for the prompt.
  */
 export function createBrowserAssistant({ inspect, execute, undo = null, context }) {
-  let settings = loadAssistantSettings();
+  let stored = loadAssistantSettings();
   let override = null;
 
+  /** The settings in use, with the key for the current provider and URL only. */
+  function current() {
+    const { provider, model, baseUrl, remember } = stored;
+    return { provider, model, baseUrl, remember, key: stored.keys[keySlot(provider, baseUrl)] ?? "" };
+  }
+
   function configured() {
+    const settings = current();
     const provider = PROVIDERS[settings.provider];
     return Boolean(provider && settings.provider !== "off" && settings.model && (!provider.key || settings.key));
   }
 
   function describe() {
-    return configured() ? { provider: settings.provider, model: settings.model } : null;
+    return configured() ? { provider: stored.provider, model: stored.model } : null;
   }
 
+  /** Change settings; a `key` belongs to the provider and URL in effect after the change. */
   function update(next) {
-    settings = { ...settings, ...next };
-    if (!PROVIDERS[settings.provider]) settings.provider = "off";
-    saveAssistantSettings(settings);
+    const { key, ...rest } = next ?? {};
+    stored = { ...stored, ...rest };
+    if (!PROVIDERS[stored.provider]) stored.provider = "off";
+    stored.remember = Boolean(stored.remember);
+    if (typeof key === "string") {
+      const keys = { ...stored.keys };
+      const slot = keySlot(stored.provider, stored.baseUrl);
+      if (key) keys[slot] = key;
+      else delete keys[slot];
+      stored.keys = keys;
+    }
+    saveAssistantSettings(stored);
   }
 
   /** The `complete` function for the configured provider, or the test override. */
   function complete() {
     if (override) return override;
+    const settings = current();
     if (settings.provider === "anthropic") {
       return anthropicMessages({ baseUrl: settings.baseUrl, key: settings.key, model: settings.model, browser: true });
     }
@@ -120,7 +186,7 @@ export function createBrowserAssistant({ inspect, execute, undo = null, context 
     configured,
     describe,
     update,
-    settings: () => ({ ...settings }),
+    settings: current,
     // Tests replace the network call with a scripted `complete` function.
     useProvider(handler) {
       override = handler ?? null;

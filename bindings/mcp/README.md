@@ -18,14 +18,18 @@ node bindings/mcp/src/cli.js house.ifc --new          # a new model, saved to ho
 node bindings/mcp/src/cli.js model.ifc                # an existing file
 ```
 
-Installed from npm beside `@tessifc/core`, `npx tessifc-mcp model.ifc
---root <checkout>` is the same server; `@tessifc/edit` comes with it, so
-only the viewer files need the checkout.
+Installed from npm, `npx -p @tessifc/mcp tessifc-mcp model.ifc --root
+<checkout>` is the same server; `@tessifc/core` and `@tessifc/edit` come
+with it, so only the viewer files need the checkout.
 
 The server speaks MCP on stdin and stdout and prints the viewer address on
-stderr, for example `Viewer: http://127.0.0.1:8000/viewer/?session=file`.
-Open it in a browser: the page follows the file, shows every revision, and
-its Session panel runs JavaScript on the same host.
+stderr, for example
+`Viewer: http://127.0.0.1:8000/viewer/?session=file#token=...`. Open that
+exact address in a browser: the `#token=` part is the session's key, which
+the page keeps and removes from the address bar. The page follows the file,
+shows every revision, and its Session panel runs JavaScript on the same
+host. When your MCP client hides stderr, `describe_model` returns the same
+address as `viewer.url`.
 
 Register it with Claude Code:
 
@@ -33,12 +37,15 @@ Register it with Claude Code:
 claude mcp add tessifc -- node bindings/mcp/src/cli.js --new house.ifc
 ```
 
-Options: `--new` (start from a project, site, building and storeys; refuses
-to overwrite an existing file without `--force`), `--schema IFC2X3|IFC4|IFC4X3`,
-`--units m|mm`, `--storeys "Ground floor:0,Upper floor:3"`, `--port 8000`
-(`0` picks a free port), `--no-viewer`, `--no-save` (keep the model in memory
-only), `--script-timeout-ms 30000` (stop a script that runs longer; `0` for
-no limit), `--root <checkout>` (where the viewer and the WASM package are).
+Options: `--new` (create the file from a project, site, building and storeys
+when it is missing and open it when it exists, so the registration above
+works on every start; `--force` replaces an existing file),
+`--schema IFC2X3|IFC4|IFC4X3`, `--units m|mm`,
+`--storeys "Ground floor:0,Upper floor:3"`, `--port 8000` (without the flag a
+taken 8000 falls back to a free port; a taken `--port` is an error; `0` picks
+a free port), `--no-viewer`, `--no-save` (keep the model in memory only),
+`--script-timeout-ms 30000` (stop a script that runs longer; `0` for no
+limit), `--root <checkout>` (where the viewer and the WASM package are).
 
 ## Tools
 
@@ -47,11 +54,11 @@ no limit), `--root <checkout>` (where the viewer and the WASM package are).
 | `describe_model` | File, schema, revision, unit, product counts, storeys, history and the viewer's selection |
 | `find_products` | Products of a class, filtered by name or storey |
 | `product_info` | One entity: attributes, container, property sets, representation items, placement |
-| `inspect_model` | Run read-only JavaScript and return what it prints |
+| `inspect_model` | Run JavaScript and return what it prints; its edits to the model are discarded |
 | `edit_model` | Run a script; its edits become one revision. Returns the kernel's affected and removed products, diagnostics and whether the file was saved; `timedOut` when the script was stopped at the limit |
 | `undo`, `redo` | New revisions that restore earlier content |
 | `export_model` | Write the committed IFC to a path |
-| `new_model`, `open_model` | Start a model from nothing, or follow another file |
+| `new_model`, `open_model` | Start a model from nothing (a `path` must end with `.ifc`), or follow another file; without `force` both refuse to drop unsaved changes, and `new_model` refuses an existing file |
 | `get_selection` | What the user selected in the viewer |
 | `verify_revision` | Evaluate the exported file from scratch and compare it with the scene built from the deltas |
 | `list_examples` | Ready-made scripts, including a small house |
@@ -75,7 +82,8 @@ kernel, the editing session, the current snapshot and its content version,
 the file it saves to, and a scene mirror for verification; with
 `kernelModule` (the path of the Node kernel) scripts run in a worker thread
 under the limit, without it they run in the process without one. `createViewerServer(host, { root, port })` is the
-loopback server the viewer follows; `createTessifcServer(host)` returns the
+loopback server the viewer follows, and its `viewerUrl` the address to open,
+token included; `createTessifcServer(host)` returns the
 MCP server for the transport of your choice. `examples/agent-building/` uses
 the host and the viewer server without MCP.
 
@@ -83,7 +91,10 @@ the host and the viewer server without MCP.
 
 Scripts run with the server's permissions and without a sandbox, in a worker
 thread that is ended when a script passes the time limit; the limit catches a
-script that never returns and is not a security boundary. Review what an
-agent proposes before granting it automatic edits elsewhere.
+script that never returns and is not a security boundary. That holds for
+`inspect_model` too: only its edits to the model are discarded. Review what
+an agent proposes before granting it automatic edits elsewhere.
 The viewer server binds to the loopback interface only, checks the Host and
-Origin headers, and requires a per-process token on every command.
+Origin headers, and requires a per-process token on every session request,
+reads included. The token reaches the page only through the printed address
+(which the MCP client also gets); no HTTP response carries it.

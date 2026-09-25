@@ -42,8 +42,8 @@ python scripts/build-wasm.py --target both
 That writes the browser module to `bindings/wasm/pkg` and the Node module to
 `bindings/wasm/pkg-node`. Each release also carries the npm packages as
 tarballs, so `npm install ./tessifc-core-0.3.0.tgz` works without a build.
-Once the preview is published, `npm install @tessifc/core` gives you the same
-API.
+Once the preview is published, `npm install @tessifc/core@preview` gives you
+the same API.
 
 ## Quick setup
 

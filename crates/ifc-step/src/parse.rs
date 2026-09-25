@@ -130,7 +130,7 @@ impl<'a> Reader<'a> {
         if new_pos > self.pos {
             let span = &self.src[self.pos..new_pos];
             // memchr beats a byte loop, and this is the only place lines are counted.
-            self.line += memchr::memchr_iter(b'\n', span).count() as u32;
+            self.line = add_lines(self.line, memchr::memchr_iter(b'\n', span).count());
             self.pos = new_pos;
         }
     }
@@ -138,7 +138,7 @@ impl<'a> Reader<'a> {
     #[inline]
     fn bump(&mut self) {
         if self.peek() == Some(b'\n') {
-            self.line += 1;
+            self.line = add_lines(self.line, 1);
         }
         self.pos += 1;
     }
@@ -425,6 +425,16 @@ impl<'a> Reader<'a> {
             if word == b"ENDSEC" {
                 self.advance_to(self.pos + word.len());
                 self.consume_semicolon();
+                return;
+            }
+            if word == b"DATA" {
+                // ENDSEC was forgotten; DATA is left for the section loop to read.
+                let line = self.line;
+                self.diag(Diagnostic::warning(
+                    DiagCode::BAD_HEADER,
+                    line,
+                    "the HEADER section is not closed by ENDSEC; DATA ends it",
+                ));
                 return;
             }
             self.advance_to(self.pos + word.len());
@@ -1294,6 +1304,11 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The line number after `newlines` more line breaks, pinned at `u32::MAX`.
+fn add_lines(line: u32, newlines: usize) -> u32 {
+    line.saturating_add(u32::try_from(newlines).unwrap_or(u32::MAX))
+}
+
 /// Depth of a class in the inheritance chain, to pick the most derived leaf.
 fn inheritance_depth(schema: &Schema, class: ClassId) -> i32 {
     if class == CLASS_UNKNOWN {
@@ -1314,23 +1329,10 @@ fn inheritance_depth(schema: &Schema, class: ClassId) -> i32 {
     depth
 }
 
-/// Which of the compiled-in schemas to actually use for a requested one.
-fn pick_available(id: SchemaId) -> SchemaId {
-    if Schema::try_get(id).is_some() {
-        return id;
-    }
-    // Fall back to whatever is compiled in, preferring the closest.
-    let order = match id {
-        SchemaId::Ifc2x3 => [SchemaId::Ifc4, SchemaId::Ifc4x3, SchemaId::Ifc2x3],
-        SchemaId::Ifc4 => [SchemaId::Ifc4x3, SchemaId::Ifc2x3, SchemaId::Ifc4],
-        SchemaId::Ifc4x3 => [SchemaId::Ifc4, SchemaId::Ifc2x3, SchemaId::Ifc4x3],
-    };
-    for candidate in order {
-        if Schema::try_get(candidate).is_some() {
-            return candidate;
-        }
-    }
-    id
+/// Which of the compiled-in schemas to actually use for a requested one:
+/// the schema itself, or the nearest one compiled in.
+pub(crate) fn pick_available(id: SchemaId) -> SchemaId {
+    Schema::get(id).id
 }
 
 /// Byte offset of the closing quote of a string starting at `from`.
@@ -1429,5 +1431,18 @@ fn echo(bytes: &[u8]) -> String {
         text.into_owned()
     } else {
         format!("{}...", text.chars().take(LIMIT).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_line_count_stops_at_its_ceiling() {
+        assert_eq!(add_lines(1, 2), 3);
+        assert_eq!(add_lines(u32::MAX - 1, 5), u32::MAX);
+        assert_eq!(add_lines(u32::MAX, 1), u32::MAX);
+        assert_eq!(add_lines(1, usize::MAX), u32::MAX);
     }
 }

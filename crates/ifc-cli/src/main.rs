@@ -9,6 +9,10 @@
 //! tessifc coverage                  what the evaluator registry handles
 //! ```
 
+#![deny(unsafe_code)]
+
+// A global allocator cannot be written in safe Rust; this module is the only exception.
+#[allow(unsafe_code)]
 mod alloc;
 mod convert;
 mod coverage;
@@ -16,7 +20,7 @@ mod edit;
 mod info;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[global_allocator]
@@ -85,7 +89,7 @@ enum Command {
         /// Maximum chord sagitta, in metres; overrides the JSON setting.
         #[arg(long)]
         chord_tolerance_m: Option<f64>,
-        /// Refuse to write output when evaluation reports errors or degraded geometry.
+        /// Refuse to write output when geometry is missing, degraded or repaired.
         #[arg(long)]
         strict: bool,
         /// List every conversion diagnostic, not just the counts by code.
@@ -200,6 +204,13 @@ fn main() -> ExitCode {
             inventory,
         } => coverage::run(json, markdown, inventory),
     }
+}
+
+/// Whether two paths name the same file, so a command never writes over its input.
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 #[cfg(test)]

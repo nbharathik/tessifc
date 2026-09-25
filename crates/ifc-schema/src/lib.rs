@@ -16,6 +16,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 use core::fmt;
 
 #[cfg(not(any(
@@ -241,29 +245,32 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// The table for a schema; panics only if the schema feature was compiled out.
+    /// The table for a schema. When its feature is compiled out, the nearest
+    /// schema that is compiled in answers instead; its `id` says which, and
+    /// [`Schema::try_get`] tells the two cases apart.
     pub fn get(id: SchemaId) -> &'static Schema {
-        match id {
-            #[cfg(feature = "schema-ifc2x3")]
-            SchemaId::Ifc2x3 => &generated::ifc2x3::SCHEMA,
-            #[cfg(feature = "schema-ifc4")]
-            SchemaId::Ifc4 => &generated::ifc4::SCHEMA,
-            #[cfg(feature = "schema-ifc4x3")]
-            SchemaId::Ifc4x3 => &generated::ifc4x3::SCHEMA,
-            #[allow(unreachable_patterns)]
-            other => panic!(
-                "schema {other} is not compiled into this build; enable the \
-                 corresponding schema-* feature of tessifc-schema"
-            ),
-        }
+        let nearest = match id {
+            SchemaId::Ifc2x3 => [SchemaId::Ifc2x3, SchemaId::Ifc4, SchemaId::Ifc4x3],
+            SchemaId::Ifc4 => [SchemaId::Ifc4, SchemaId::Ifc4x3, SchemaId::Ifc2x3],
+            SchemaId::Ifc4x3 => [SchemaId::Ifc4x3, SchemaId::Ifc4, SchemaId::Ifc2x3],
+        };
+        nearest
+            .into_iter()
+            .find_map(Schema::try_get)
+            .unwrap_or_else(compiled_in)
     }
 
     /// Look up a schema, returning `None` when its feature is compiled out.
     pub fn try_get(id: SchemaId) -> Option<&'static Schema> {
-        if SchemaId::all().contains(&id) {
-            Some(Schema::get(id))
-        } else {
-            None
+        match id {
+            #[cfg(feature = "schema-ifc2x3")]
+            SchemaId::Ifc2x3 => Some(&generated::ifc2x3::SCHEMA),
+            #[cfg(feature = "schema-ifc4")]
+            SchemaId::Ifc4 => Some(&generated::ifc4::SCHEMA),
+            #[cfg(feature = "schema-ifc4x3")]
+            SchemaId::Ifc4x3 => Some(&generated::ifc4x3::SCHEMA),
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 
@@ -378,6 +385,21 @@ impl fmt::Debug for Schema {
     }
 }
 
+/// A schema that is compiled in; the features guarantee there is one.
+fn compiled_in() -> &'static Schema {
+    #[cfg(feature = "schema-ifc4")]
+    let schema = &generated::ifc4::SCHEMA;
+    #[cfg(all(not(feature = "schema-ifc4"), feature = "schema-ifc4x3"))]
+    let schema = &generated::ifc4x3::SCHEMA;
+    #[cfg(all(
+        not(feature = "schema-ifc4"),
+        not(feature = "schema-ifc4x3"),
+        feature = "schema-ifc2x3"
+    ))]
+    let schema = &generated::ifc2x3::SCHEMA;
+    schema
+}
+
 /// Fold ASCII to upper case into `buf`; `None` if it does not fit or is not ASCII.
 fn fold_ascii_upper<'b>(s: &str, buf: &'b mut [u8; MAX_CLASS_NAME_LEN]) -> Option<&'b str> {
     let bytes = s.as_bytes();
@@ -428,6 +450,19 @@ mod tests {
         assert_eq!(SchemaId::detect("IFC5"), None);
         assert_eq!(SchemaId::detect(""), None);
         assert_eq!(SchemaId::detect("CIS2"), None);
+    }
+
+    #[test]
+    fn every_schema_id_answers_without_panicking() {
+        for id in [SchemaId::Ifc2x3, SchemaId::Ifc4, SchemaId::Ifc4x3] {
+            let schema = Schema::get(id);
+            assert!(SchemaId::all().contains(&schema.id));
+            match Schema::try_get(id) {
+                Some(exact) => assert_eq!(exact.id, id),
+                None => assert_ne!(schema.id, id, "a compiled-out schema is substituted"),
+            }
+            assert!(schema.class_by_name("IfcWall").is_some());
+        }
     }
 
     #[test]

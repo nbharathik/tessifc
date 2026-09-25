@@ -38,14 +38,18 @@ class LauncherTests(unittest.TestCase):
             return response.read()
 
     def test_serves_the_viewer_and_the_followed_file(self):
-        metadata = json.loads(self.get("/__tessifc/session"))
+        token = {"X-Tessifc-Token": self.server.session_token}
+        self.assertTrue(self.server.viewer_url.endswith("/viewer/?session=file#token=" + self.server.session_token))
+        metadata = json.loads(self.get("/__tessifc/session", token))
         self.assertEqual(metadata["name"], "example.ifc")
         self.assertIn("capabilities", metadata)
-        self.assertEqual(self.get("/__tessifc/model.ifc?version=" + metadata["version"]), self.path.read_bytes())
+        self.assertNotIn("token", metadata)
+        self.assertEqual(self.get("/__tessifc/model.ifc?version=" + metadata["version"], token), self.path.read_bytes())
         self.assertIn(b"TessIFC", self.get("/viewer/"))
-        with self.assertRaises(HTTPError) as error:
-            self.get("/__tessifc/session", {"Origin": "https://example.com"})
-        self.assertEqual(error.exception.code, 403)
+        for headers in ({}, {"Origin": "https://example.com", **token}):
+            with self.subTest(headers=headers), self.assertRaises(HTTPError) as error:
+                self.get("/__tessifc/session", headers)
+            self.assertEqual(error.exception.code, 403)
 
 
 if __name__ == "__main__":

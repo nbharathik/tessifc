@@ -7,7 +7,7 @@
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
   "scripts": {
-    "test": "node test/navigation.test.mjs && node test/depth-planes.test.mjs && node test/motion.test.mjs && node test/culling.test.mjs && node test/occlusion.test.mjs && node test/scheduler.test.mjs && node test/gpu-frame-gate.test.mjs && node test/picking.test.mjs && node test/stream.test.mjs && node test/delta.test.mjs && node test/igp.test.mjs && node test/render.test.mjs && node test/revision.test.mjs && node test/session-panel.test.mjs && node test/file-session.test.mjs && node test/mcp-session.test.mjs",
+    "test": "node test/navigation.test.mjs && node test/depth-planes.test.mjs && node test/motion.test.mjs && node test/culling.test.mjs && node test/occlusion.test.mjs && node test/scheduler.test.mjs && node test/gpu-frame-gate.test.mjs && node test/picking.test.mjs && node test/stream.test.mjs && node test/delta.test.mjs && node test/igp.test.mjs && node test/script-safety.test.mjs && node test/assistant-settings.test.mjs && node test/render.test.mjs && node test/revision.test.mjs && node test/session-panel.test.mjs && node test/file-session.test.mjs && node test/mcp-session.test.mjs",
     "test:render": "node test/render.test.mjs"
   },
   "devDependencies": {

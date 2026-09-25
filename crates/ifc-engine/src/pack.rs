@@ -97,6 +97,8 @@ pub struct Packer {
     embedded_texture_bytes: usize,
     /// Coarse levels to write per large mesh, and the chord tolerance they start from.
     lod: Option<(u8, f64)>,
+    /// What the packer itself had to leave out, also written into the pack.
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl Packer {
@@ -135,6 +137,7 @@ impl Packer {
             shared_instances: 0,
             embedded_texture_bytes: 0,
             lod: None,
+            diagnostics: Vec::new(),
         }
     }
 
@@ -238,16 +241,17 @@ impl Packer {
                     _ => 0,
                 };
                 let data = if self.embedded_texture_bytes + size > MAX_EMBEDDED_TEXTURE_BYTES {
-                    self.writer.add_diagnostic(DiagnosticRecord {
-                        express_id: Some(express_id),
-                        line: 0,
-                        severity: "warn".to_string(),
-                        code: codes::TEXTURE_OMITTED.as_str().to_string(),
-                        message: format!(
-                            "texture #{} left out: the pack's embedded textures would exceed their limit",
-                            texture.id
-                        ),
-                    });
+                    self.raise(
+                        Diagnostic::warning(
+                            codes::TEXTURE_OMITTED,
+                            0,
+                            format!(
+                                "texture #{} left out: the pack's embedded textures would exceed their limit",
+                                texture.id
+                            ),
+                        )
+                        .with_id(express_id),
+                    );
                     TextureData::Omitted
                 } else {
                     self.embedded_texture_bytes += size;
@@ -389,26 +393,34 @@ impl Packer {
 
     /// Say in the pack why a part was left out of it.
     fn drop_part(&mut self, express_id: u32) {
-        self.writer.add_diagnostic(DiagnosticRecord {
-            express_id: Some(express_id),
-            line: 0,
-            severity: "warn".to_string(),
-            code: codes::NON_FINITE_GEOMETRY.as_str().to_string(),
-            message: "a coordinate does not survive f32; this part was left out".to_string(),
-        });
+        self.raise(
+            Diagnostic::warning(
+                codes::NON_FINITE_GEOMETRY,
+                0,
+                "a coordinate does not survive f32; this part was left out",
+            )
+            .with_id(express_id),
+        );
+    }
+
+    /// Write a diagnostic of the packer's own into the pack and keep it for the caller.
+    fn raise(&mut self, diagnostic: Diagnostic) {
+        self.writer.add_diagnostic(record_of(&diagnostic));
+        self.diagnostics.push(diagnostic);
     }
 
     /// Add diagnostics to the pack's own list.
     pub fn add_diagnostics<'a>(&mut self, diagnostics: impl IntoIterator<Item = &'a Diagnostic>) {
         for diagnostic in diagnostics {
-            self.writer.add_diagnostic(DiagnosticRecord {
-                express_id: diagnostic.express_id,
-                line: diagnostic.line,
-                severity: diagnostic.severity.as_str().to_string(),
-                code: diagnostic.code.as_str().to_string(),
-                message: diagnostic.message.clone(),
-            });
+            self.writer.add_diagnostic(record_of(diagnostic));
         }
+    }
+
+    /// Diagnostics the packer raised itself, such as a part left out because a
+    /// coordinate does not survive f32. They are already in the pack; a caller
+    /// judging the output needs them next to the evaluation's own.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 
     /// Unique meshes written by this packer.
@@ -494,6 +506,17 @@ pub fn lod_indices(
         out.push(coarse);
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// A diagnostic as the pack's diagnostics table stores it.
+fn record_of(diagnostic: &Diagnostic) -> DiagnosticRecord {
+    DiagnosticRecord {
+        express_id: diagnostic.express_id,
+        line: diagnostic.line,
+        severity: diagnostic.severity.as_str().to_string(),
+        code: diagnostic.code.as_str().to_string(),
+        message: diagnostic.message.clone(),
+    }
 }
 
 /// A mesh's texture coordinates as the writer takes them: two floats per
@@ -830,6 +853,10 @@ mod tests {
 
         assert_eq!(packer.instance_count(), 0);
         assert_eq!(packer.geometry_count(), 0);
+        let own = packer.diagnostics();
+        assert_eq!(own.len(), 1, "the caller sees the dropped part too");
+        assert_eq!(own[0].code, codes::NON_FINITE_GEOMETRY);
+        assert_eq!(own[0].express_id, Some(7));
         let json = parse_json(&packer.finish());
         assert_eq!(json["diagnostics"][0]["id"], 7);
         assert_eq!(json["diagnostics"][0]["code"], "W_NON_FINITE_GEOMETRY");

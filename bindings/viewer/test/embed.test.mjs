@@ -317,7 +317,7 @@ async function runSuite(worker) {
     const followed = createViewerServer(host, { root: fileURLToPath(new URL("../../../", import.meta.url)), port: 0 });
     const followedUrl = await followed.listen();
     try {
-      await page.goto(`${followedUrl}/examples/embed-viewer/?session=file${worker ? "&worker=1" : ""}`);
+      await page.goto(`${followedUrl}/examples/embed-viewer/?session=file${worker ? "&worker=1" : ""}#token=${followed.token}`);
       await page.waitForFunction(() => Boolean(window.tessifcViewer) && window.tessifcViewer.pack() !== null, null, { timeout: 60_000 });
       await page.evaluate(() => {
         window.__revisions = [];

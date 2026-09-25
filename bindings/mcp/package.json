@@ -1,6 +1,6 @@
 {
   "name": "@tessifc/mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "An MCP server over the TessIFC kernel: agents edit or create IFC models and a viewer follows every change",
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
@@ -46,8 +46,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
-    "@tessifc/core": "0.2.0",
-    "@tessifc/edit": "0.2.0",
+    "@tessifc/core": "0.3.0",
+    "@tessifc/edit": "0.3.0",
     "zod": "4.6.5"
   },
   "engines": {

@@ -28,7 +28,7 @@ def owner_scope(model, producer: str = "tessifc"):
         user = api.run("owner.add_person_and_organisation", model, person=person, organisation=organisation)
     if application is None:
         developer = user.TheOrganization
-        application = api.run("owner.add_application", model, version="0.2", application_full_name=producer,
+        application = api.run("owner.add_application", model, version="0.3", application_full_name=producer,
                               application_identifier=producer, application_developer=developer)
     hooks = (owner_settings.get_user, owner_settings.get_application)
     owner_settings.get_user = lambda ifc: user

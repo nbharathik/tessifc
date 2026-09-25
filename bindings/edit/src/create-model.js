@@ -67,7 +67,7 @@ export function createModelText({
     const person = entity(`IFCPERSON($,$,${author ? label(author) : "$"},$,$,$,$,$)`);
     const org = entity(`IFCORGANIZATION($,${label(organisation || producer)},$,$,$)`);
     const owner = entity(`IFCPERSONANDORGANIZATION(${person},${org},$)`);
-    const application = entity(`IFCAPPLICATION(${org},${label("0.2")},${label(producer)},${label(producer)})`);
+    const application = entity(`IFCAPPLICATION(${org},${label("0.3")},${label(producer)},${label(producer)})`);
     const seconds = Math.floor(Date.parse(`${stamp}Z`) / 1000);
     history = entity(`IFCOWNERHISTORY(${owner},${application},$,.ADDED.,$,$,$,${Number.isFinite(seconds) ? seconds : 0})`);
   }

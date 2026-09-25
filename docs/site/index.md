@@ -12,7 +12,7 @@ hide:
 ## Start with a model, build from there
 
 Use the browser API in your application or convert files from the command line.
-Build from the checkout for the v0.2 developer preview.
+Build from the checkout for the v0.3 developer preview.
 
 === "JavaScript"
 

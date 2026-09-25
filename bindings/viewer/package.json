@@ -1,6 +1,6 @@
 {
   "name": "@tessifc/viewer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A minimal WebGL2 IFC viewer over the TessIFC kernel: open a file, stream its geometry, select, hide, section and frame; build your own interface on top",
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
@@ -95,10 +95,10 @@
     "prepack": "npm run types"
   },
   "dependencies": {
-    "@tessifc/edit": "0.2.0"
+    "@tessifc/edit": "0.3.0"
   },
   "peerDependencies": {
-    "@tessifc/core": "0.2.0"
+    "@tessifc/core": "0.3.0"
   },
   "peerDependenciesMeta": {
     "@tessifc/core": {

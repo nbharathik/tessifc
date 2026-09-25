@@ -58,7 +58,7 @@ buffer instead of copying.
 ```json
 {
   "igp": 0,
-  "generator": "tessifc 0.2.0",
+  "generator": "tessifc 0.3.0",
   "schema": "IFC4",
   "units": { "length_scale_to_m": 0.001 },
   "model_offset": [420000.0, 5900000.0, 12.0],

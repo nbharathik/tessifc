@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # tessifc for Python
 
-**v0.2 developer preview.** The TessIFC geometry kernel as a native Python
+**v0.3 developer preview.** The TessIFC geometry kernel as a native Python
 extension: IFC-SPF or IFCZIP in, render-ready IGP meshes out, with the same
 reports, settings, diagnostics and streaming as the WebAssembly and CLI
 builds. No Python dependencies; NumPy is optional for array views.

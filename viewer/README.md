@@ -5,7 +5,7 @@ A browser viewer for IFC files, powered by the [TessIFC](../README.md) geometry
 kernel. Open a model to inspect, section, measure and edit it. Files stay in
 your browser; nothing is uploaded.
 
-**v0.2 developer preview.** Built with WebAssembly and WebGL2, with no runtime
+**v0.3 developer preview.** Built with WebAssembly and WebGL2, with no runtime
 npm or CDN dependencies.
 
 ![The TessIFC viewer inspecting a pavilion model](../docs/assets/viewer.png)

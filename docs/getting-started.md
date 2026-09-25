@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Getting started
 
-Start from the checkout for the v0.2 developer preview. Rust is pinned in
+Start from the checkout for the v0.3 developer preview. Rust is pinned in
 `rust-toolchain.toml`; the helper scripts use Python 3.10 or newer. Node 20
 or newer is needed for Node integrations and JavaScript tests.
 

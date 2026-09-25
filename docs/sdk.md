@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # The TessIFC SDK
 
-The v0.2 developer preview exposes one Rust kernel through native and WASM
+The v0.3 developer preview exposes one Rust kernel through native and WASM
 interfaces, an editing session over it, and two ways for an agent to drive
 that session. Start with the [local build](getting-started.md) and read the
 [preview contract](preview.md). Packages ship as tarballs on the Releases
@@ -869,5 +869,5 @@ around the events and calls above.
 ## Preview feedback
 
 Report missing representations with element IDs, settings and minimal inputs.
-New bindings and formats are separate proposals; the supported v0.2 surface
+New bindings and formats are separate proposals; the supported v0.3 surface
 is the package and API set documented above.

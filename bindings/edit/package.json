@@ -1,6 +1,6 @@
 {
   "name": "@tessifc/edit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Editing sessions, browser scripts, IGP reading and agent tools over the TessIFC kernel",
   "license": "Apache-2.0",
   "author": "Bharathi Kannan",
@@ -95,7 +95,7 @@
     "prepack": "npm run types"
   },
   "peerDependencies": {
-    "@tessifc/core": "0.2.0"
+    "@tessifc/core": "0.3.0"
   },
   "peerDependenciesMeta": {
     "@tessifc/core": {

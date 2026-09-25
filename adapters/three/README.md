@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # @tessifc/three
 
-**v0.2 developer preview.** Build three.js meshes from an evaluated TessIFC
+**v0.3 developer preview.** Build three.js meshes from an evaluated TessIFC
 model. Pass your application's `THREE` namespace; the adapter does not bundle
 a second copy. three.js is a peer dependency.
 
